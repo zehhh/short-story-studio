@@ -53,7 +53,7 @@ TOP_COMMANDS = [
 ]
 SECOND_LEVEL = {
     "kb": ["list", "show", "collect", "stats", "recall", "rebuild", "migrate", "dedup", "tag",
-           "lint", "enrich"],
+           "lint", "enrich", "batch-decon"],
     "material": ["list", "stats", "deposit", "add", "remove", "curate", "trash", "restore", "from-hotspots"],
     "memory": ["layers", "recall", "consolidate"],
     "schedule": ["add", "list", "remove", "toggle", "run"],
@@ -70,7 +70,7 @@ MATRIX = {
     "continue": ("续跑既有项目", True, True, "mock", "project/ 阶段产物", "本文件", "publish/material"),
     "tropes": ("查看梗库方向", False, False, "无（本身离线）", "无（只读 data/tropes.json）", "smoke_test+本文件", "mine/run/knowledge"),
     "fetch": ("热门小说抓取→深拆入库", True, True, "无（--list 离线）", "project 下载稿 + workspace/decon", "本文件(--list)", "deconstruct/kb"),
-    "kb": ("知识库：卡/单元/向量/召回", "collect=是，其余否", "collect=是", "无（本地库可离线）", "workspace/kb/*、data/knowledge/*(collect)", "smoke_test+本文件", "pitch/outline/draft"),
+    "kb": ("知识库：卡/单元/向量/召回/批量深拆", "collect/enrich/batch-decon=是", "collect/batch-decon=是", "无（本地库可离线）", "workspace/kb/*、data/knowledge/*(collect)", "smoke_test+本文件", "pitch/outline/draft"),
     "local": ("本地小模型探测/方案/片段", False, "探测本地端口", "无（本身离线）", "无（只打印）", "smoke_test+本文件", "config.llm_roles"),
     "material": ("素材库 CRUD/沉淀/整理/热点转化", "curate/from-hotspots=是", "from-hotspots=是", "curate", "workspace/materials*.jsonl", "smoke_test+本文件", "mine/kb/rag/memory"),
     "memory": ("冷热分层/引力检索/衰减整理", False, False, "无（本身离线）", "workspace/materials.jsonl(consolidate)", "smoke_test+本文件", "mine/draft"),
@@ -1394,6 +1394,9 @@ def main() -> int:
         test_match_direction_respects_genre,
         test_genre_cards_note_and_ancient_guide,
         test_lang_rule_not_genre_scoping,
+        test_auto_deposit_off_by_default_everywhere,
+        test_deposit_flag_propagates_to_subprocess,
+        test_kb_batch_decon_cli_and_shared_impl,
     ]
     try:
         for fn in order:
@@ -2971,6 +2974,153 @@ def test_banned_text_fixed_in_place_not_rewritten():
     out, rep = P._fix_banned_text(cfg2, llm, _t, "导语")
     assert out == _t and llm.calls == 0, (out, rep)
     print("  [ok] 定点替换 / 换不掉退回 / 长度守卫 / 异常兜底 / 干净零调用 / 成语白名单")
+
+
+@case
+def test_auto_deposit_off_by_default_everywhere():
+    """成稿自动沉淀默认必须是关的——三层口径不能各说各话。
+
+    自回声事故：一版默认开，机器写的稿子沉淀进素材库，下一篇又被检索回来当
+    「爆款素材」注入提示词，越写越像自己、越写越薄（1276/1367 条自产污染就是这么来的）。
+    用户决策是「成稿不要自动沉淀」。三处默认值任一处回退成 True，这条链就又活了：
+      config.DEFAULT_CONFIG / pipeline 读配置时的兜底 / scheduler.new_job。
+    """
+    from studio import config as C
+    from studio import scheduler as sch
+
+    assert C.DEFAULT_CONFIG["materials"]["auto_deposit"] is False, \
+        "DEFAULT_CONFIG 回退成 True 会让自回声复活"
+
+    # scheduler 建的任务默认不许自动沉淀
+    job = sch.new_job({}, "t", {"type": "manual"}, count=1)
+    assert job["auto_deposit"] is False, job["auto_deposit"]
+
+    # pipeline 里读配置的兜底值：cfg 没写 materials.auto_deposit 时也必须当关
+    import inspect
+
+    from studio import pipeline as _P
+
+    src_all = inspect.getsource(_P)
+    assert 'get("auto_deposit", True)' not in src_all, \
+        "pipeline 里有 auto_deposit 兜底 True（与 config 默认相反）"
+
+    # 显式开启的口子还在（--deposit / 面板勾选 / material deposit），
+    # 否则用户「想反哺」时无路可走。
+    from studio.cli import _apply
+    import argparse as ap
+
+    args = ap.Namespace(deposit=True)
+    cfg = {"materials": {"auto_deposit": False}}
+    assert _apply(cfg, args)["materials"]["auto_deposit"] is True
+    args2 = ap.Namespace(deposit=False)
+    cfg2 = {"materials": {"auto_deposit": False}}
+    assert _apply(cfg2, args2)["materials"]["auto_deposit"] is False
+    print("  [ok] 三层默认关 / 无真值兜底 / --deposit 可显式开启")
+
+
+@case
+def test_deposit_flag_propagates_to_subprocess():
+    """定时任务/看板勾选的「沉淀素材」必须真的传到子进程 --deposit。
+
+    否则勾了等于没勾：调度器拉起的子进程按 config 默认（关）跑，用户以为开了。
+    反向也要成立：没勾就不许出现 --deposit（默认关是被反复踩过的结论）。
+    """
+    from studio import scheduler as sch
+
+    base = {"id": "J1", "name": "t", "count": 1}
+    # ① 默认关 → 两个 build 都不带 --deposit
+    j_off = sch.new_job({}, "t", {"type": "manual"})
+    assert "--deposit" not in " ".join(sch.build_run_cmd({}, j_off, 0))
+    assert "--deposit" not in " ".join(sch.build_produce_cmd({}, j_off))
+
+    # ② 显式开 → 两处命令都带
+    j_on = sch.new_job({}, "t", {"type": "manual"}, auto_deposit=True)
+    assert j_on["auto_deposit"] is True
+    assert "--deposit" in sch.build_run_cmd({}, j_on, 0)
+    assert "--deposit" in sch.build_produce_cmd({}, j_on)
+
+    # ③ 老任务（历史 job 里没有该键）当作关，不许 KeyError、也不许悄悄开
+    legacy = dict(base)
+    assert "--deposit" not in " ".join(sch.build_run_cmd({}, legacy, 0))
+    assert "--deposit" not in " ".join(sch.build_produce_cmd({}, legacy))
+
+    # ④ mock 任务带 --no-kb 时也能同时带 --deposit（两个开关互不吞噬）
+    j_mock = sch.new_job({}, "t", {"type": "manual"}, provider="mock", auto_deposit=True)
+    joined = " ".join(sch.build_run_cmd({}, j_mock, 0))
+    assert "--no-kb" in joined and "--deposit" in joined, joined
+    print("  [ok] 默认不带 / 勾选带 / 老任务兼容 / 与 --no-kb 共存")
+
+
+@case
+def test_kb_batch_decon_cli_and_shared_impl():
+    """批量深拆必须是主 CLI 的子命令，且与旧模块入口共用同一份实现。
+
+    旧状：`python -m studio.batch_decon` 是第二个入口，走自己手搓的 argv 解析，
+    不认 `--config` 之外的公共参数；进度文件写死总篇数 3757、写死
+    `parent.parent.parent/workspace` 层级、收尾无条件 `sleep(150)`。
+    """
+    from studio import batch_decon as bd
+
+    # ① 只有一个实现函数，CLI 与 __main__ 都走它
+    assert callable(bd.run), "batch_decon.run 是 CLI 与模块入口的共用实现"
+    import inspect
+
+    src_main = inspect.getsource(bd.main)
+    assert "run(" in src_main, "main() 必须调用 run()，不能自己再写一遍流程"
+    src_run = inspect.getsource(bd.run)
+    assert "3757" not in src_run and "3757" not in inspect.getsource(bd.save_state), \
+        "总篇数必须现算，不许写死 3757"
+
+    # 只查可执行代码，不查文档字符串（说明历史缺陷的注释里会出现旧写法）
+    import ast
+
+    def _code_src(fn):
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+                body = getattr(node, "body", [])
+                if body and isinstance(body[0], ast.Expr) and isinstance(
+                        getattr(body[0], "value", None), ast.Constant):
+                    node.body = body[1:] or [ast.Pass()]
+        return ast.unparse(tree)
+
+    assert "parent.parent.parent" not in _code_src(bd._progress_path), \
+        "进度路径不许再靠固定层级拼"
+
+    # ② 进度路径跟着 knowledge 目录走，能顺着祖先找 workspace
+    from pathlib import Path
+
+    p = bd._progress_path(Path("/tmp/ws/workspace/kb"))
+    assert p.name == "decon_progress.txt" and p.parent.name == "logs", p
+    assert "workspace" in str(p), p
+
+    # ③ CLI 子命令存在且默认参数对得上
+    from studio.cli import build_parser
+
+    parser = build_parser()
+    ns = parser.parse_args(["kb", "batch-decon"])
+    assert ns.action == "batch-decon" and ns.workers == 2 and ns.dedup_wait == 150
+    assert ns.no_dedup is False
+    ns2 = parser.parse_args(["kb", "batch-decon", "--no-dedup", "--workers", "4",
+                             "--dedup-wait", "0", "--limit", "3"])
+    assert ns2.no_dedup is True and ns2.workers == 4 and ns2.dedup_wait == 0 and ns2.limit == 3
+
+    # ④ run(dedup=False) 不发收尾去重（提前返回，不 sleep、不扫库）
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        kdir = Path(td) / "kb"
+        (kdir / "raw_text").mkdir(parents=True)
+        cfg = {"studio": {"workspace_abs": td}}
+        import time as _t
+
+        t0 = _t.time()
+        res = bd.run(cfg, workers=1, dedup=False)
+        assert _t.time() - t0 < 5, "dedup=False 时不该有等待"
+        assert res["dedup"] is None and res["total"] == 0, res
+    print("  [ok] 单实现 / 无硬编码 / 进度路径 / CLI 参数 / dedup 开关")
 
 
 if __name__ == "__main__":

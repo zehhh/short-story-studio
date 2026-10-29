@@ -1,0 +1,10 @@
+# 行尾只钉住需要钉的，不做全仓库 renormalize。
+# 背景：编辑器/工具把 .py 整文件从 LF 改成 CRLF 时，git 会给出
+# 9000 行「插入+删除」的假 diff，真实改动（4 行）被彻底淹没，
+# code review 与 blame 都失效。钉成 eol=lf 后工作区永远是 LF，
+# 换机器/换编辑器也不会再复现。
+
+*.py   text eol=lf
+*.sh   text eol=lf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf

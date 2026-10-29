@@ -846,6 +846,8 @@ class _Handler(BaseHTTPRequestHandler):
                     platform=payload.get("platform") or "",
                     sources=_srcs,
                     provider=payload.get("provider") or "",
+                    # 成稿默认不自动沉淀进素材库/知识库（防自回声）；要反哺就在面板显式勾选。
+                    auto_deposit=bool(payload.get("auto_deposit")),
                     auto_publish=bool(payload.get("auto_publish")),
                     auto_data=bool(payload.get("auto_data")),
                     auto_improve=bool(payload.get("auto_improve")),
@@ -1664,6 +1666,7 @@ async function renderCreate(){
       </select>
       <label class="sw"><input type="checkbox" id="g_autodata" checked> 自动回收数据</label>
       <label class="sw"><input type="checkbox" id="g_autoimp" checked> 自动复盘改进</label>
+      <label class="sw" title="成稿后把本篇拆成素材回灌素材库。默认关：机器稿回灌后会被下一篇当成「爆款素材」检索回来，越写越像自己。"><input type="checkbox" id="g_deposit"> 沉淀素材入库</label>
     </div>
     <div class="dim" style="margin-top:6px">勾选后走全流程制作（写→发→数据→复盘一条龙）。番茄草稿箱需先：pip install playwright → python -m studio.fanqie_draft login，详见 docs/fanqie_publish.md。</div>
     <div id="genList" style="margin-top:10px">${genJobsHtml(genjobs.jobs||[])}</div></div>`;
@@ -1729,7 +1732,8 @@ async function startGen(){
       auto_publish: document.getElementById('g_autopub').checked,
       publish_mode: document.getElementById('g_pubmode')?.value || 'manual',
       auto_data: document.getElementById('g_autodata').checked,
-      auto_improve: document.getElementById('g_autoimp').checked});
+      auto_improve: document.getElementById('g_autoimp').checked,
+      auto_deposit: document.getElementById('g_deposit').checked});
     alert('已后台启动（任务 '+res.job_id+'），完成后在总览/素材库查看');
     await renderCreate();
   }catch(e){ alert('失败：'+e.message); }
@@ -1768,7 +1772,8 @@ async function oneClickGen(){
       provider: document.getElementById('g_prov')?.value||'',
       auto_publish: true,
       publish_mode: document.getElementById('g_pubmode')?.value || 'manual',
-      auto_data: true, auto_improve: true});
+      auto_data: true, auto_improve: true,
+      auto_deposit: !!document.getElementById('g_deposit')?.checked});
     msg.textContent = '已启动（任务 ' + res.job_id + '）' + (doDecon ? '｜拆书已完成入库' : '');
   }catch(e){ msg.textContent = '启动失败：' + e.message; }
 }

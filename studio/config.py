@@ -85,7 +85,10 @@ DEFAULT_CONFIG = {
         "per_call": 2,                # 每次 LLM 调用拆几段
     },
     "materials": {
-        "auto_deposit": True,         # 成稿后自动沉淀素材入库
+        # 默认关：成稿自动沉淀 = 把机器生成的稿子回灌进素材库/知识库，
+        # 下一篇再检索回来 → 自回声（echo chamber），越写越像自己、越写越薄。
+        # 需要反哺时显式开启（config.yaml 或 `run --deposit`）；沉淀端点 `material deposit` 始终可用。
+        "auto_deposit": False,
         "convert_hotspots": True,     # 热点事件必须转成小说素材才能入库（需 LLM）
         "auto_curate": True,          # 沉淀后自动接入整理 Agent（质量分级+删低质）
         "curate_batch": 15,           # 整理 Agent 每批评估条数

@@ -4506,7 +4506,9 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
     project.save_json("report.json", report)
 
     # --- 自动沉淀素材入库（mock 产出不入库）---
-    if cfg.get("materials", {}).get("auto_deposit", True) and not isinstance(llm, MockLLM):
+    # 默认关（与 config.DEFAULT_CONFIG 一致）：成稿回灌素材库会把机器生成的稿子
+    # 再检索回来（自回声），下一篇越写越像自己。要反哺必须显式开启。
+    if cfg.get("materials", {}).get("auto_deposit", False) and not isinstance(llm, MockLLM):
         try:
             from . import material as material_mod
 

@@ -1,8 +1,8 @@
 # 短篇小说工作室（Short Story Studio）
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
-[![Commercial Use](https://img.shields.io/badge/commercial%20use-allowed-brightgreen?style=flat-square)](COMMERCIAL.md)
+[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-lightgrey?style=flat-square)](LICENSE)
+[![Commercial Use](https://img.shields.io/badge/commercial%20use-license%20required-orange?style=flat-square)](COMMERCIAL.md)
 [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
 自动抓取各大平台短篇小说热点 → 提炼**核心梗** → 多 agent 协作扩写出完整的**下沉市场短篇小说**的全流程生产线。纯 Python 标准库实现，无第三方框架依赖（`requests` / `pyyaml` 之外全部内置）。
@@ -72,6 +72,7 @@ python -m studio run --idea "退婚被索88万彩礼，女主用一张十年前�
 | `python -m studio run --source zhihu,baidu,douyin,toutiao --pick ask` | **蹭热点一键成稿**，交互选梗 |
 | `python -m studio kb collect 彩礼纠纷` | 手动搜集某题材知识卡；`--all` 全部、`--refresh` 强制重搜 |
 | `python -m studio kb list` / `kb show 彩礼纠纷` | 查看已有知识卡 |
+| `python -m studio kb batch-decon --workers 2` | **批量深拆**：把 `workspace/kb/raw_text/` 里的原文逐篇深拆成叙事弧单元入库；断点续跑、失败自动补试、收尾全库去重（`--no-dedup` 跳过，`--dedup-wait 0` 免等模型卸载） |
 | `python -m studio continue` | 续跑最近的项目（断点续跑，已完成的阶段自动跳过） |
 | `python -m studio tropes` | 查看梗库方向 |
 | `python -m studio check` | 体检：LLM/角色端点连通性 + 资产完整性 + 热点源可用性 |
@@ -87,8 +88,13 @@ python -m studio run --idea "退婚被索88万彩礼，女主用一张十年前�
 常用参数：`--platform zhihu|fanqie|uc|qimao`（目标平台）、`--words 12000`（目标字数）、
 `--chapters 8`（章节数）、`--pick auto|数字|ask`（选梗方式）、`--provider mock`（离线）、
 `--no-review`（跳过门禁单稿直出）、`--threshold 8`（读者团阈值）、`--rounds 4`（审查上限）、
-`--no-kb` / `--kb-refresh`（知识库开关/强制重搜）、`--refresh-polish`（强制重跑体检）。
+`--no-kb` / `--kb-refresh`（知识库开关/强制重搜）、`--refresh-polish`（强制重跑体检）、
+`--deposit`（成稿后沉淀素材入库，**默认关**——见下）。
 全局参数（`--config/--provider/--platform/--words`）放在子命令前或后均可。
+
+> **成稿默认不自动沉淀进素材库/知识库。** 机器写的稿子回灌素材库，下一篇又会被当成
+> 「爆款素材」检索回来注入提示词——自回声，越写越像自己、越写越薄。要反哺得显式开口子：
+> `run --deposit`、看板「生成」页勾选「沉淀素材」，或事后 `material deposit`。
 
 ## 管线各阶段（都在防"扑街"）
 
@@ -503,23 +509,31 @@ python -m studio dashboard --export   # 导出自包含静态 HTML（数据内�
 
 ## License
 
-本项目采用 **[MIT License](LICENSE)**——**可以自由商用**，包括企业内部使用、付费产品与服务、
-代写工作室收费生产、修改后闭源分发、二次销售。唯一要求是保留版权声明与许可声明。
+本项目采用 **[CC BY-NC-SA 4.0](LICENSE)**（署名-非商业性使用-相同方式共享 4.0 国际）——
+**非商业可以自由使用，商业用途须另行取得书面授权**。
 
-**完整说明见 [COMMERCIAL.md](COMMERCIAL.md)**。那份文件只做三件事：说清授权现状、划清 MIT
-管不到的边界、给出可选的支持途径。**它不是商用前置条件**——MIT 之下商用无需申请或付费。
+简单说三条你需要遵守的：
+
+- **署名**：保留版权声明，并说明你是否做了修改。README 或页面底部放一句话即可，
+  建议格式见 `LICENSE` 末尾。
+- **非商业**：不得用于商业目的——包括集成进付费产品、代写工作室收费生产、
+  以本项目产出的批量内容直接变现、公司内部营利性生产。判定标准是「产出是否进入收费链路」。
+- **相同方式共享**：修改后再分发，必须以 CC BY-NC-SA 4.0 或兼容协议开源，不得改闭源。
+
+**需要商用授权？见 [COMMERCIAL.md](COMMERCIAL.md)**（一事一议，非独占按年授权）。
+纯个人使用、学习研究、非营利场景**永远不需要走这一步**。
 
 需要你知道的几条边界：
 
-- **成稿的著作权**不在 MIT 授权范围内。你用它写的小说能否投稿、签约、出售，取决于平台条款
-  与当地法律，作者不作任何声明或保证。
+- **成稿的著作权**不在本许可范围内。你用它写的小说能否投稿、签约、出售，取决于平台条款
+  与当地法律，作者不作任何声明或保证，也不主张其权利。
 - **`data/knowledge/` 的题材知识卡**是虚构创作参考（人工撰写或公开资料蒸馏），不含真实人物
-  与机构影射；二次商用前请自行评估。
+  与机构影射；二次使用前请自行评估。
 - **抓取与生成内容的合规责任**在使用者：抓取频率、数据用途、内容审核由你自行承担。
 
-**MIT 管代码，不管成稿。** 这两件事分开看，就不会踩坑。
+**CC 管代码与内容，不管你的成稿。** 这两件事分开看，就不会踩坑。
 
 第三方数据与素材的合规提示见「合规与风险提示」一节。
 
-*历史：早期提交 `7a1b2e3` 曾短暂使用 PolyForm Noncommercial 1.0.0，自 `3f2667e` 起改为 MIT。
-MIT 版本之后发布的代码与数据一律适用 MIT。*
+*历史：早期提交 `7a1b2e3`～`a2355c7` 期间曾使用 PolyForm Noncommercial 1.0.0 与 MIT；
+自本次变更起统一为 CC BY-NC-SA 4.0。旧版本已发布的副本仍适用其当时的许可。*

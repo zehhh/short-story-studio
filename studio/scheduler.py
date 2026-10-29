@@ -66,7 +66,7 @@ def save_schedules(cfg: dict, jobs: list[dict]):
 def new_job(cfg: dict, name: str, trigger: dict, count: int = 1,
             directions: list[str] | None = None, words: int | None = None,
             platform: str | None = None, sources: list[str] | None = None,
-            provider: str | None = None, auto_deposit: bool = True,
+            provider: str | None = None, auto_deposit: bool = False,
             auto_publish: bool = False, auto_data: bool = False,
             auto_improve: bool = False, publish_mode: str | None = None,
             data_source: str | None = None) -> dict:
@@ -166,6 +166,9 @@ def build_run_cmd(cfg: dict, job: dict, story_index: int) -> list[str]:
         cmd += ["--provider", job["provider"]]
         if job["provider"] == "mock":
             cmd += ["--no-kb"]  # mock 产出不入知识库
+    # 成稿沉淀默认关；任务显式勾了才加 --deposit，否则子进程仍按默认（不沉淀）
+    if job.get("auto_deposit"):
+        cmd += ["--deposit"]
     return cmd
 
 
@@ -197,6 +200,9 @@ def build_produce_cmd(cfg: dict, job: dict) -> list[str]:
                 ("mock" if job.get("provider") == "mock" else "custom")]
     if job.get("auto_improve"):
         cmd += ["--with-improve"]
+    # 成稿沉淀默认关；任务显式勾了才加 --deposit
+    if job.get("auto_deposit"):
+        cmd += ["--deposit"]
     return cmd
 
 

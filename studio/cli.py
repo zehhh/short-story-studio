@@ -94,13 +94,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("kb", parents=[common],
                         help="知识库：collect 知识卡 / list/show 清单 / stats 向量库 / recall 联想 / rebuild 重建 / migrate 素材入库")
     sp.add_argument("action", choices=["list", "show", "collect", "stats", "recall", "rebuild", "migrate",
-                                       "dedup", "tag", "lint", "enrich"])
+                                       "dedup", "tag", "lint", "enrich", "batch-decon"])
     sp.add_argument("--apply", action="store_true", help="dedup：应用压实（默认只扫描报告）")
+    sp.add_argument("--workers", type=int, default=2, help="batch-decon：并发线程数（默认 2）")
+    sp.add_argument("--no-dedup", action="store_true", help="batch-decon：跳过收尾全库去重")
+    sp.add_argument("--dedup-wait", type=int, default=150,
+                    help="batch-decon：收尾去重前等模型卸载的秒数（默认 150，云 API 可设 0）")
     sp.add_argument("--no-semantic", action="store_true", help="dedup：跳过语义近重复扫描（只做同文/同开头/id修复）")
     sp.add_argument("--threshold", type=float, default=0.93, help="dedup：语义近重复余弦阈值")
     sp.add_argument("--arc", choices=["起", "承", "转", "合"], help="recall 弧位定向")
     sp.add_argument("--q", help="recall 查询词（如：离婚 净身出户 后悔）")
-    sp.add_argument("--limit", type=int, default=500, help="migrate 迁移条数")
+    sp.add_argument("--limit", type=int, default=500, help="migrate 迁移条数 / batch-decon 本次最多拆几篇")
     sp.add_argument("direction", nargs="?", help="题材方向名称（如 彩礼纠纷）")
     sp.add_argument("--all", dest="all_dirs", action="store_true", help="收集全部方向")
     sp.add_argument("--pages", type=int, help="最多抓取网页数")
@@ -180,6 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="字数越界时淘汰出工作台（默认保留并标记 length_out_of_range）")
     sp.add_argument("--mode", choices=["agent", "hybrid"], default=None,
                     help="正文生成模式：agent=多agent逐章门禁；hybrid=单writer同上下文续写整稿（默认取 config.pipeline.mode）")
+    sp.add_argument("--deposit", action="store_true",
+                    help="成稿后自动沉淀素材入库（默认关：机器稿回灌素材库会自回声）")
 
     sp = sub.add_parser("project", parents=[common], help="项目管理：list/delete")
     sp.add_argument("action", choices=["list", "delete"])
@@ -247,6 +253,8 @@ def _add_gate_args(sp):
                     help="关闭全稿语言打磨（定向改写碎句/欧化/冗余，默认开、花 token）")
     sp.add_argument("--no-emotion", action="store_true", help="关闭情绪量化门（默认开）")
     sp.add_argument("--refresh-polish", action="store_true", help="强制重跑全稿润色体检（默认已有 report.json 则跳过）")
+    sp.add_argument("--deposit", action="store_true",
+                    help="成稿后自动沉淀素材入库（默认关：机器稿回灌素材库会自回声，越写越像自己）")
 
 
 def _apply(cfg: dict, args) -> dict:
@@ -281,6 +289,8 @@ def _apply(cfg: dict, args) -> dict:
         cfg["review"]["emotion_enabled"] = False
     if getattr(args, "mode", None):
         cfg.setdefault("pipeline", {})["mode"] = args.mode
+    if getattr(args, "deposit", False):
+        cfg.setdefault("materials", {})["auto_deposit"] = True
     return cfg
 
 
@@ -458,6 +468,22 @@ def cmd_knowledge_base(cfg: dict, args):
     from . import kb
 
     action = getattr(args, "action", "list")
+    if action == "batch-decon":
+        # 原 `python -m studio.batch_decon` 的口子，收进主 CLI：
+        # 这样 --config/--provider 等公共参数按统一规则生效，
+        # 用户也不必记第二个入口。
+        from . import batch_decon
+
+        res = batch_decon.run(
+            cfg,
+            limit=int(getattr(args, "limit", 0) or 0),
+            workers=int(getattr(args, "workers", 2) or 2),
+            dedup=not getattr(args, "no_dedup", False),
+            dedup_wait=int(getattr(args, "dedup_wait", 150) or 0),
+        )
+        print(f"[batch-decon] 汇总：本轮成功 {res['ok']}｜累计完成 {res['done']}/{res['total']}｜"
+              f"待重试 {res['failed']}")
+        return
     if action == "lint":
         from . import kb_lint
         from .config import data_path
