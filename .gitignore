@@ -57,3 +57,7 @@ desktop.ini
 
 # ---- 生成稿示例（属 workspace 产物）----
 断簪还我本宫不要了.md
+
+# ---- 提示词编辑自动备份 ----
+prompts/*.bak
+*.bak
