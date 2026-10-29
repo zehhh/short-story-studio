@@ -374,7 +374,9 @@ def unit_text_for_embed(u: dict) -> str:
 
 def _atomic_save_npy(p: Path, mat) -> None:
     """写临时文件后原子替换，避免并发读（knn）撞上写一半的矩阵。"""
-    import numpy as np
+    np = _numpy()
+    if np is None:
+        raise RuntimeError("numpy 未安装，无法写入向量矩阵")
 
     tmp = p.with_name(p.name + ".tmp")
     with open(tmp, "wb") as f:
@@ -390,7 +392,11 @@ def index_pending(cfg: dict, batch_size: int = 32) -> int:
     双保险：无论游标是否因外部重写而失准，都按 rows 里已有的 id 过滤，
     保证绝不给同一单元建两条向量。
     """
-    import numpy as np
+    np = _numpy()
+    if np is None:
+        # 无 numpy 无法写 vectors.npy：直接跳过索引，单元本体已落 units.jsonl，
+        # 补装 numpy 后重跑 kb rebuild 即可补齐（不阻塞入库）
+        return 0
 
     with _IO_LOCK:
         done = offsets_path(cfg)
@@ -453,7 +459,9 @@ def repair_index(cfg: dict) -> dict:
     用于治理历史遗留的重复向量行/游标失准；不重新编码已有向量，秒级完成。
     注意：多进程同时写库时请先停其他写入方（同 kb dedup --apply 的前提）。
     """
-    import numpy as np
+    np = _numpy()
+    if np is None:
+        return {"repaired": 0, "error": "numpy 未安装，向量索引不可用"}
 
     with _IO_LOCK:
         units = load_units(cfg)
@@ -507,7 +515,9 @@ def _search_dim(cfg: dict) -> int:
 
 def _build_reduced_vectors(vp: Path, rp: Path, dim: int) -> None:
     """把全维向量按 MRL 截断到前 dim 维并逐行重归一化（分块写 memmap，峰值内存低）。"""
-    import numpy as np
+    np = _numpy()
+    if np is None:
+        raise RuntimeError("numpy 未安装，无法构建 MRL 截断矩阵")
 
     full = np.load(vp, mmap_mode="r")
     n = int(full.shape[0])
@@ -528,7 +538,9 @@ def _load_vectors_cached(cfg: dict):
     kb.embedding.search_dim>0 时使用 MRL 截断矩阵（默认 512 维）：
     体积/扫描耗时降 8 倍，Qwen3-Embedding 的 MRL 特性保证余弦相关度仍 >0.94。
     """
-    import numpy as np
+    np = _numpy()
+    if np is None:
+        return None, []   # 无 numpy：向量层不可用，调用方降级为纯词法
 
     vp, op = vectors_path(cfg), offsets_path(cfg)
     if not vp.exists() or not op.exists():
@@ -577,10 +589,62 @@ def _dir_hit(unit_dir: str, q_dir: str, unit_tags: list | None = None) -> bool:
     return False
 
 
+def _numpy():
+    """numpy 是可选依赖：未安装时返回 None，向量层整体降级为纯词法。
+
+    为什么不在模块顶部 import：kb 的词法层（BM25/共现扩散）不依赖 numpy，
+    缺 numpy 的环境仍应能检索。历史上 knn() 内部直接 `import numpy as np`，
+    而 recall() 裸调 knn()——没装 numpy 时整条写作链路直接抛
+    ModuleNotFoundError，被外部依赖打断了本该可用的降级路径。
+    """
+    try:
+        import numpy as np  # noqa: PLC0415
+
+        return np
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def capabilities(cfg: dict | None = None) -> dict:
+    """检索能力体检：报告 embedding / rerank / numpy / 向量索引是否真的可用。
+
+    只做配置与本地状态判定，不发网络请求（不烧 token、不依赖外网）。
+    「配了 key」不等于「能调用」，所以字段名用 configured 而非 ok——
+    调用失败的真实状态由 _embed_texts/_rerank 的返回值体现。
+    """
+    ec = _emb_cfg(cfg)
+    np = _numpy()
+    vp = vectors_path(cfg) if cfg else None
+    off = offsets_path(cfg) if cfg else None
+    has_vec = bool(vp and vp.exists() and off and off.exists())
+    embedding_configured = bool(ec.get("base_url") and ec.get("api_key"))
+    rerank_configured = bool(embedding_configured and ec.get("rerank_model"))
+    return {
+        "numpy": np is not None,
+        "embedding_configured": embedding_configured,
+        "embedding_model": ec.get("model", "Qwen/Qwen3-Embedding-8B"),
+        "rerank_configured": rerank_configured,
+        "rerank_model": ec.get("rerank_model", ""),
+        "vectors_indexed": has_vec,
+        # 语义检索只有在 numpy + embedding + 向量矩阵三者齐备时才生效
+        "semantic": bool(np is not None and embedding_configured and has_vec),
+        # 降级说明给人和看板直接看，避免「配了却没用上」的静默
+        "mode": ("bm25+vector+coco+rerank" if (np is not None and embedding_configured and has_vec and rerank_configured)
+                 else "bm25+vector+coco" if (np is not None and embedding_configured and has_vec)
+                 else "bm25+coco (语义层降级)"),
+    }
+
+
 def knn(cfg: dict, query: str, top_k: int = 20, arc: str = "",
         direction: str = "") -> list[dict]:
-    """向量 KNN。返回 [{unit, score}]，弧位/方向命中加成。"""
-    import numpy as np
+    """向量 KNN。返回 [{unit, score}]，弧位/方向命中加成。
+
+    任一环节不可用（numpy 缺失 / 无向量矩阵 / embedding 失败）都返回 []，
+    由 recall 的三路融合自动退化为 BM25 + 共现扩散。
+    """
+    np = _numpy()
+    if np is None:
+        return []
 
     units = load_units(cfg)
     off_f = offsets_path(cfg)
@@ -812,8 +876,9 @@ def recall(cfg: dict, query: str, arc: str = "", direction: str = "",
     # "同单元出现过的节点"，跨来源/跨批次的语义近似单元永远连不上（如手工
     # 桥段库与拆书语料），语义扩散补这个洞
     try:
-        import numpy as np
-
+        np = _numpy()
+        if np is None:
+            raise RuntimeError("numpy 未安装")
         mat, vrows = _load_vectors_cached(cfg)
         row_of = {uid: r for r, uid in enumerate(vrows or [])}
         if mat is not None:
@@ -964,12 +1029,13 @@ def semantic_filter_new(cfg: dict, texts: list[str], threshold: float = 0.93) ->
     与库内已索引单元比对（cos ≥ threshold 判近重复），并对本批内部互查。
     embedding 失败时全部放行（防重降级，不阻塞入库）。
     """
-    import numpy as np
-
     keep = [True] * len(texts)
     to_check = [i for i, t in enumerate(texts) if len((t or "").strip()) >= 16]
     if not to_check:
         return keep
+    np = _numpy()
+    if np is None:
+        return keep  # 无 numpy 无法做余弦比对，按 fail-open 放行（防重降级，不阻塞入库）
     embs = _embed_texts([texts[i] for i in to_check], cfg)
     if embs is None:
         return keep
@@ -1089,6 +1155,8 @@ def stats(cfg: dict) -> dict:
         "vectors_indexed": (json.loads(offsets_path(cfg).read_text(encoding="utf-8")).get("count", 0)
                             if vec_ok else 0),
         "coco_nodes": len(coco),
+        # 能力体检：让「配了 key 但没生效」「numpy 缺失悄悄降级」这类静默失败可见
+        "capabilities": capabilities(cfg),
     }
 
 

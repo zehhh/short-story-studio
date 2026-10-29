@@ -45,6 +45,21 @@ review:
   emotion_threshold: 7.0    # 情绪总分阈值（0-10）
   hook_threshold: 7.0       # 章尾钩子强度阈值（0-10）
 
+# ─── 知识库检索（向量 + 精排）────────────────────────────────────────
+# 写作时注入的素材走 kb.py 的「引力检索」：BM25 + 向量 KNN + 共现扩散三路融合，
+# 再经 rerank 模型精排。embedding / rerank 是外部服务（硅基流动等 OpenAI 兼容端点）。
+# 不填也能用：自动降级为 BM25 + 共现扩散的纯词法检索（召回归、语义泛化能力下降）。
+# 填写后 `python -m studio kb stats` 会显示当前实际的检索模式。
+kb:
+  embedding:
+    base_url: ""                    # 如 https://api.siliconflow.cn/v1
+    api_key: ""                     # 为空则走本地 Ollama（http://127.0.0.1:11434）
+    model: Qwen/Qwen3-Embedding-8B  # 嵌入模型（本地 Ollama 时为 qwen3.5-embedding）
+    dim: 4096                       # 全维（写库用）
+    search_dim: 512                 # 检索用 MRL 截断维度，0=全维。降 8 倍体积与扫描耗时
+    rerank_model: Qwen/Qwen3-Reranker-8B   # 留空则跳过精排
+  negative_terms: []                # 召回黑名单：命中即丢弃（防套路化道具反复注入）
+
 # 题材知识库：写作前自动搜集公开资料蒸馏成知识卡（data/knowledge/）
 knowledge:
   auto_collect: true        # 总开关（CLI: --no-kb 关闭）

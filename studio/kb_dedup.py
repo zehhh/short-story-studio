@@ -50,11 +50,14 @@ def _better(a: dict, b: dict) -> dict:
 def scan(cfg: dict, semantic: bool = True, threshold: float = 0.93) -> dict:
     """扫描重复。返回 {units, drops, reasons, stats}（不改库）。
 
-    semantic=True 时用向量层做近重复扫描（需 Ollama，全库 CPU 约 20 分钟）。
+    semantic=True 时用向量层做近重复扫描（需 embedding 服务，全库 CPU 约 20 分钟）。
+    numpy 缺失时自动降级为纯词法扫描（同文/同开头），不抛异常。
     """
-    import numpy as np
-
     from . import kb
+
+    np = kb._numpy()
+    if np is None:
+        semantic = False  # 无语义层：降级为同文/同开头压实
 
     units = []
     for u in kb.load_units(cfg):
@@ -111,7 +114,7 @@ def scan(cfg: dict, semantic: bool = True, threshold: float = 0.93) -> dict:
         texts = [kb.unit_text_for_embed(u) for u in units]
         embs, B = [], 64
         for i in range(0, len(texts), B):
-            e = kb._embed_texts(texts[i:i + B])
+            e = kb._embed_texts(texts[i:i + B], cfg)
             if e is None:
                 print(f"[kb-dedup] embedding 中断于第 {i} 条，语义扫描跳过（其余规则已生效）")
                 break
@@ -180,9 +183,9 @@ def apply(cfg: dict, scan_result: dict) -> dict:
 
     幂等保障：apply 期间批量深拆必须暂停（CLI 侧检查 decon_state 新鲜度）。
     """
-    import numpy as np
-
     from . import kb
+
+    np = kb._numpy()   # 无 numpy 时向量搬移自动跳过（下面的 try/except 兜底），只压实文本
 
     with kb._IO_LOCK:
         units = scan_result["units"]
@@ -210,7 +213,7 @@ def apply(cfg: dict, scan_result: dict) -> dict:
             if r is not None and old_mat is not None and r < old_mat.shape[0]:
                 rows.append(u["id"])
                 vecs.append(old_mat[r])
-        if vecs:
+        if vecs and np is not None:
             mat = np.vstack(vecs).astype(np.float32)
             kb._atomic_save_npy(kb.vectors_path(cfg), mat)
             kb.offsets_path(cfg).write_text(

@@ -1,5 +1,9 @@
 # requests：热点抓取与 LLM API 调用（必需，Py3.12 标配环境通常已装）
 requests>=2.28
 
-# pyyaml：解析 config.yaml（不装则请把 config.yaml 写成 JSON 格式）
+# pyyaml：解析 config.yaml（不装请把 config.yaml 写成 JSON 格式）
 pyyaml>=6.0
+
+# numpy：知识库向量检索（cosine KNN / MRL 截断 / 共现矩阵扫描）。
+# 缺它时 kb 检索整体降级为纯词法，kb rebuild / 拆书入库会直接失败。
+numpy>=1.24

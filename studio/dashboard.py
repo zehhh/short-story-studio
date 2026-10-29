@@ -2095,8 +2095,13 @@ function matToggleKb(){
 window.matToggleKb = matToggleKb;
 async function loadKbView(){
   const st = await (await fetch('/api/materials?view=kbstats')).json();
+  // 检索模式显式展示：语义层降级（未配 embedding / numpy 缺失）曾是静默的
+  const cap = st.capabilities || {};
+  const capTxt = cap.mode
+    ? ` ｜ 检索 ${cap.mode}` + (cap.semantic ? '' : ' ⚠ 语义层降级')
+    : '';
   document.getElementById('matStats').textContent =
-    `知识单元 ${st.units} 条 | 向量索引 ${st.vectors_indexed} | 共现节点 ${st.coco_nodes} ｜ 弧位 ` +
+    `知识单元 ${st.units} 条 | 向量索引 ${st.vectors_indexed} | 共现节点 ${st.coco_nodes}${capTxt} ｜ 弧位 ` +
     Object.entries(st.by_arc||{}).map(([k,v])=>k+' '+v).join(' · ');
   const d = st.decon || {};
   const pct = d.total ? Math.min(100, Math.round(d.done / d.total * 100)) : 0;
@@ -2161,7 +2166,7 @@ async function loadKbView(){
       <div id="deconList" style="margin-top:6px"><span class="dim">加载中…</span></div>
       <div id="deconDoc" style="margin-top:8px;white-space:pre-wrap"></div>
     </div>
-    <div class="card" style="margin-top:10px"><b>🔍 联想检索测试（BM25+向量+共现扩散 三路融合）</b>
+    <div class="card" style="margin-top:10px"><b>🔍 联想检索测试（BM25 + 向量 KNN + 共现扩散 三路融合，rerank 精排）</b>
     <div class="row" style="margin-top:6px">
       <div style="flex:1"><input class="f" id="kbQ" placeholder="如：婆婆藏了赔偿款怎么办"></div>
       <div style="width:110px"><select id="kbArc" class="f"><option value="">弧位</option><option>起</option><option>承</option><option>转</option><option>合</option></select></div>

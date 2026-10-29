@@ -6,8 +6,8 @@
 [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
 抓热点 → 提炼核心梗 → 多 agent 协作扩写出完整短篇小说的一条龙生产线。
-产物是可直接投稿的成稿（`final/成稿.md` / `.txt`）。纯 Python 标准库实现，
-除 `requests`、`pyyaml` 外无第三方依赖。
+产物是可直接投稿的成稿（`final/成稿.md` / `.txt`）。Python 标准库 + 三个依赖：
+`requests`（HTTP）、`pyyaml`（配置）、`numpy`（知识库向量检索）。
 
 ```
 热点抓取 → 提梗打分 → 书名方案 → 章节大纲 → 故事圣经 → 逐章扩写 → 门禁循环 → 润色体检 → 成稿
@@ -19,7 +19,7 @@
 ## 快速开始
 
 ```bash
-pip install -r requirements.txt          # 只需 requests + pyyaml
+pip install -r requirements.txt          # requests + pyyaml + numpy
 cp config.example.yaml config.yaml       # Windows: copy
 # 填入 llm.base_url / api_key / model，然后：
 
@@ -48,6 +48,7 @@ Windows 也可双击 `启动工作室.bat` 走菜单式操作（一键创作 / �
 | `python -m studio tropes` | 查看梗库方向 |
 | `python -m studio fetch --list` | 抓取外部书源原文 |
 | `python -m studio kb collect 彩礼纠纷` | 搜集该题材知识卡（`--all` 全部，`--refresh` 重搜） |
+| `python -m studio kb stats` | 知识库统计 + **检索模式体检**（embedding / rerank 是否真的生效） |
 | `python -m studio kb batch-decon --workers 2` | 批量深拆 `workspace/kb/raw_text/` 原文入叙事弧库 |
 | `python -m studio deconstruct 某书.txt` | 拆书（单本或目录） |
 | `python -m studio rag search --q "假死 公证"` | 检索统一知识库 |

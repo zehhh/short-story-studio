@@ -1298,6 +1298,49 @@ def test_title_gate_sells_the_hook() -> None:
     print("    [title] 真实榜单 9 条全过 / 5 类坏名全拦 / 与 pipeline 同源 / 进投稿结论")
 
 
+@case
+def test_kb_capabilities_visible():
+    """检索能力体检：降级必须可见，不能静默。
+
+    历史坑：配了 embedding 却在用纯词法、缺 numpy 悄悄降级——用户看到
+    「知识库有 16 万条」以为语义检索在工作，实际只是 BM25 匹配。
+    """
+    from studio import kb as K
+
+    import tempfile as _tf
+
+    with _tf.TemporaryDirectory() as td:
+        cfg = {"studio": {"workspace_abs": td}, "kb": {}}
+        cap = K.capabilities(cfg)
+        for k in ("numpy", "embedding_configured", "rerank_configured",
+                  "vectors_indexed", "semantic", "mode"):
+            assert k in cap, f"capabilities 缺字段 {k}: {cap}"
+        # 未配置 embedding 时必须明确 semantic=False，且 mode 写明降级
+        assert cap["embedding_configured"] is False, cap
+        assert cap["semantic"] is False, f"未配 embedding 不该报语义可用: {cap}"
+        assert "bm25" in cap["mode"], f"降级模式名不含 bm25: {cap['mode']}"
+        assert "rerank" not in cap["mode"], f"未配 rerank 不该出现在模式名: {cap['mode']}"
+
+        # stats 必须把能力体检带出去（看板/CLI 都靠它）
+        st = K.stats(cfg)
+        assert "capabilities" in st and st["capabilities"]["mode"] == cap["mode"], st.keys()
+
+        # 无 numpy 时全部只读路径不得抛异常（降级而非崩溃）
+        real = K._numpy
+        try:
+            K._numpy = lambda: None
+            assert K.capabilities(cfg)["numpy"] is False
+            assert K.knn(cfg, "彩礼") == [], "无 numpy 时 knn 应返回空而不是崩"
+            K.semantic_filter_new(cfg, ["测试" * 10])          # 不抛异常即可
+            K.index_pending(cfg)
+            mat, rows = K._load_vectors_cached(cfg)
+            assert mat is None and rows == [], (mat, rows)
+            assert K.repair_index(cfg).get("error"), "无 numpy 时 repair_index 应报可读错误"
+        finally:
+            K._numpy = real
+    print("  [ok] capabilities 字段完整 / 降级语义诚实 / stats 透传 / 无 numpy 全路径不崩")
+
+
 def main() -> int:
     print("=" * 72)
     print("短篇小说工作室 · 功能矩阵回归测试（离线 mock，临时目录 workspace/.feature_matrix_tmp）")
@@ -1306,6 +1349,7 @@ def main() -> int:
     print(f"临时配置：{CFG_PATH}")
     order = [
         test_title_gate_sells_the_hook,
+        test_kb_capabilities_visible,
         test_feature_matrix_table_complete,
         test_parser_tree_matches_matrix,
         test_help_all_subcommands,

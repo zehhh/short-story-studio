@@ -585,6 +585,20 @@ def cmd_knowledge_base(cfg: dict, args):
         if action == "stats":
             st = kb.stats(cfg)
             print(f"知识单元 {st['units']} 条 | 向量已索引 {st['vectors_indexed']} | 共现节点 {st['coco_nodes']}")
+            cap = st.get("capabilities") or {}
+            if cap:
+                # 检索模式必须显式可见：曾经「配了 embedding 却在用纯词法」无人察觉
+                print(f"检索模式: {cap.get('mode', '未知')}")
+                detail = [
+                    f"numpy {'✓' if cap.get('numpy') else '✗ 缺失'}",
+                    f"embedding {'✓ ' + cap.get('embedding_model', '') if cap.get('embedding_configured') else '✗ 未配置'}",
+                    f"rerank {'✓ ' + cap.get('rerank_model', '') if cap.get('rerank_configured') else '✗ 未配置'}",
+                    f"向量矩阵 {'✓' if cap.get('vectors_indexed') else '✗ 无'}",
+                ]
+                print("  能力:", " | ".join(detail))
+                if not cap.get("semantic"):
+                    print("  ⚠ 语义检索未生效：检索降级为纯词法，语义泛化能力下降。"
+                          "配置 config.yaml 的 kb.embedding（见 config.example.yaml）")
             print("按弧位:", json.dumps(st["by_arc"], ensure_ascii=False))
             print("按类型:", json.dumps(st["by_kind"], ensure_ascii=False))
             print("Top 题材:", json.dumps(st["top_directions"], ensure_ascii=False))

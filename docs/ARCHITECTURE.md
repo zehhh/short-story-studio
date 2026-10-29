@@ -25,7 +25,7 @@ studio/                  # 主体包（47 个模块，纯标准库）
 ├── knowledge.py         #   知识卡选材（相关性 × 具体度）
 ├── kb_lint.py           #   知识卡体检（K01–K09）与修复
 ├── kb_enrich.py         #   知识卡 LLM 扩写 + 质量门 + 空壳改写
-├── kb.py / rag.py       #   统一检索（BM25 + 字符 bigram + 共现扩散）
+├── kb.py / rag.py       #   知识检索：kb=BM25+向量KNN+共现扩散+rerank；rag=纯词法兜底
 ├── memory.py            #   记忆库（引力 / 语义河道 / 冷热分层）
 ├── material.py          #   素材库与转换门
 ├── deconstruct.py       #   拆书
@@ -94,7 +94,8 @@ docs/                    # 开发流程规范 + 审计报告
 | 分层质量门（语言 / 句式 / 情绪拉扯分道把关） | 多 agent 创作流水线公开实践中的分工设计 | `studio/langqa.py`、`prompts/review.md` |
 | AI 味词表与句式模板禁用 | 社区多轮实测沉淀的八类高频词 | `data/lang_rules.json` |
 | 毒点 / 弃书雷区清单 | 读者侧弃书原因的公开归纳 | `data/craft.json` |
-| 检索用 BM25 + 字符 n-gram 而非向量嵌入 | 中文短文本上词法检索优于稠密向量的公开复现结论 | `studio/kb*.py` |
+| 检索用 BM25 + 向量 KNN + 共现扩散三路融合，再经 rerank 精排 | 中文短文本上词法召回高、但漏语义同构；稠密向量补语义、rerank 压掉词面误命中——三路互补而非择一 | `studio/kb.py` |
+| 保留纯词法 `rag.py` 作兜底 | embedding / rerank 属外部服务，可能未配 key、断网或因额度失败；写作流水线不能因检索外部依赖故障而断流 | `studio/rag.py` |
 | 拆书五维（核心目标/钩子/冲突/爽虐/悬念） | 拆文方法论的公开拆解 | `studio/deconstruct.py` |
 | 书名必须带卖点（4 字书名签约必死） | 签约数据与编辑公开经验 | `studio/title_gate.py` |
 
