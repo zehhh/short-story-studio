@@ -698,8 +698,21 @@ def test_rubric_refresh_on_drift():
 
 @case
 def test_cli_deconstruct_mock_chain():
-    src = ROOT / "断簪还我本宫不要了.md"
-    assert src.is_file(), "根目录缺少测试用 txt"
+    # 现场：这个用例原本读仓库根目录的 `断簪还我本宫不要了.md`（一份示例成稿），
+    # 而那份稿子后来被 `.gitignore` 排除、磁盘上也删了 → 用例永久 FAIL，
+    # 并且任何人 clone 下来都跑不了（fixture 不在仓库里）。现在自己造样稿：
+    # 4 个小节，每节都过 `deconstruct.split_sections` 的 80 字下限。
+    src = TMP / "decon_sample.md"
+    para = ("我娘把那只断簪塞进我手里就走了。簪头缺了一角，缺口磨得发亮。"
+            "「这是你姐姐的东西。」她只说了这一句。我把簪子攥出汗也没敢问第二句。"
+            "夜里我数了三遍，缺口正好对得上我掌心那道旧疤。")
+    body = "\n\n".join(f"{i:02d}\n\n{para}" for i in range(1, 5))
+    src.write_text(body, encoding="utf-8")
+
+    from studio import deconstruct as dec
+
+    assert len(dec.split_sections(body)) == 4, "样稿必须能被切成 4 节"
+
     before_mats = len(read_jsonl(WS / "materials.jsonl"))
     before_units = len(read_jsonl(WS / "kb" / "units.jsonl"))
     p = run_cli(["deconstruct", str(src), "--provider", "mock",
@@ -1389,6 +1402,7 @@ def main() -> int:
         test_chain_e_scheduler_command_contract,
         test_scheduler_config_passthrough_known_bug,
         test_chain_f_dashboard_kpis_and_http,
+        test_dashboard_models_cache_and_refresh,
         test_chain_g_knowledge_offline_fallback,
         test_review_degraded_is_not_pass,
         test_rubric_no_fake_high_score,
@@ -3325,6 +3339,67 @@ def test_cross_dup_detects_repeated_sentence_across_sections():
     assert "B语言/跨章逐字重复(轻)" in res2["warns"], f"中等长度只判 warn：{res2['warns']}"
     assert "B语言/跨章逐字重复" not in res2["fails"]
     print("  [ok] 跨章逐字重复：12 字抓得住 / 节拍句不误报 / 24 字判 C、中档判 B")
+
+
+@case
+def test_dashboard_models_cache_and_refresh():
+    """看板「模型与配置」页：探测并发 + TTL 缓存 + `?refresh=1` 绕过缓存。
+
+    回归背景（2026-10-29 用户反馈「看板加载模型配置界面运行有些卡顿」）：
+    `list_models()` 原来逐端点串行 `timeout=6`，前端 `renderConfig()` 又把它和
+    `/api/config`、`/api/sources` 一起 `await`，于是任何一个端点离线（本地 Ollama
+    没启动、代理挂了）都让整页空白等 6 秒；两个死端点 = 12 秒。
+    """
+    from studio.config import load_config
+    from studio import dashboard as dash
+
+    cfg = load_config(str(CFG_PATH))
+    cfg["llm"]["base_url"] = "http://127.0.0.1:1/v1"
+    cfg["llm"]["api_key"] = "k"
+    cfg["llm_roles"] = {"writer": {"base_url": "http://127.0.0.1:2/v1"}}
+    calls: list[str] = []
+
+    def fake_probe(base, api_key):
+        calls.append(base)
+        return {"base_url": base, "models": ["m" + base[-3]]}, True
+
+    orig = dash._probe_models
+    dash._probe_models = fake_probe
+    dash._MODELS_CACHE.clear()
+    try:
+        first = dash.list_models(cfg)
+        assert len(first) == 2, f"两个端点都该探到：{first}"
+        assert len(calls) == 2, calls
+        assert all(str(x["models"][0]).startswith("m") for x in first), first
+
+        dash.list_models(cfg)
+        assert len(calls) == 2, f"第二次调用应命中缓存，实际又探了一遍：{calls}"
+
+        dash.list_models(cfg, refresh=True)
+        assert len(calls) == 4, f"refresh=True 必须绕过缓存重新探测：{calls}"
+        assert dash._MODELS_TTL_FAIL < dash._MODELS_TTL_OK, "失败端点的缓存时间要短于成功端点"
+
+        srv = dash.make_server(cfg, 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        try:
+            def get(path: str):
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=15) as r:
+                    return json.loads(r.read().decode("utf-8"))
+
+            n = len(calls)
+            body = get("/api/models")
+            assert len(calls) == n, "带缓存的 HTTP 请求不该再触发探测"
+            assert isinstance(body, list) and body and "base_url" in body[0], body
+            get("/api/models?refresh=1")
+            assert len(calls) == n + 2, f"?refresh=1 没透传到 list_models：{calls[-4:]}"
+        finally:
+            srv.shutdown()
+            srv.server_close()
+    finally:
+        dash._probe_models = orig
+        dash._MODELS_CACHE.clear()
+    print("  [ok] 模型探测：两端口各探一次 / 命中缓存不重探 / refresh 绕过缓存")
 
 
 if __name__ == "__main__":

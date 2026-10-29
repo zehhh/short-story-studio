@@ -591,7 +591,11 @@ class _Handler(BaseHTTPRequestHandler):
                 body = json.dumps(wb.load_config_dict(CFG_FILE), ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
             elif u.path == "/api/models":
-                body = json.dumps(list_models(self.cfg), ensure_ascii=False).encode("utf-8")
+                # ?refresh=1 由界面上的「刷新模型列表」触发，绕过 TTL 缓存重新探。
+                _qs = parse_qs(u.query)
+                _refresh = str((_qs.get("refresh") or ["0"])[0]).lower() in ("1", "true", "yes")
+                body = json.dumps(list_models(self.cfg, refresh=_refresh),
+                                  ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
             elif u.path == "/api/kb-units":
                 from . import kb as kb_mod
@@ -777,6 +781,12 @@ class _Handler(BaseHTTPRequestHandler):
                            "application/json; charset=utf-8")
             elif u.path == "/api/config":
                 saved = wb.save_config_dict(payload, CFG_FILE)
+                # 就地同步模型相关键：self.cfg 里还有 workspace_abs 之类解析后的私有键，
+                # 整体替换会让别的端点 KeyError。不同步的话，同一进程内保存完新端点，
+                # /api/models 的缓存指纹仍是旧配置，下拉里还是旧端点的模型。
+                for _k in ("llm", "llm_roles"):
+                    if _k in saved:
+                        self.cfg[_k] = saved[_k]
                 self._send(200, json.dumps({"ok": True, "config": saved}, ensure_ascii=False).encode("utf-8"),
                            "application/json; charset=utf-8")
             elif u.path == "/api/sources":
@@ -1096,27 +1106,67 @@ def _project_root(cfg: dict, name: str) -> Path | None:
     return None
 
 
-def list_models(cfg: dict) -> list[dict]:
-    """探测已配置的各端点可用模型（本地 ollama / 云端 /v1/models）。"""
+_MODELS_CACHE: dict = {}
+_MODELS_LOCK = threading.Lock()
+_MODELS_TTL_OK = 600.0    # 探测成功：10 分钟内同一份配置不再打网络
+_MODELS_TTL_FAIL = 60.0   # 探测失败：1 分钟后允许重试，避免每次开页面都撞同一个死端点
+
+
+def _probe_models(base: str, api_key: str):
+    """探一个端点的 /models。返回 (结果, 是否可达)。"""
     import requests
 
-    bases = []
+    try:
+        # 分开设「连接」与「读」超时：端点没在听时 1.5s 就放弃，不必等满 6s。
+        r = requests.get(f"{base.rstrip('/')}/models", timeout=(1.5, 4),
+                         headers={"Authorization": "Bearer " + (api_key or "")})
+        models = [m.get("id", "?") for m in (r.json().get("data") or [])][:60]
+        return {"base_url": base, "models": models}, True
+    except Exception as e:  # noqa: BLE001
+        return {"base_url": base, "models": [f"(不可达: {type(e).__name__})"]}, False
+
+
+def list_models(cfg: dict, refresh: bool = False) -> list[dict]:
+    """探测已配置的各端点可用模型（本地 ollama / 云端 /v1/models）。
+
+    为什么要有缓存 + 并发：看板「模型与配置」页一打开就调这个接口，原来是串行
+    `for` 逐端点 `timeout=6`——只要有一个端点连不上（Ollama 没启动、代理挂了），
+    每个死端点白等 6 秒，两个就是 12 秒；而且整页 `renderConfig` 在 `await` 这个
+    请求，于是表现为「点进模型配置卡好几秒空白」。现在：端点之间并发探、连接超时
+    压到 1.5s、结果按配置指纹缓存（成功 10 分钟 / 失败 1 分钟）。
+    """
     llm = cfg.get("llm", {}) or {}
-    bases.append(llm.get("base_url", ""))
+    api_key = llm.get("api_key", "") or ""
+    bases = [llm.get("base_url", "")]
     for rcfg in (cfg.get("llm_roles") or {}).values():
         b = (rcfg or {}).get("base_url")
         if b:
             bases.append(b)
-    out = []
-    for b in dict.fromkeys(x for x in bases if x):
-        models = []
-        try:
-            r = requests.get(f"{b.rstrip('/')}/models", timeout=6,
-                             headers={"Authorization": "Bearer " + (llm.get("api_key", "") or "")})
-            models = [m.get("id", "?") for m in (r.json().get("data") or [])][:60]
-        except Exception as e:  # noqa: BLE001
-            models = [f"(不可达: {type(e).__name__})"]
-        out.append({"base_url": b, "models": models})
+    bases = list(dict.fromkeys(x for x in bases if x))
+    if not bases:
+        return []
+
+    key = (tuple(bases), api_key)
+    now = time.time()
+    if not refresh:
+        with _MODELS_LOCK:
+            hit = _MODELS_CACHE.get(key)
+        if hit:
+            ttl = _MODELS_TTL_OK if hit[1] else _MODELS_TTL_FAIL
+            if now - hit[0] < ttl:
+                return hit[2]
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(4, len(bases))) as ex:
+        results = list(ex.map(lambda b: _probe_models(b, api_key), bases))
+    out = [r[0] for r in results]
+    all_ok = all(r[1] for r in results)
+    with _MODELS_LOCK:
+        _MODELS_CACHE[key] = (now, all_ok, out)
+        # 配置改过之后旧指纹再没人查，顺手清掉，免得多进程长跑里越攒越多
+        while len(_MODELS_CACHE) > 8:
+            _MODELS_CACHE.pop(next(iter(_MODELS_CACHE)))
     return out
 
 
@@ -2344,14 +2394,13 @@ window.matAddSave = matAddSave;
 const ROLE_LABEL = {planner:'策划（提梗/方案/大纲/圣经）', writer:'写手（扩写/终稿）',
                     reviewer:'审查（主编/情绪/体检）', panel:'读者评分团', light:'轻量（知识蒸馏）'};
 async function renderConfig(){
-  const [cfg, models, sources] = await Promise.all([
+  // 只等「本地就能给」的两个接口；模型探测（要打外网/本地 Ollama）走后台异步补。
+  // 以前是三个接口一起 await，只要有一个端点连不上，整页就空白等好几秒。
+  const [cfg, sources] = await Promise.all([
     fetch('/api/config').then(r=>r.json()),
-    fetch('/api/models').then(r=>r.json()).catch(()=>[]),
     fetch('/api/sources').then(r=>r.json())]);
   const llm = cfg.llm || {};
-  const allModels = [...new Set(models.flatMap(m=>m.models||[]).filter(m=>!m.startsWith('(')))];
-  const opt = m => `<option value="${H(m)}">${H(m)}</option>`;
-  const dl = `<datalist id="modelList">${allModels.map(opt).join('')}</datalist>`;
+  const dl = `<datalist id="modelList"></datalist>`;
   let html = `<h2>模型与配置</h2><div class="dim">保存即写入 config.yaml（自动备份 .bak）；角色留空 = 跟随主模型</div>`;
   html += `<div class="card"><b>主模型（接入 AI API：本地 Ollama 或任意 OpenAI 兼容接口）</b>
     <div class="row" style="margin-top:8px">
@@ -2360,7 +2409,7 @@ async function renderConfig(){
       <div style="flex:1;min-width:180px">model<br><input class="f" id="c_model" list="modelList" value="${H(llm.model||'')}"></div>
       <div style="flex:1;min-width:170px">api_key<br><input class="f" id="c_key" value="${H(llm.api_key||'')}"></div>
       <div style="width:90px">温度<br><input class="f" id="c_temp" value="${H(llm.temperature??0.85)}"></div>
-    </div>${dl}</div>`;
+    </div>${dl}<div class="dim" id="mLdMsg">模型列表探测中… <a href="#" onclick="loadModelList(true);return false;">刷新</a></div></div>`;
   html += `<div class="card"><b>按 Agent 角色分配模型（留空 = 跟随主模型）</b>`;
   for(const role of ['planner','writer','reviewer','panel','light']){
     const rc = (cfg.llm_roles||{})[role] || {};
@@ -2383,8 +2432,31 @@ async function renderConfig(){
     <button class="btn gray" onclick="saveRaw()">合并保存</button><span class="dim" id="rMsg"></span></div>`;
   document.getElementById('view').innerHTML = html;
   document.getElementById('saveModelsBtn')?.setAttribute('data-x','1');
+  loadModelList();          // 后台补模型下拉，不挡住界面
 }
 window.renderConfig = renderConfig;
+
+// 模型列表单独异步加载：探测要打网络（云端 /v1/models）或本地 Ollama，
+// 不该和「配置表单」抢同一个首屏。失败只影响下拉建议，表单照样能填。
+async function loadModelList(refresh){
+  const dl = document.getElementById('modelList');
+  const hint = document.getElementById('mLdMsg');
+  if(!dl) return;
+  try{
+    const resp = await fetch('/api/models' + (refresh ? '?refresh=1' : ''));
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    const models = await resp.json();
+    const all = [...new Set((models||[]).flatMap(m=>(m.models||[]))
+                            .map(String).filter(m=>m && !m.startsWith('(')))];
+    dl.innerHTML = all.map(m=>`<option value="${H(m)}">${H(m)}</option>`).join('');
+    if(hint) hint.innerHTML = all.length
+      ? `可选模型 ${all.length} 个 <a href="#" onclick="loadModelList(true);return false;">刷新</a>`
+      : `未探测到可用模型（端点可能离线） <a href="#" onclick="loadModelList(true);return false;">重试</a>`;
+  }catch(e){
+    if(hint) hint.innerHTML = `模型列表加载失败：${H(e.message)} <a href="#" onclick="loadModelList(true);return false;">重试</a>`;
+  }
+}
+window.loadModelList = loadModelList;
 async function saveModels(){
   const patch = {llm: {
       provider: document.getElementById('c_provider').value,
