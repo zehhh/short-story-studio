@@ -805,7 +805,7 @@ def cmd_material(cfg: dict, args):
     items = mat.query(cfg, mtype=args.mtype or "", direction=args.direction or "",
                       keyword=args.q or "", limit=args.n)
     if not items:
-        print("素材库为空。成稿后自动沉淀，或 material add 手动添加。")
+        print("素材库为空。生成时加 --deposit，或 material add 手动添加。")
         return
     for x in items:
         score = f" {x.get('score')}分" if x.get("score") else ""

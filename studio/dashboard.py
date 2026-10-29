@@ -2032,7 +2032,7 @@ async function loadMat(){
       <div style="margin-top:5px">${H(x.text)}</div>
       ${x.note?`<div class="dim" style="margin-top:3px">整理意见：${H(x.note)}</div>`:''}
       <div class="dim" style="margin-top:3px">${H(x.source_project||'')} · ${H(x.created_at||'')}</div></div>`;
-  }).join('') || (matView==='trash' ? '<div class="dim">回收站为空</div>' : '<div class="dim">暂无素材（成稿后自动沉淀，或手动添加）</div>');
+  }).join('') || (matView==='trash' ? '<div class="dim">回收站为空</div>' : '<div class="dim">暂无素材（生成时勾选「沉淀素材入库」，或手动添加）</div>');
 }
 window.loadMat = loadMat;
 async function matCurate(){
