@@ -1445,6 +1445,7 @@ def main() -> int:
         test_pipeline_word_expand_compares_int_to_int,
         test_editor_rewrite_refills_prev_text,
         test_chapter_todo_uses_commit_receipt,
+        test_cross_dup_detects_repeated_sentence_across_sections,
     ]
     try:
         for fn in order:
@@ -3288,6 +3289,42 @@ def test_chapter_todo_uses_commit_receipt():
         pr.chapter_file(1).write_text("被手工改成别的内容" * 50, encoding="utf-8")
         assert D.is_committed(pr, 1) is False, "正文被改过，sha 对不上就不算已提交"
     print("  [ok] todo 含 is_committed / 半状态不算完成 / 改过不算完成")
+
+
+@case
+def test_cross_dup_detects_repeated_sentence_across_sections():
+    """跨章逐字重复：段级/摘要级查重都抓不到的"同一句写两遍"。
+
+    现场（2026-10-29 真 API 实测稿）：第 03 节原样复用第 01 节的
+    「你妹不是要房子吗？让她来管。」——这句 12 字，在节里一字不改地出现了 3 次。
+    · `dup_report` 比整段（≥18 字且整段相同）→ 一句 12 字嵌在长段里，抓不到；
+    · 章级 `repeat_suspect` 比摘要（语义）→ 摘要里没有台词，抓不到；
+    · 大纲拍检查只看计划 → 这句是写手临场复用，计划里没有。
+    三套全放行，但读者一眼就看出来（体检因此判 B 有瑕疵）。
+    """
+    from studio import audit as A
+    from studio import langqa
+
+    s1 = "我把围裙解下来摔在他脸上。\n「你妹不是要房子吗？让她来管。」\n他没接话。"
+    s2 = "我把手里的小票摊开。\n他蹲下来捏起一张。\n「你妹不是要房子吗，让她来管」他忽然说。"
+    hits = langqa.cross_dup(s2, [s1])
+    assert hits and hits[0]["len"] >= 12, f"标点不同也要抓到（去标点后比对）：{hits}"
+    assert "你妹不是要房子吗" in hits[0]["text"], f"片段应可读：{hits}"
+
+    # 短节拍句（「她没说话。」）复用是正常文风节拍，不能报
+    assert langqa.cross_dup("她没说话。他也没说话。", ["她没说话。天黑了。"]) == [], \
+        "低于 12 字的节拍句不该算重复"
+
+    # 体检档位：≥24 字判 fail（C），14—23 字判 warn（B）
+    long_sent = "同志我还有个人要举报开发商的王经理他跟我哥一块算计我家房子"
+    res = A.audit_text(f"01\n\n{long_sent}。\n\n02\n\n他又说了一遍：{long_sent}。")
+    assert "B语言/跨章逐字重复" in res["fails"], f"超长逐字重复必须判硬线：{res['fails']}"
+    assert res["cross_dup"]["max_len"] >= A.CDUP_FAIL_LEN
+
+    res2 = A.audit_text("01\n\n我们把话说清楚再谈钱的事吧行不行。\n\n02\n\n她说：我们把话说清楚再谈钱的事吧行不行。")
+    assert "B语言/跨章逐字重复(轻)" in res2["warns"], f"中等长度只判 warn：{res2['warns']}"
+    assert "B语言/跨章逐字重复" not in res2["fails"]
+    print("  [ok] 跨章逐字重复：12 字抓得住 / 节拍句不误报 / 24 字判 C、中档判 B")
 
 
 if __name__ == "__main__":

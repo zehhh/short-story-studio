@@ -35,6 +35,9 @@ DIALOG_RATIO_MIN = MT["dialog_ratio_min"]
 SECTION_RATIO_MAX = MT["section_ratio_max"]
 WORDS_MIN, WORDS_MAX = MT["words_min"], MT["words_max"]
 LONG_PARA_CHARS = MT["long_para_chars"]
+CDUP_FAIL_LEN = MT["cdup_fail_len"]
+CDUP_WARN_LEN = MT["cdup_warn_len"]
+CDUP_WARN_N = MT["cdup_warn_n"]
 REVIEW_PASS = 7.0
 
 
@@ -58,6 +61,22 @@ def sections(text: str) -> list[tuple[str, str]]:
         # 否则 01 凭空多出 400 字，节长极差被虚报（e2e5 实测 1.36× 变 1.69×）。
         out.pop(0)
     return out
+
+
+def cross_dup_scan(bodies: list[tuple[str, str]], limit: int = 8) -> dict:
+    """逐节扫描跨章逐字重复。`bodies` 是 `[(sec_no, body)]`（与 `sections()` 同源）。
+
+    返回 `{"hits": [{ch, prev, text, len}], "max_len": int}`。
+    一条重复只留最长的那次（同一段文字被后面多章复用时，每章各报一条更利于返修）。
+    """
+    hits: list[dict] = []
+    prev: list[str] = []
+    for idx, (no, body) in enumerate(bodies, 1):
+        for h in langqa.cross_dup(body, prev):
+            hits.append({**h, "ch": no, "prev": f"{h['prev']:02d}"})
+        prev.append(body)
+    hits.sort(key=lambda h: -int(h.get("len") or 0))
+    return {"hits": hits[:limit], "max_len": int(hits[0]["len"]) if hits else 0}
 
 
 def audit_text(text: str, report: dict | None = None, direction: str = "") -> dict:
@@ -124,6 +143,26 @@ def audit_text(text: str, report: dict | None = None, direction: str = "") -> di
     add("B语言", "详略/千字", dens["detail"] <= DETAIL_PER_K_MAX, dens["detail"],
         f"≤{DETAIL_PER_K_MAX}")
 
+    # 跨章逐字重复。为什么单列一项：段级 `dup_report` 要求整段相同（≥18 字），
+    # 一句嵌在长段里的话抓不到；摘要级 `repeat_suspect` 看不见正文台词。
+    # 2026-10-29 实测稿第 03 节原样复用第 01 节「你妹不是要房子吗？让她来管。」，
+    # 三套既有查重全放行，是读者一眼就看得出的重复。
+    cdup = cross_dup_scan(bodies)
+    cd_max = int(cdup["max_len"])
+    cd_bad = cd_max >= CDUP_FAIL_LEN
+    cd_warn = (not cd_bad) and (cd_max >= CDUP_WARN_LEN or len(cdup["hits"]) >= CDUP_WARN_N)
+    add("B语言", "跨章逐字重复", not cd_bad,
+        f"{len(cdup['hits'])} 处（最长 {cd_max} 字）"
+        + (f"，如第{cdup['hits'][0]['ch']}章 vs 第{cdup['hits'][0]['prev']}章"
+           f"「{cdup['hits'][0]['text'][:20]}」" if cdup["hits"] else ""),
+        f"无 {CDUP_FAIL_LEN} 字以上逐字重复")
+    if cd_warn:
+        # 同一条缺陷只报一次：硬线已 fail 时不再补一条 warn，否则同一句话在
+        # fails 与 warns 里各出现一次（看板会把"1 个问题"显示成 2 个）。
+        add("B语言", "跨章逐字重复(轻)", False,
+            f"{len(cdup['hits'])} 处，最长 {cd_max} 字",
+            f"≤{CDUP_WARN_N - 1} 处且最长 <{CDUP_WARN_LEN} 字", "warn")
+
     # C 节奏
     add("C节奏", "对话段占比", ratio >= DIALOG_RATIO_MIN, round(ratio, 3), f"≥{DIALOG_RATIO_MIN}")
     add("C节奏", "超长无对话段", not long_paras, len(long_paras),
@@ -180,4 +219,5 @@ def audit_text(text: str, report: dict | None = None, direction: str = "") -> di
         "fails": [f"{c['group']}/{c['name']}" for c in fails],
         "warns": [f"{c['group']}/{c['name']}" for c in warns],
         "worst_sections": per_sec[:4],
+        "cross_dup": cdup,
     }

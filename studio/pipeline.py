@@ -4545,8 +4545,21 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
         # 报过，体检再报一次会让 `reasons` 变成同一句话两遍（实测 mock 跑出 7 条
         # 原因里 3 条是重复的）。体检独有的是结构/节奏/规范三类。
         _dup = ("A结构/字数", "E门禁/平台检查")
+        # 例外：`B语言/跨章逐字重复` 不在 market_lang 的覆盖面内（它比的是段级/摘要级），
+        # 若跟着其它 B语言项一起被丢掉，就变成"体检判 C、投稿判 A"——正是本模块要消灭的分裂。
+        _lang_covered = ("B语言/缺陷总分", "B语言/碎句", "B语言/长句", "B语言/碎句链",
+                         "B语言/语序", "B语言/欧化", "B语言/冗余", "B语言/详略")
         _audit_fails = [f for f in _aud["fails"]
-                        if f not in _dup and not f.startswith("B语言/")]
+                        if f not in _dup
+                        and not any(f.startswith(_p) for _p in _lang_covered)]
+        # 跨章逐字重复：硬线已在 _audit_fails 里，轻档（口头禅级别）只记软瑕疵并落 report。
+        _cd = _aud.get("cross_dup") or {}
+        if _cd.get("hits"):
+            report["cross_dup"] = _cd
+            if int(_cd.get("max_len") or 0) < _au.CDUP_FAIL_LEN:
+                _soft.append(f"跨章逐字重复 {len(_cd['hits'])} 处"
+                             f"（最长 {_cd['max_len']} 字，如第{_cd['hits'][0]['ch']}章"
+                             f"复用第{_cd['hits'][0]['prev']}章「{_cd['hits'][0]['text'][:16]}」）")
         # 书名卖点分：签约第一道门槛，随 report 落盘并进投稿结论。
         _pitch_r = project.load_json("pitch.json") or {}
         _title = str(_pitch_r.get("title") or "")

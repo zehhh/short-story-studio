@@ -325,6 +325,80 @@ def dup_report(text: str, rules: dict | None = None) -> dict:
     }
 
 
+_CDUP_MIN_LEN = 12
+
+
+def _norm_sent(s: str) -> str:
+    """句级归一化：去空白 + 去引号 + 去标点。
+
+    为什么要去标点：作者复用自己写过的强句时，往往只改个标点或加个逗号
+    （「你妹不是要房子吗？让她来管。」→「你妹不是要房子吗，让她来管」），
+    带标点比对会漏掉这种"改标点式复用"。
+    """
+    s = _norm_para(s)
+    return re.sub(r"[。，、！？；：…—\-—～~·,.!?;:()（）《》\[\]【】]", "", s)
+
+
+def cross_dup(new_text: str, prev_texts: list[str],
+              n: int = _CDUP_MIN_LEN, limit: int = 6) -> list[dict]:
+    """跨章**逐字重复**检测：本章正文里与已写章节逐字相同的片段（字符 n-gram 扩展）。
+
+    为什么需要它（2026-10-29 实测漏检）：
+      既有三套查重都不是这个粒度——
+      · `dup_report` 比的是**整段**（阈值 18 字且要求整段相同），
+        一句嵌在长段里的话永远抓不到；
+      · 章级 `repeat_suspect` 比的是**摘要**（laya 语义判重），
+        正文复用一句台词，摘要里根本看不见；
+      · 大纲/拍检查只看计划，而实测这一句是**写手临场复用**自己第 1 章写的强句
+        （婆媳大战实测稿第 03 节复用第 01 节的「你妹不是要房子吗？让她来管。」）。
+    结果是"读者一眼就看出来的重复"，三套检测全放行。
+
+    为什么按字符 n-gram 而不是按句：
+      实测句子边界会骗人——同一句话在两章里标点不同（「吗？」vs「吗，」），
+      或被拆成两行对话，按句哈希直接漏。字符 n-gram 扩写不受标点影响，
+      且能抓到"半句复用"（只复用后半句也刺眼）。
+
+    返回 `[{"text": 重复片段, "prev": 最早出现的第几章(1基), "len": 长度}]`，
+    按长度降序。`limit` 只截返回条数。
+    """
+    if not new_text or not prev_texts:
+        return []
+    pool: dict[str, int] = {}
+    for idx, pt in enumerate(prev_texts, 1):
+        s = _norm_sent(pt or "")
+        for k in range(len(s) - n + 1):
+            pool.setdefault(s[k:k + n], idx)
+    if not pool:
+        return []
+    cur = _norm_sent(new_text)
+    hits: list[dict] = []
+    i = 0
+    end = len(cur) - n + 1
+    while i < end:
+        where = pool.get(cur[i:i + n])
+        if where is None:
+            i += 1
+            continue
+        # 向前扩到最长：同一段重复只报一次，而不是每 n 字报一次
+        j = i + n
+        while j < len(cur) and (cur[j - n + 1:j + 1] in pool):
+            j += 1
+        hits.append({"text": cur[i:j], "prev": where, "len": j - i})
+        i = j
+    if not hits:
+        return []
+    hits.sort(key=lambda h: -h["len"])
+    return hits[:limit]
+
+
+def format_cross_dup(hits: list[dict]) -> str:
+    """跨章重复 → 给写手看的清单（进重写提示词，必须带原句才改得准）。"""
+    if not hits:
+        return ""
+    return "\n".join(f"- 第{h['prev']}章已写过：「{h['text']}」（{h['len']} 字逐字重复）"
+                     for h in hits)
+
+
 def fragment_report(text: str, rules: dict | None = None) -> dict:
     """碎句/长句检测：只抓"整篇节奏"层面的极端离群，不做逐句语法判定。
 
