@@ -11,7 +11,7 @@
 | `studio/pipeline.py` | 流程编排、各 stage、`_chapter_ctx`（draft 占位符来源） | 流程 | 5 条 + 真实小样 |
 | `studio/langqa.py` | 确定性语言质检（读 `data/lang_rules.json`） | 规则执行器 | 契约 + 漂移 + 冒烟 |
 | `studio/prompts.py` | 模板加载/渲染、`_safe_val`、MARKET/GENRE 自动注入 | 渲染机制 | 契约 |
-| `prompts/*.md` | 35 个 `<!--TASK:XXX-->` 模板（SYSTEM + USER） | prompt 文案 | 契约 + 漂移 + 冒烟 |
+| `prompts/*.md` | 36 个 `<!--TASK:XXX-->` 模板（SYSTEM + USER） | prompt 文案 | 契约 + 漂移 + 冒烟 |
 | `data/lang_rules.json` | **L2 语言规则唯一 owner**（词表/正则/阈值/severity） | 规则 | 漂移 + 冒烟 |
 | `data/platforms.json` | **L1 平台参数**（字数区间/卡点密度/人称/格式） | 平台 | 静态 + 漂移 |
 | `data/{tropes,readers,genres,genre_chains,character_templates,material_tags}.json` | 资产库 | 数据 | 静态 + 冒烟 |
