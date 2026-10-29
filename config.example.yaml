@@ -1,0 +1,95 @@
+# 短篇小说工作室配置示例
+# 复制为 config.yaml 后修改。所有字段都有默认值；也可用环境变量覆盖：
+#   STUDIO_LLM_BASE_URL / STUDIO_LLM_API_KEY / STUDIO_LLM_MODEL / STUDIO_PLATFORM ...
+
+llm:
+  provider: auto            # auto=有 key 用 API，否则 mock / api / mock
+  # 任意 OpenAI 兼容接口均可：
+  #  DeepSeek:  https://api.deepseek.com/v1   + deepseek-chat
+  #  智谱GLM:   https://open.bigmodel.cn/api/paas/v4 + glm-4-plus
+  #  Kimi:      https://api.moonshot.cn/v1    + moonshot-v1-32k
+  #  通义Qwen:  https://dashscope.aliyuncs.com/compatible-mode/v1 + qwen-max
+  #  本地模型:  http://127.0.0.1:11434/v1     + qwen2.5:14b (Ollama)
+  base_url: https://api.deepseek.com/v1
+  api_key: ""               # 填你的 sk-xxx
+  model: deepseek-chat
+  temperature: 0.85
+  max_tokens: 8192
+  timeout: 300
+  retries: 3
+  qps: 0                    # 两次调用最小间隔秒数（防止限流可设 1）
+  stream: auto              # 流式输出：auto=本地引擎自动开启（长文可见进度）/ true / false
+
+studio:
+  workspace: workspace      # 产物目录（相对本目录）
+  platform: zhihu           # 默认平台: zhihu(盐选) / fanqie(番茄) / uc / qimao
+  target_words: 10000       # 全稿目标字数
+  chapters: 0               # 0=按字数自动定章节数
+  hot_top: 30               # 每平台抓取条数
+  concept_candidates: 6     # 一次提几张梗卡
+  dailyhot_base: ""         # 可选：自建 DailyHotApi，如 http://127.0.0.1:6688
+  sources: [weibo, zhihu, baidu, douyin, toutiao, bilibili]
+  weibo_cookie: ""          # 可选：浏览器 F12 里 SUB=... 那串，显著提高微博热搜成功率
+
+# 写作-审查四道门禁：语言质检(免费) → 毒舌主编 → 读者评分团 → 情绪量化
+review:
+  enabled: true             # 总开关（CLI: --no-review 关闭）
+  langqa_enabled: true      # 语言质检门：黑名单/句式词频确定性扫描，零 token 成本（CLI: --no-langqa）
+  langqa_max_rounds: 2      # 语言质检打回重写上限
+  max_review_rounds: 3      # 主编打回重写上限，达到上限按现稿放行并标记
+  reader_enabled: true      # 读者评分团开关
+  reader_panel: 3           # 参与评分的读者画像数（按题材亲和力优先挑选，画像见 data/readers.json）
+  score_threshold: 7.5      # 读者团均分阈值(0-10)，低于即带反馈打回重写
+  max_reader_rounds: 2      # 读者评分打回重写上限
+  emotion_enabled: true     # 情绪量化门：情绪分/钩子强度/虐爽比/毒点（CLI: --no-emotion）
+  emotion_threshold: 7.0    # 情绪总分阈值（0-10）
+  hook_threshold: 7.0       # 章尾钩子强度阈值（0-10）
+
+# 题材知识库：写作前自动搜集公开资料蒸馏成知识卡（data/knowledge/）
+knowledge:
+  auto_collect: true        # 总开关（CLI: --no-kb 关闭）
+  max_pages: 8              # 每题材最多抓取网页数
+  page_chars: 1500          # 每页正文提取字符上限
+  digest_budget: 2200       # 注入 prompt 的知识摘要字符预算
+  allow_llm_fallback: true  # 搜索全部失败时降级为 LLM 内化生成
+
+# ─── 自动发布与阅读数据回流 ──────────────────────────────────────────
+# 平台均无公开发布 API：manual=生成投稿包（永远可用）；custom=抓包后自配接口；
+# 发布记录落盘项目 publish.json，数据快照落盘 workspace/analytics/。
+publish:
+  platform: fanqie          # fanqie / zhihu / uc / qimao
+  mode: manual              # manual / custom / mock
+  cookie: ""                # 作家后台登录 cookie（custom 模式）
+  endpoints:
+    publish: ""             # 发布接口模板 POST，支持 {title}/{content} 占位（抓包获得）
+    stats: ""               # 数据接口 GET，返回 JSON
+  fields: {}                # 数据字段映射，如 {reads: data.reads, finish_rate: data.finishRate}
+
+analytics:
+  source: mock              # mock / custom
+
+# ─── 本地小模型 / 角色路由 ────────────────────────────────────────────
+# 给不同任务配不同模型：本地 OpenAI 兼容引擎（Ollama/LM Studio/llama-server）
+# 与云端 API 可混用。未配置的角色沿用主 llm。探测与基准：python -m studio local
+#
+# llm_roles:
+#   reviewer:                  # 主编审查 + 全稿体检（高频 JSON，小模型足够）
+#     provider: local
+#     base_url: http://127.0.0.1:11434/v1
+#     model: qwen3:8b
+#   panel:                     # 读者评分团（调用量最大，本地零成本）
+#     provider: local
+#     base_url: http://127.0.0.1:11434/v1
+#     model: qwen3:8b
+#   light:                     # 知识卡蒸馏
+#     provider: local
+#     base_url: http://127.0.0.1:11434/v1
+#     model: qwen3:8b
+#   writer:                    # 可选：写手也走本地（纯本地模式）
+#     provider: local
+#     base_url: http://127.0.0.1:11434/v1
+#     model: qwen3:14b
+#   planner: {}                # 提梗/书名/大纲/圣经，未配置 → 沿用主 llm
+#
+# ⚠ Ollama 用户务必设上下文，否则默认 4K 截断长稿：
+#   setx OLLAMA_CONTEXT_LENGTH 16384   （设完重启 Ollama）知识卡

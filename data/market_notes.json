@@ -1,0 +1,53 @@
+{
+  "_comment": "番茄榜单实证语料（人工从公开页面抄录，未接采集器）。用途：① 书名卖点门的真实样本（studio/title_gate.py 的 hint() 从 title_score>=5 的样本里取正例）；② 复盘时能回答「这个结论是从哪本书看出来的」。禁止在这里编造书名——只放实际看到的。",
+  "_source": {
+    "url": "https://fanqienovel.com/",
+    "page": "首页「最近更新」+ 男频/女频精选 + 排行榜入口",
+    "fetched_at": "2026-10-26",
+    "method": "web_fetch 直取 HTML 文本后人工摘录（未用爬虫/接口）"
+  },
+  "signing_rules": [
+    {
+      "rule": "短篇作品字数大于 1 万字可申请签约；长篇为 2 万字",
+      "source": "番茄小说小课堂《作品运作说明》 https://mp.toutiao.com/docs/novel/295/65542",
+      "impact": "本项目短篇目标字数下限应从 8000 抬到 10000，否则跑完也过不了签约线"
+    },
+    {
+      "rule": "2026-10-12 新规：Lv.0/Lv.1 新书只能走「完本签约」（15 万 / 30 万字），Lv.2 以上可连载签约",
+      "source": "https://m.36kr.com/p/4028300871996041 ；https://www.sohu.com/a/1087189687_313745",
+      "impact": "短篇/短故事频道不在完本限制内，仍是新人的低门槛入口；但书名审美门槛没降"
+    },
+    {
+      "rule": "番茄签约被拒的公开归因集中在「书名没卖点、简介没钩子、前三章劝退」，很少是字数不够",
+      "source": "https://maliangwriter.com/guides/fanqie-novel-signing-guide/",
+      "impact": "把书名校验从「长度/标点」升级为「卖点分」"
+    }
+  ],
+  "titles": [
+    {"title": "我妈把一百二十万拆迁款全给了我弟，转头让我出十万给她做手术", "kind": "关系冲突", "family": "relation"},
+    {"title": "我把婚房让给弟弟，他结婚第二天把我行李扔在楼道", "kind": "关系冲突", "family": "relation"},
+    {"title": "主播万人迷骗了八个豪门网恋翻车", "kind": "关系冲突", "family": "relation"},
+    {"title": "太后赐婚那天，我把圣旨咬破了一个角", "kind": "古言关系", "family": "relation"},
+    {"title": "替姐姐进宫那夜，皇上掀开盖头喊的却是我的名字", "kind": "古言关系", "family": "relation"},
+    {"title": "港岛73：我爹搞社团我搞黑科技", "kind": "设定卖点", "family": "concept"},
+    {"title": "开局一张图，百鬼跪着喊我姐", "kind": "设定卖点", "family": "concept"},
+    {"title": "我在大清当老六", "kind": "设定卖点", "family": "concept"},
+    {"title": "被苗疆少主缠上了", "kind": "设定卖点", "family": "concept"},
+    {"title": "穿越后，女主求我别走", "kind": "设定卖点", "family": "concept"},
+    {"title": "武道提现，我靠肝熟练度肉身成圣", "kind": "设定卖点", "family": "concept"},
+    {"title": "末日求生：开局无限强化超凡序列", "kind": "设定卖点", "family": "concept"}
+  ],
+  "chapter_names": [
+    {"name": "索要损失费", "book": "港岛73：我爹搞社团我搞黑科技", "pattern": "具体可索取的财物/权利"},
+    {"name": "抢凳子", "book": "主播万人迷骗了八个豪门网恋翻车", "pattern": "一个具体动作当整章冲突"},
+    {"name": "我只想要你的钱", "book": "被苗疆少主缠上了", "pattern": "一句台词直接当章名"},
+    {"name": "暧昧的都拉丝了", "book": "京婚有礼", "pattern": "关系推进到一个可感知的程度"},
+    {"name": "对峙", "book": "开局一张图，百鬼跪着喊我姐", "pattern": "两字动词，场面型章名"}
+  ],
+  "rejected_for_short_form": [
+    {"title": "萤火之城", "why": "4 字文艺名：靠作者名望和长书曝光位，不靠书名自己打架"},
+    {"title": "娇养玫瑰", "why": "同上；短故事频道没有曝光位可以借"},
+    {"title": "心肝宠", "why": "同上"},
+    {"title": "够野", "why": "同上"}
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "_comment": "读者评分团画像：按题材亲和力挑选。score 满分10分，低于阈值视为不通过并打回重写。",
+  "readers": [
+    {
+      "id": "wangayi",
+      "name": "追更的王阿姨",
+      "age": 58,
+      "profile": "县城退休纺织女工，广场舞队消息灵通人士，番茄/七猫重度用户，爱看婆媳、彩礼、分家赡养，专挑'不像真的'的细节毛病",
+      "affinity": ["poxi", "caili", "fenjia", "chaiqian", "liuyan", "gedai"],
+      "hates": "假大空的团圆说教、主角圣母心、反派蠢得没脑子",
+      "loves": "细节真实到像自家事、恶人现世报、当众评理翻盘"
+    },
+    {
+      "id": "baoma",
+      "name": "夜刷手机的宝妈小陈",
+      "age": 31,
+      "profile": "镇上开小超市，带俩娃，只有睡前刷手机的时间，知乎盐选会员，看扶弟魔、婚内背叛、宝妈生存题材",
+      "affinity": ["fudi", "beipan", "caili", "poxi", "fanxiang", "xiangqin"],
+      "hates": "女主憋屈二十章不反击、为虐而虐、男人调和式结局",
+      "loves": "女主清醒断亲搞钱、孩子不是拖油瓶是软肋也是铠甲"
+    },
+    {
+      "id": "dagong",
+      "name": "流水线上的阿伟",
+      "age": 26,
+      "profile": "电子厂打工，宿舍熄灯后用手机看文，爱看逆袭、讨薪、县城职场、赘婿打脸",
+      "affinity": ["pua", "zhuixu", "hengcai", "chongsheng", "xiangqin"],
+      "hates": "主角 wins 靠背景不靠自己、节奏慢、说教",
+      "loves": "憋屈到顶一波反杀、取证掀桌、数字对账式打脸"
+    },
+    {
+      "id": "yinfaguniang",
+      "name": "给爸妈找书看的娟娟",
+      "age": 40,
+      "profile": "市里上班，帮爸妈挑故事看，关注黄昏恋、养老、保健品骗局、隔代抚养，眼光挑剔",
+      "affinity": ["yinfa", "baojianpin", "gedai", "jiomingqian", "fenjia"],
+      "hates": "把老人写成糊涂蛋、子女都是白眼狼的脸谱化、消费苦难",
+      "loves": "老人的体面与清醒、两代人和解但不和稀泥"
+    },
+    {
+      "id": "bianjiqi",
+      "name": "弃稿率极高的老书虫",
+      "age": 35,
+      "profile": "看了十五年网文的老读者，盐选/番茄双平台，任何题材都看，开头三段抓不住他就划走",
+      "affinity": [],
+      "hates": "开头铺垫太长、卡点稀、伏笔忘回收、结尾大道理",
+      "loves": "炸裂开头、严丝合缝的伏笔回收、最后一幕有画面"
+    },
+    {
+      "id": "xinxuannv",
+      "name": "刚毕业的茜茜",
+      "age": 23,
+      "profile": "省城实习期，通勤路上听书看书，爱看女性觉醒、小镇相亲、原生家庭题材，会转发到闺蜜群",
+      "affinity": ["fudi", "xiangqin", "liuyan", "beipan", "peidu"],
+      "hates": "雌竞内耗、强行大团圆、把忍耐写成美德",
+      "loves": "女主搞钱搞事业、毒舌金句、姐妹互助"
+    }
+  ]
+}

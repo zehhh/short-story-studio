@@ -1,0 +1,59 @@
+# ---- 密钥（绝不提交）----
+config.yaml
+config.local.yaml
+config.yaml.bak
+*.key
+*.pem
+.env
+.env.*
+
+# ---- 运行时产物 ----
+workspace/
+workspace_logs/
+out/
+dashboard.html
+*.log
+
+# ---- 另一个独立子项目（数据集/训练，约 11G，不属于本仓库）----
+dataset-forge/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+
+# ---- Agent / 编辑器状态 ----
+.memsearch/
+.workbuddy-ai/
+.idea/
+.vscode/
+
+# ---- 临时草稿（本项目历史上堆在根目录的一次性脚本）----
+.tmp_*
+tmp_probe.py
+*.tmp
+_probe_*.py
+_produce_impl.py
+_rebuild_vectors.py
+_create_ui.js
+_patch_*.py
+_patch_*.txt
+_run_out.txt
+mock_out*.txt
+
+# ---- 系统 ----
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- 源码快照归档（体积大且与源码重复）----
+*.zip
+短篇工作室源码.zip
+
+# ---- 生成稿示例（属 workspace 产物）----
+断簪还我本宫不要了.md
