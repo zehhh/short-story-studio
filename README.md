@@ -3,7 +3,6 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-lightgrey?style=flat-square)](LICENSE)
 [![Commercial Use](https://img.shields.io/badge/commercial%20use-license%20required-orange?style=flat-square)](COMMERCIAL.md)
-[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
 抓热点 → 提炼核心梗 → 多 agent 协作扩写出完整短篇小说的一条龙生产线。
 产物是可直接投稿的成稿（`final/成稿.md` / `.txt`）。Python 标准库 + 三个依赖：
