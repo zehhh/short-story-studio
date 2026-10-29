@@ -1,7 +1,8 @@
 # 短篇小说工作室（Short Story Studio）
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
-[![License: PolyForm NC](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-orange?style=flat-square)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+[![Commercial Use](https://img.shields.io/badge/commercial%20use-allowed-brightgreen?style=flat-square)](COMMERCIAL.md)
 [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
 自动抓取各大平台短篇小说热点 → 提炼**核心梗** → 多 agent 协作扩写出完整的**下沉市场短篇小说**的全流程生产线。纯 Python 标准库实现，无第三方框架依赖（`requests` / `pyyaml` 之外全部内置）。
@@ -92,8 +93,8 @@ python -m studio run --idea "退婚被索88万彩礼，女主用一张十年前�
 ## 管线各阶段（都在防"扑街"）
 
 1. **抓热点**（`studio/hotspots/`）：微博/知乎/百度/抖音/头条/B站/贴吧 直连适配器，
-   并发抓取 + 跨平台近似去重 + 热度归一排序；微博风控时可配 cookie 或走自建
-   [DailyHotApi](https://github.com/imsyy/DailyHotApi) 聚合通道（`dailyhot_base`）。
+   并发抓取 + 跨平台近似去重 + 热度归一排序；微博风控时可配 cookie，或指向任意自建的
+   聚合热榜服务（`dailyhot_base`，兼容常见的 `/api?type=xxx` 聚合接口返回结构）。
 2. **提核心梗**（`mine`）：把热点榜单喂给 LLM，对照梗库方向产出 N 张"梗卡"
    （核心梗/情绪主轴/冲突/开头钩子/爆款潜力分），热点只是由头，转成虚构世情故事。
 3. **题材知识库**（`kb` / `stage_kb`）：按所选方向自动 Bing 搜索（百度兜底）公开资料，
@@ -254,8 +255,8 @@ python -m studio local --snippet      # 生成混合模式 config.yaml 片段，
 实测参考（某 CPU 机器 + Ollama + qwen3）：生成 2.1 字/秒但 **JSON 指令遵循 3/3**——
 写正文太慢，但做审查/评分完全够格，正是混合模式的价值；生成样例文风已相当"下沉"
 （"腊月里飘着细雪，老张婆子把儿媳陪嫁的金镯子往小姑子手心一塞"）。
-进一步可探索社区网文微调模型（如 HuggingFace 上的 Qwen 系爽文 LoRA/GGUF），或用
-[LLaMA Factory](https://github.com/hiyouga/LLaMA-Factory) 以 2000-5000 条过稿文本自训写手模型。
+进一步可探索社区网文微调模型（如 HuggingFace 上的 Qwen 系爽文 LoRA/GGUF）；若要做领域微调，
+用任意训练框架以 2000-5000 条过稿文本自训写手模型即可，本项目不绑定具体训练方案。
 
 ## 自动发布与数据闭环
 
@@ -286,7 +287,7 @@ python -m studio local --snippet      # 生成混合模式 config.yaml 片段，
 **BM25 + 中文字符 bigram**（零嵌入模型、纯 CPU、离线可用，社区验证的轻量本地方案），
 源文件变化自动重建。写作时按"核心梗+方向+本章目标"检索，命中素材直接注入章节提示词。
 
-**拆书**（`studio/deconstruct.py`，参考行业拆书方法论：每章核心目标/开篇钩子/核心冲突/
+**拆书**（`studio/deconstruct.py`，按五维结构拆解：每章核心目标/开篇钩子/核心冲突/
 爽点虐点/章末悬念 + 起承转合 + 节奏标记）：
 
 ```bash
@@ -367,8 +368,8 @@ curate（跑整理）/ trash（看回收站）/ restore --id（恢复）`。
 
 ## 知识系统（结构拆解 + 向量建模 + 共现矩阵联想）
 
-参考 [VCPToolBox 浪潮语义动力学](https://github.com/lioensky/VCPToolBox)、HippoRAG（Personalized PageRank）、
-GraphRAG（结构摘要）设计的四层知识系统（详细方案见 `docs/knowledge_system_plan.md`）：
+四层知识系统（详细方案见 `docs/knowledge_system_plan.md`）：结构拆解定骨架，向量层管语义相近，
+共现层做无字面重叠的联想扩散，检索层三路融合按弧位加权——每层解决上一层解决不了的问题：
 
 1. **结构拆解层**：拆书自动标注叙事弧——每段输出 `arc`（起/承/转/合）+ `arc_role`（弧内功能）+
    开头片段 `lead_pattern`（数字悬念/身份反差/偷听反差/倒计时）；全书聚合为 `arc_map` 弧线图；
@@ -382,10 +383,9 @@ GraphRAG（结构摘要）设计的四层知识系统（详细方案见 `docs/kn
 CLI：`kb stats / recall --q "查询" --arc 转 / rebuild / migrate`；
 看板：素材库页签 →「📚 知识结构」→ 联想检索测试。
 
-## 记忆库（参考 VCPToolBox 记忆系统设计）
+## 记忆库
 
-素材库即记忆单元池，参考 [lioensky/VCPToolBox](https://github.com/lioensky/VCPToolBox)
-多层级持久化记忆思想实现四条机制（`studio/memory.py`，零依赖）：
+素材库即记忆单元池，按多层级持久化记忆的思路实现四条机制（`studio/memory.py`，零依赖）：
 
 - **记忆引力**：写作时信息主动流向模型——逐章上下文自动注入相关记忆，不等检索指令；
 - **标签语义河道**：共享标签的记忆互相增权，BM25 命中做种子后沿标签河道一跳联想扩散
@@ -414,7 +414,7 @@ CLI：`kb stats / recall --q "查询" --arc 转 / rebuild / migrate`；
 
 - **模型与配置**：手动切换模型（本地 Ollama 下拉或任意 OpenAI 兼容 API：填 base_url + model +
   api_key 即完成接入）、按 Agent 角色分配不同模型（策划/写手/审查/读者团/轻量五路 llm_roles）、
-  增删热点抓取来源（七大平台 + DailyHotApi 代理 + mock/custom 勾选即存）、高级 JSON 增量改配置；
+  增删热点抓取来源（七大平台 + 自建聚合代理 + mock/custom 勾选即存）、高级 JSON 增量改配置；
 - **Agent 管理**：14 个 Agent 的门禁开关（语言质检/主编/读者团/情绪门/知识库随手启停），
   点击即可在线编辑任意 Agent 的提示词（保存自动备份 .bak），也可新建自定义提示词模板；
 - **文稿编辑**：选择项目 → 打开成稿或任意章节，在线修改，保存自动备份；支持**删除项目**（二次确认，连带数据快照清理）；
@@ -483,46 +483,43 @@ python -m studio dashboard --export   # 导出自包含静态 HTML（数据内�
 **小节编号规范**：全流程统一使用 `01`、`02`、`03`… 两位数字编号（不用"第X章"）——
 写作、成稿、番茄排版稿、草稿箱推送、拆书识别均按此规范，拆书同时兼容旧"第X章"标记。
 
-## 致谢：参考的开源项目与方法论
+## 设计依据与方法论
 
-- [Long-Novel-GPT](https://github.com/MaoXiaoYuZ/Long-Novel-GPT)：大纲→章节→正文自上而下扩写的经典管线
-- [datacrystals/AIStoryWriter](https://github.com/datacrystals/AIStoryWriter)：章节摘要滚动上下文、按 prompt 逐章产出
-- [RhythmicWave/NovelForge](https://github.com/RhythmicWave/NovelForge)：实体/世界书管理（本项目的"故事圣经"）
-- [imsyy/DailyHotApi](https://github.com/imsyy/DailyHotApi)：热榜聚合思路与可自建的代理数据源
-- [NanmiCoder/MediaCrawler](https://github.com/NanmiCoder/MediaCrawler)：多平台采集的工程化参考（Playwright 重方案，本项目取其轻）
-- [lioensky/VCPToolBox](https://github.com/lioensky/VCPToolBox)：记忆库设计的参考——记忆引力、标签语义河道、冷热分层、使用即强化（见「记忆库」一节）
-- [zhongbai2333/Tomato-Novel-Downloader](https://github.com/zhongbai2333/Tomato-Novel-Downloader) / [shing-yu/7mao-novel-downloader](https://github.com/shing-yu/7mao-novel-downloader)：番茄/七猫接口研究参考
-- 方法论：盐选爆款公式（第一人称+炸裂开头+精准卡点+快节奏、每500字一个卡点、标题即钩子、
-  蹭热点当天出稿多平台分发），以及[短故事爆款公式（7大模板）](https://zhuanlan.zhihu.com/p/1927364960729690189)、
-  [盐选黄金结构](https://zhuanlan.zhihu.com/p/2025903140269037171)等公开拆解；
-- 分层质量门与语言规则：参考社区 18-Agent 创作流水线的"语言质检员/句式词频审查官/情绪拉扯检测官"
-  分层设计，AI 味词表参考[八类禁词实测](https://blog.csdn.net/ksueh/article/details/163422251)、
-  [ai-flavor-remover](https://github.com/hylarucoder/ai-flavor-remover)，毒点清单参考
-  [网文毒点55条](https://zhuanlan.zhihu.com/p/710489723)、[弃书雷区](https://www.wangwen666.com/post/194.html)等公开沉淀；
-- RAG 采用 BM25+字符 n-gram 无嵌入方案（[BM25 优于向量检索的社区实践](https://news.ycombinator.com/item?id=46616529)），
-  拆书方法论参考[AI 高效拆文](https://zhuanlan.zhihu.com/p/2050149729674252671)、
-  [拆书全攻略](https://post.smzdm.com/p/aqr8w68x)（每章核心目标/钩子/冲突/爽虐/悬念五维拆解）
+本项目的规则不是拍脑袋定的，每条判据背后都有可复核的依据。以下按「判据 → 依据 → 落在哪」列出：
+
+| 判据 | 依据 | 代码位置 |
+|---|---|---|
+| 第一人称 + 炸裂开头 + 每 500-800 字一个卡点 + 标题即钩子 | 下沉市场盐选类爆款的公开拆解共识（多篇同构，非单一来源） | `studio/audit.py`、`studio/title_gate.py` |
+| 开头三章定生死（黄金三章） | 平台签约/推荐机制的普遍实践 | `studio/diagnose.py` |
+| 分层质量门（语言 / 句式 / 情绪拉扯分道把关） | 多 agent 创作流水线公开实践中的分工设计 | `studio/langqa.py`、`prompts/review.md` |
+| AI 味词表与句式模板禁用 | 社区多轮实测沉淀的八类高频词 | `data/lang_rules.json` |
+| 毒点 / 弃书雷区清单 | 读者侧弃书原因的公开归纳 | `data/craft.json` |
+| 检索用 BM25 + 字符 n-gram 而非向量嵌入 | 中文短文本上词法检索优于稠密向量的公开复现结论 | `studio/kb*.py` |
+| 拆书五维（核心目标/钩子/冲突/爽虐/悬念） | 拆文方法论的公开拆解 | `studio/dissect.py` |
+| 书名必须带卖点（4 字书名签约必死） | 签约数据与编辑公开经验 | `studio/title_gate.py` |
+
+**说明**：以上均为**方法论层面的借鉴**，用于确定「该检测什么、阈值定在哪」；
+**代码全部为本项目独立实现**，未复制任何第三方项目的源码，也未引入其依赖。
 
 ## License
 
-本项目采用 **[PolyForm Noncommercial License 1.0.0](LICENSE)**（非商业许可，官方原文见
-<https://polyformproject.org/licenses/noncommercial/1.0.0>）。
+本项目采用 **[MIT License](LICENSE)**——**可以自由商用**，包括企业内部使用、付费产品与服务、
+代写工作室收费生产、修改后闭源分发、二次销售。唯一要求是保留版权声明与许可声明。
 
-**可以做的**：个人学习、研究、自用写作、修改代码、非营利组织内部使用、fork 后继续开发并分发
-（须保留同样的许可与版权声明）。
+**完整说明见 [COMMERCIAL.md](COMMERCIAL.md)**。那份文件只做三件事：说清授权现状、划清 MIT
+管不到的边界、给出可选的支持途径。**它不是商用前置条件**——MIT 之下商用无需申请或付费。
 
-**不可以做的**：任何**商业用途**——包括但不限于：把本项目或其衍生作品用于付费服务/付费产品、
-代写工作室的收费生产、企业内部营利性内容生产、把生成的稿件作为商品出售、
-基于本项目提供咨询或外包服务。
+需要你知道的几条边界：
 
-**两句实话**：
+- **成稿的著作权**不在 MIT 授权范围内。你用它写的小说能否投稿、签约、出售，取决于平台条款
+  与当地法律，作者不作任何声明或保证。
+- **`data/knowledge/` 的题材知识卡**是虚构创作参考（人工撰写或公开资料蒸馏），不含真实人物
+  与机构影射；二次商用前请自行评估。
+- **抓取与生成内容的合规责任**在使用者：抓取频率、数据用途、内容审核由你自行承担。
 
-1. 带「不可商用」限制的许可**不是 OSI 定义的开源许可**（OSI 明确不接受「领域限制」）。
-   准确说法是「**源码可见 / source-available**」。如果你要的是严格的 OSI 开源，就得换回 MIT / Apache-2.0。
-2. 许可管的是**代码**。用它生成的**小说稿件**的版权归属，取决于你所在平台与当地法律，
-   本许可不对成稿的商用权利作出授予或限制——那部分请自行确认。
+**MIT 管代码，不管成稿。** 这两件事分开看，就不会踩坑。
 
-需要商业授权请开 issue 联系作者。
+第三方数据与素材的合规提示见「合规与风险提示」一节。
 
-第三方数据与素材的合规提示见「合规与风险提示」一节；`data/knowledge/` 下的题材知识卡为本项目
-人工撰写或由公开资料蒸馏的**虚构创作参考**，不含真实人物与机构影射。
+*历史：早期提交 `7a1b2e3` 曾短暂使用 PolyForm Noncommercial 1.0.0，自 `3f2667e` 起改为 MIT。
+MIT 版本之后发布的代码与数据一律适用 MIT。*

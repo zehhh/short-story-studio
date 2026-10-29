@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """各大平台热点榜适配器。
 
-设计参考 imsyy/DailyHotApi（热榜聚合）与 NanmiCoder/MediaCrawler（多平台采集）：
-轻量直连各平台公开榜单接口，失败自动跳过不影响整体；若本地部署了 DailyHotApi，
-配置 dailyhot_base 即可走代理通道获得更稳定的数据。
+轻量直连各平台公开榜单接口，失败自动跳过不影响整体；若本地部署了热榜聚合服务，
+配置 dailyhot_base 即可走代理通道获得更稳定的数据（兼容 `/api?type=xxx` 这类
+返回 {title,url,hot} 列表的通用结构）。
 """
 from __future__ import annotations
 
@@ -273,18 +273,18 @@ SOURCE_NAMES = {
     "toutiao": "头条热榜",
     "bilibili": "B站热门",
     "tieba": "贴吧热议",
-    "dailyhot": "热榜聚合(DailyHotApi)",
+    "dailyhot": "热榜聚合(自建代理)",
     "mock": "Mock演示数据",
     "custom": "自定义清单",
 }
 
 
 # ---------------------------------------------------------------------------
-# DailyHotApi 代理通道 + mock + 自定义文件
+# 聚合代理通道 + mock + 自定义文件
 # ---------------------------------------------------------------------------
 
 def fetch_dailyhot(base: str, route: str, n: int) -> list[HotItem]:
-    """走自建 DailyHotApi（https://github.com/imsyy/DailyHotApi），GET {base}/{route}"""
+    """走自建热榜聚合服务（兼容通用 /api?type=xxx 结构），GET {base}/{route}"""
     r = requests.get(f"{base.rstrip('/')}/{route}", headers=HEADERS, timeout=TIMEOUT)
     rows = (r.json() or {}).get("data", []) or []
     items = []

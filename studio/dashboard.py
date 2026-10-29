@@ -2337,7 +2337,7 @@ async function renderConfig(){
   const enabled = sources.enabled||[];
   html += `<div class="card"><b>热点抓取来源</b><div class="row" style="margin-top:6px">` +
     sources.available.map(s=>`<label class="sw"><input type="checkbox" class="srcck" value="${s}" ${enabled.includes(s)?'checked':''}> ${s}</label>`).join('') +
-    `</div><div class="row" style="margin-top:8px"><div style="flex:1">DailyHotApi 地址（可选代理）<br>
+    `</div><div class="row" style="margin-top:8px"><div style="flex:1">聚合热榜地址（可选代理）<br>
       <input class="f" id="dhBase" value="${H(sources.dailyhot_base||'')}"></div></div>
     <br><button class="btn" onclick="saveSources()">保存来源</button><span class="dim" id="sMsg"></span></div>`;
   html += `<div class="card"><b>高级（直接改 config，JSON 增量合并）</b>

@@ -31,7 +31,7 @@ DEFAULT_CONFIG = {
         "chapters": 0,                 # 0 = 按目标字数自动定章节数
         "hot_top": 30,                 # 每个平台抓多少条热点
         "concept_candidates": 6,       # 一次提几张梗卡
-        "dailyhot_base": "",           # 可选：自建 DailyHotApi 地址，如 http://127.0.0.1:6688
+        "dailyhot_base": "",           # 可选：自建热榜聚合服务地址，如 http://127.0.0.1:6688
         "sources": ["weibo", "zhihu", "baidu", "douyin", "toutiao", "bilibili"],
         "novel_sources": True,        # 抓热点时同时聚合小说平台/故事向源（七猫榜/知乎故事/贴吧）
         "weibo_cookie": "",            # 可选：浏览器里的 SUB=... cookie，提高微博热搜成功率

@@ -27,7 +27,7 @@ studio:
   chapters: 0               # 0=按字数自动定章节数
   hot_top: 30               # 每平台抓取条数
   concept_candidates: 6     # 一次提几张梗卡
-  dailyhot_base: ""         # 可选：自建 DailyHotApi，如 http://127.0.0.1:6688
+  dailyhot_base: ""         # 可选：自建热榜聚合服务，如 http://127.0.0.1:6688
   sources: [weibo, zhihu, baidu, douyin, toutiao, bilibili]
   weibo_cookie: ""          # 可选：浏览器 F12 里 SUB=... 那串，显著提高微博热搜成功率
 
