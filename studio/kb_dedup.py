@@ -47,11 +47,16 @@ def _better(a: dict, b: dict) -> dict:
     return a if a.get(_OLD_ID, a.get("id", "")) <= b.get(_OLD_ID, b.get("id", "")) else b
 
 
-def scan(cfg: dict, semantic: bool = True, threshold: float = 0.93) -> dict:
+def scan(cfg: dict, semantic: bool = True, threshold: float = 0.93,
+         progress=None) -> dict:
     """扫描重复。返回 {units, drops, reasons, stats}（不改库）。
 
-    semantic=True 时用向量层做近重复扫描（需 embedding 服务，全库 CPU 约 20 分钟）。
+    semantic=True 时用向量层做近重复扫描（需 embedding 服务；耗时随库大小线性增长，
+    163k 单元实测约 4.5 小时——调用方应给进度反馈，不要写死时长）。
     numpy 缺失时自动降级为纯词法扫描（同文/同开头），不抛异常。
+
+    progress(done, total, phase)：可选进度回调。phase="embed" 是向量化阶段
+    （占比约 95%），phase="pair" 是分块比对角逐，phase="done" 收尾。
     """
     from . import kb
 
@@ -121,6 +126,11 @@ def scan(cfg: dict, semantic: bool = True, threshold: float = 0.93) -> dict:
             embs.extend(e)
             if (i // B) % 20 == 0:
                 print(f"[kb-dedup] 语义扫描 {min(i + B, len(texts))}/{len(texts)}…", flush=True)
+                if progress:
+                    try:
+                        progress(min(i + B, len(texts)), len(texts), "embed")
+                    except Exception:  # noqa: BLE001
+                        pass
         if len(embs) == len(units):
             mat = np.array(embs, dtype=np.float32)
             parent = list(range(len(units)))
@@ -152,6 +162,11 @@ def scan(cfg: dict, semantic: bool = True, threshold: float = 0.93) -> dict:
                         if pj != pi:
                             parent[max(pi, pj)] = min(pi, pj)
                 del block
+                if progress:
+                    try:
+                        progress(be, N, "pair")
+                    except Exception:  # noqa: BLE001
+                        pass
 
             clusters: dict[int, list[int]] = defaultdict(list)
             for i in range(len(units)):

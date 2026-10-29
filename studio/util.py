@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
 import time
 import datetime as _dt
 from pathlib import Path
@@ -141,19 +142,28 @@ def extract_json(text: str):
 
 
 class RateLimiter:
-    """简单限速器：保证两次调用间隔不小于 min_interval 秒。"""
+    """简单限速器：保证两次调用间隔不小于 min_interval 秒。
+
+    **必须持锁**：pipeline 的章级门禁走 ThreadPoolExecutor（默认 3 并发），
+    所有线程共享 `_LLM_CACHE` 里同一个 LLM 实例 → 同一个 limiter。无锁时
+    两个线程会读到同一个 `_last`、同时判定"不用等"，实际间隔变成 0，
+    限速器失效 → 撞网关 RPM 限制 → 连环重试。锁内 sleep 正是限速器该有的
+    语义（串行化"算等待 + 占时隙"）。
+    """
 
     def __init__(self, min_interval: float = 0.0):
         self.min_interval = min_interval
         self._last = 0.0
+        self._lock = threading.Lock()
 
     def wait(self):
         if self.min_interval <= 0:
             return
-        elapsed = time.time() - self._last
-        if elapsed < self.min_interval:
-            time.sleep(self.min_interval - elapsed)
-        self._last = time.time()
+        with self._lock:
+            elapsed = time.time() - self._last
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self._last = time.time()
 
 
 # ---------------------------------------------------------------------------

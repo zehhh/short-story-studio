@@ -22,8 +22,8 @@ from .llm import BaseLLM, MockLLM, _build_llm, resolve_llm, usage_summary
 from .prompts import load_prompt, render_prompt
 from .store import Project
 from .util import count_words_zh, now_ts
-from .util import (MAX_SECTIONS, SEC_HEAD, SEC_HEAD_TITLE, atomic_write_text,
-                   sec_head_no, sec_head_title)
+from .util import (MAX_SECTIONS, SEC_HEAD, SEC_HEAD_TITLE, atomic_write_json,
+                   atomic_write_text, sec_head_no, sec_head_title)
 from . import runlog
 
 # ---------------------------------------------------------------------------
@@ -136,8 +136,10 @@ def _guide_query_terms(direction: str) -> list[str]:
         for d in load_tropes()["directions"]:
             if d.get("id"):
                 id2name[d["id"]] = d.get("name", "")
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # id2name 是「方向 id → 中文名」的唯一映射（梗库用 id、题材指导用 name），
+        # 构建失败后整表为空、检索词退化成原始 id，命中率下降却零提示——必须留痕。
+        print(f"[trope] ⚠ 方向名映射构建失败（{type(e).__name__}: {e}），检索按 id 兜底")
     terms: list[str] = []
     for t in [direction] + split_combo(direction):
         if not t:
@@ -344,8 +346,15 @@ def match_direction(text: str) -> str:
                 base_url=_lcfg.get("route_url", "http://127.0.0.1:8150"))
             if d and any(x["name"] == d for x in pool):
                 return d
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # 不许静默：laya_judge 是本地 HTTP 服务（默认 127.0.0.1:8150），没起/超时/
+        # 脏数据都会抛。吞掉之后表现上选题仍成功，但"明明开了语义路由却一直在走
+        # 热度兜底"，与"关键词没命中"的提示是同一句，用户无从区分。
+        print(f"[trope] ⚠ 方向路由服务不可用（{type(e).__name__}: {e}），降级为关键词+热度兜底")
+        try:
+            runlog.event("trope", f"route_direction 失败：{e}", level="warn")
+        except Exception:  # noqa: BLE001 —— 早于项目创建时 runlog 尚不可用
+            pass
 
     # 3) 兜底：题材适配子集里热度最高的方向（确定性、可解释，不再是硬编码常量）
     fallback = max(pool, key=lambda x: int(x.get("heat") or 0))["name"]
@@ -532,13 +541,20 @@ def _log_dup_decisions(candidates: list, hist: list, flags: list, project_name: 
             rows.append({"ts": now_ts(), "project": project_name,
                          "candidate": cand, "verdict": "dup" if f else "new",
                          "matched_hist": best, "n_hist": len(hist)})
-        with open(p, "a", encoding="utf-8") as fh:
-            for r in rows:
-                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+        # 必须原子整份替换，不能 `open(p,"a")` 逐行追加：dup_decisions.jsonl 是
+        # **跨项目共享**的文件（produce --count N 的多篇、两个 CLI 进程并发时都会写）。
+        # TextIOWrapper 不做行级原子保证，Windows 上多写者会交错出半行 JSON：
+        # 前半行来自 A、后半行来自 B，下游按行 json.loads 直接炸，或静默丢掉训练样本。
         if rows:
+            from .util import atomic_write_text
+
+            blob = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+            prev = p.read_text(encoding="utf-8") if p.exists() else ""
+            atomic_write_text(p, prev + blob)
             print(f"[flywheel] 查重决策落盘 {len(rows)} 条（v4 训练数据）")
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # 飞轮失败不影响主流程，但**不许静默**：写坏了要能看见
+        print(f"[flywheel] ⚠ 查重决策落盘失败（不影响成稿）：{type(e).__name__}: {e}")
 
 
 def _llm_dup_check(llm, candidates: list, hist: list, project_name: str = "") -> list:
@@ -859,13 +875,18 @@ def stage_kb(cfg: dict, llm: BaseLLM, project: Project, force: bool = False):
     if not direction:
         # 兜底1：核心梗关键词匹配梗库方向
         try:
-            direction = match_direction(concept.get("core_trope", ""))
-            if direction:
-                concept["direction"] = direction
+            _d = match_direction(concept.get("core_trope", ""))
+            if _d:
+                concept["direction"] = _d
+                # 先落盘再认账：历史写法先赋值给局部 `direction`、再 save_json，
+                # save_json 抛异常被吞掉后本次运行仍用这个"磁盘上没有"的方向，
+                # 下次重跑又从头兜底 —— 两次运行结果不一致。
                 project.save_json("concept.json", concept)
-                print(f"[stage] 方向缺失，按核心梗匹配为「{direction}」")
-        except Exception:  # noqa: BLE001
-            pass
+                direction = _d
+                print(f"[stage] 方向缺失，按核心梗匹配为「{_d}」")
+        except Exception as e:  # noqa: BLE001
+            print(f"[stage] ⚠ 方向兜底匹配失败（不影响后续联网兜底）："
+                  f"{type(e).__name__}: {e}")
     if not direction:
         # 兜底2：无方向也联网搜一轮核心梗真实细节，直接作为知识摘要
         if not cfg["knowledge"].get("auto_collect", True) and not force:
@@ -2162,8 +2183,11 @@ def stage_write_direct(cfg: dict, llm: BaseLLM, project: Project) -> None:
     try:
         from . import kb as _kb0
         style_sample = _kb0.style_samples(cfg, direction=direction, n=2, max_chars=500)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        # 风格样本是「文风不漂移」的唯一硬锚点；失败时提示词会少一整块而模型毫不知情，
+        # 一整批稿子文风突然变干却查不出原因。降级可以，静默不行。
         style_sample = ""
+        print(f"[kb] ⚠ 风格样本不可用（{type(e).__name__}: {e}），本次不注入 STYLE_SAMPLE")
 
     # 分节计划：写手先自己拆成一节节（每节 goal/end_hook），再据此一次写。
     # 计划保证"梗的设定分节落地、节与节首尾相接、写满末节不提前收尾"，比让模型临场决定更稳。
@@ -2321,7 +2345,13 @@ def stage_write(cfg: dict, llm: BaseLLM, project: Project, only: int | None = No
         direction = (project.load_json("concept.json") or {}).get("direction", "")
         panel = agents.ReaderPanel(panel_llm, direction, int(cfg["review"].get("reader_panel", 3)))
 
-    todo = [c["no"] for c in chs if not project.chapter_file(c["no"]).exists()]
+    # 「这章做完了吗」必须看提交凭据，不能只看文件存在：commit_chapter 是
+    # 「正文原子写 + 标记原子写」两步，中间崩溃会留下正文在、标记缺的半状态章。
+    # 只查 exists() 会把这种章永久排除在 todo 外（永不重写），而 drafts 的
+    # 零标记整路跳过逻辑又不会报它——两边同时沉默，管线带着未过门禁的章跑到成稿。
+    todo = [c["no"] for c in chs
+            if not project.chapter_file(c["no"]).exists()
+            or not _drafts.is_committed(project, c["no"])]
     if only:
         todo = [only]
     if not todo:
@@ -2368,10 +2398,13 @@ def stage_write(cfg: dict, llm: BaseLLM, project: Project, only: int | None = No
         return
 
     # ---- 阶段二：主编审查 + 读者团评分 并行（章间无依赖；写作质量已由初稿状态保证衔接）----
+    # 单线程时下面的 `if workers > 1` 走 else 分支串行调用同一个 _gate_one，
+    # 因此串行/并行共用同一份门禁实现（含阶段三的终稿确定性复查）。
     p_cfg = cfg.get("pipeline") or {}
     max_par = max(1, int(p_cfg.get("max_parallel", 3) or 3))
     workers = min(max_par, len(drafts))
-    print(f"[stage] 门禁并行（review+reader，{workers} 线程，阈值 {cfg['review'].get('score_threshold')}）…")
+    print(f"[stage] 门禁{'并行' if workers > 1 else '串行'}（review+reader，{workers} 线程，"
+          f"阈值 {cfg['review'].get('score_threshold')}）…")
 
     def _gate_one(no: int) -> tuple[int, str, dict]:
         ctx, text, _ = drafts[no]
@@ -2402,8 +2435,13 @@ def stage_write(cfg: dict, llm: BaseLLM, project: Project, only: int | None = No
         # 最终门禁状态：情绪/审查/读者/语言质检/禁道具 任一门打满都要反映出来。
         # 旧代码只看 rep_emo+rep_mid，rep_core 的 maxed_langqa/maxed_banprops
         # 会被 review 的 pass 合并覆盖——langqa 打满在最终状态里不可见（漏报）
-        bad = [g for g in (rep_emo.get("gate"), rep_mid.get("gate"), rep_core.get("gate"))
-               if g and g != "pass"]
+        # 现在收全量 gates：_mark_gate 累积了同一段内所有打满的门（一个章节里
+        # 思考泄漏+禁用道具+语言质检+语言病可能全部打满，单值 gate 只留第一个）。
+        bad: list[str] = []
+        for part in (rep_emo, rep_mid, rep_core):
+            for g in (part.get("gates") or []) + [part.get("gate")]:
+                if g and g != "pass" and g not in bad:
+                    bad.append(g)
         rep["gate"] = bad[0] if bad else "pass"
         if len(bad) > 1:
             rep["maxed_all"] = bad
@@ -2452,8 +2490,16 @@ def stage_write(cfg: dict, llm: BaseLLM, project: Project, only: int | None = No
                 direction=str(ctx.get("DIRECTION") or ""))
             rep["rubric"] = rubric
             rep["target_words"] = int(ctx.get("WORDS", 0) or 0)
-            if rubric.get("gate_status") == "blocked" and rep["gate"] == "pass":
-                rep["gate"] = "blocked_rubric"
+            # 观测层不得篡改判定层：评分卡（rubric）只算分、供复盘与平台口味对照，
+            # 它的结论写在独立字段里。历史写法直接改 rep["gate"]="blocked_rubric"，
+            # 与同文件 _refresh_review_verdict 的立场（「观测层不得篡改判定层」）矛盾，
+            # 且该值没有任何消费方（全仓只有赋值处、无分支判断），等于静默否决门禁。
+            if rubric.get("gate_status") == "blocked":
+                rep["rubric_gate"] = "blocked"
+                if rep.get("gate") == "pass":
+                    print("    [rubric] ⚠ 评分卡不满（判定层仍为 pass，见 rubric_gate）")
+            else:
+                rep["rubric_gate"] = rubric.get("gate_status") or "ok"
             print("    " + review_mod.render_text(rubric).splitlines()[0])
         except Exception as e:  # noqa: BLE001
             # 评审卡是"观测层"，坏掉不该毁掉已经产出的正文；但要留痕，不许静默。
@@ -2502,8 +2548,10 @@ def stage_write(cfg: dict, llm: BaseLLM, project: Project, only: int | None = No
                         # 最后一章的标记必然丢失（缺陷 P1-8）。
                         project.save_meta(meta)
                         print(f"[repcheck] ⚠️ 第{no:02d}章情节与更早章节高度相似（已标记，建议复盘时关注）")
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                # repeat_suspect 是可选质量信号，失败不毁稿；但完全无声会让「这次到底做没做
+                # 重复检测」无从得知（该功能历史上丢过数据），至少留一行痕迹。
+                print(f"[repcheck] ⚠ 跨章重复检测跳过（{type(e).__name__}: {e}）")
     project.set_stage("chapters", f"{len(chs)}章完成")
 
 
@@ -2583,7 +2631,7 @@ def stage_improve(cfg: dict, llm: BaseLLM, project: Project) -> dict:
             "lessons": data.get("lessons", []),
         }
     )
-    lf.write_text(json.dumps(entries[-20:], ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(lf, entries[-20:])
 
     # 人类可读报告
     md = [
@@ -2785,10 +2833,14 @@ def stage_quality_gate(cfg, llm, project, stage, gen_fn, extra_issues: str = "")
         return gen_fn(1, ""), {"gate": "skipped", "rounds": 0}
     threshold = float(rv.get("stage_gate_threshold", 8.0))
     max_r = int(rv.get("stage_gate_rounds", 2))
+    # 语义明确化：stage_gate_rounds = **最多重做轮数**，总生成次数 = max_r + 1
+    #（初稿 + max_r 次带意见重做）。这两者历史上不一致过：循环跑 max_r+1 次，
+    # 但打满路径的 rounds 字段写 max_r → 复盘无法区分"跑 2 次就过"和"跑 3 次都没过"。
+    total_rounds = max_r + 1
     issues = ""
     best, best_score = None, -1.0   # 留优：打回循环可能把稿件改劣（如删句压字数压丢内容），
     # 打满时返回「评审分最高且硬检合格」的那稿，而不是最后一稿
-    for rnd in range(1, max_r + 2):
+    for rnd in range(1, total_rounds + 1):
         content = gen_fn(rnd, "；".join(filter(None, [issues, extra_issues])))
         if rnd > 1:
             print(f"[gate] {stage} 第{rnd}轮重做完成")
@@ -2825,8 +2877,10 @@ def stage_quality_gate(cfg, llm, project, stage, gen_fn, extra_issues: str = "")
     print(f"[gate] {stage} 轮次用尽，按现稿放行（maxed_stage，已留运行日志）")
     if best is not None and best_score >= 0:
         print(f"[gate] {stage} 打满轮次：保留评审最优稿（{best_score} 分，硬检合格）")
-        return best, {"gate": "maxed_stage", "rounds": max_r, "issues": issues[:200], "kept_score": best_score}
-    return content, {"gate": "maxed_stage", "rounds": max_r, "issues": issues[:200]}
+        return best, {"gate": "maxed_stage", "rounds": total_rounds, "retries": max_r,
+                      "issues": issues[:200], "kept_score": best_score}
+    return content, {"gate": "maxed_stage", "rounds": total_rounds, "retries": max_r,
+                     "issues": issues[:200]}
 
 
 def _split_full_sections(full: str) -> list[dict]:
@@ -3111,9 +3165,10 @@ def word_gate(cfg: dict, llm, project: Project, full: str) -> tuple[str, dict]:
             new_w = count_words_zh(new_full)
             n_heads = sum(1 for ln in new_full.splitlines() if _SEC_HEAD.match(ln.strip()))
             if new_w >= total * 1.1 and n_heads >= 3:
+                _old_total = total            # 先留旧值，否则日志把同一个数打两遍
                 full = new_full
                 total = new_w
-                print(f"[gate] 整稿扩写 {new_w} 字（{total} → {new_w}）")
+                print(f"[gate] 整稿扩写 {new_w} 字（{_old_total} → {new_w}）")
             else:
                 print(f"[guard] 整稿扩写异常（{total}→{new_w} 字，{n_heads} 个小节头），保留原文")
             rounds += 1
@@ -3162,7 +3217,7 @@ def word_gate(cfg: dict, llm, project: Project, full: str) -> tuple[str, dict]:
                 new_full = writer.chat(sys_p, user_p).strip()
                 new_w = count_words_zh(new_full)
                 n_heads = sum(1 for ln in new_full.splitlines() if _SEC_HEAD.match(ln.strip()))
-                if new_w >= full and n_heads >= 3:
+                if new_w >= total * 1.05 and n_heads >= 3:
                     full = new_full
                     total = new_w
                 else:
@@ -3189,8 +3244,9 @@ def word_gate(cfg: dict, llm, project: Project, full: str) -> tuple[str, dict]:
                 new_w = count_words_zh(new_full)
                 n_heads = sum(1 for _ln in new_full.splitlines() if _SEC_HEAD.match(_ln.strip()))
                 if new_w < total and n_heads >= 3:
+                    _old_total = total        # 同上：先留旧值再赋值
                     full, total = new_full, new_w
-                    print(f"[gate] 整稿压缩 {total} 字（{new_w} → 目标 {int(ceil * 0.95)}）")
+                    print(f"[gate] 整稿压缩 {_old_total} → {new_w} 字（目标 {int(ceil * 0.95)}）")
                 else:
                     print(f"[guard] 整稿压缩异常（{total}→{new_w} 字，{n_heads} 个小节头），保留原文")
                     break
@@ -3634,7 +3690,12 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
             stats = ([{"no": s["no"], "words": count_words_zh(s["text"])}
                       for s in _split_full_sections(full)] or stats)
         except Exception as e:  # noqa: BLE001
-            _lang_rep = {"pass": False, "error": f"{type(e).__name__}: {e}"}
+            # 变量必须是 _repair_rep：历史写法写成了 _lang_rep（那是下一段 lang_polish
+            # 的变量），造成双向失真——① _repair_rep 仍为 None → report 里
+            # lang_repair 键直接缺失，下游看着像"这步没开"而不是"开了但失败"；
+            # ② 污染的 _lang_rep 让 report 生成一条"改 0 节、缺陷 0→0"的假成功记录，
+            # 绕过下方"开了却没跑成必须留痕"的防线。
+            _repair_rep = {"pass": False, "error": f"{type(e).__name__}: {e}"}
             print(f"[repair] ⚠ 确定性返修跳过（{type(e).__name__}: {e}）")
     if (cfg.get("review") or {}).get("lang_polish_enabled", True) and not isinstance(llm, MockLLM):
         try:
@@ -4221,12 +4282,6 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
     direction = concept.get("direction", "")
     lead_rec = project.load_json("lead.json") or {}
     lead_block = f"**导语**：{lead_rec.get('text', '')}\n\n" if lead_rec.get("text") else ""
-    final_md = (
-        f"# {title}\n\n"
-        f"> 平台：{plat['name']} | 字数：{total_words} | 题材：{direction}"
-        + (f" | 读者团均分：{full_review['reader_avg']}" if full_review else "")
-        + f"\n\n**一句话故事**：{pitch.get('logline', '')}\n\n{lead_block}---\n\n{full}\n"
-    )
     # 交付前最后一次节长均衡：`balance`（上面那次）跑在**全稿读者团重写之前**，
     # 而读者团打回时会整稿重写（"不得低于原稿 90%"），把已经调好的节长比例重新
     # 拉歪——e2e14 实测 balance 报 ratio_after 1.79，而落到 成稿.txt 里是 2.08
@@ -4286,6 +4341,20 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
         submit_text = "\n\n".join(sections)
     else:
         submit_text = f"{title}\n\n{full}"
+    # 字数必须在**所有整稿改写之后**重量一次：4210 行取 total_words 之后，节长均衡
+    # 与补对白还会整稿改写。用旧值会让成稿头部印的字数、report.final_words、
+    # word_flow.lost_in_clean、set_stage("final") 全部对不上正文。final_md 因此也
+    # 挪到这里拼装（原来在改写之前拼，正文与字数两项都是旧的）。
+    _new_total = count_words_zh(full)
+    if _new_total != total_words:
+        print(f"[words] 交付前整稿改写使字数 {total_words} → {_new_total}，按新值收口")
+        total_words = _new_total
+    final_md = (
+        f"# {title}\n\n"
+        f"> 平台：{plat['name']} | 字数：{total_words} | 题材：{direction}"
+        + (f" | 读者团均分：{full_review['reader_avg']}" if full_review else "")
+        + f"\n\n**一句话故事**：{pitch.get('logline', '')}\n\n{lead_block}---\n\n{full}\n"
+    )
     # 导语来自 lead.json、正文来自 full，两段分别拼装；统一在这里收口，
     # 保证 md/txt 全文（含导语）引号一致，不再出现"导语「」、正文 “”"。
     final_md = normalize_quotes(final_md)

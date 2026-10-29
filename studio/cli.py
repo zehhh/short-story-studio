@@ -98,6 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--apply", action="store_true", help="dedup：应用压实（默认只扫描报告）")
     sp.add_argument("--workers", type=int, default=2, help="batch-decon：并发线程数（默认 2）")
     sp.add_argument("--no-dedup", action="store_true", help="batch-decon：跳过收尾全库去重")
+    sp.add_argument("--resume", action="store_true",
+                    help="rebuild：断点续跑（只补未编码单元，不清空已有向量；大库中断后用它接着跑）")
     sp.add_argument("--dedup-wait", type=int, default=150,
                     help="batch-decon：收尾去重前等模型卸载的秒数（默认 150，云 API 可设 0）")
     sp.add_argument("--no-semantic", action="store_true", help="dedup：跳过语义近重复扫描（只做同文/同开头/id修复）")
@@ -331,7 +333,9 @@ def hotspots_save(cfg: dict, items):
     d = Path(cfg["studio"]["workspace_abs"]) / "hotspots"
     d.mkdir(parents=True, exist_ok=True)
     f = d / f"hot_{time.strftime('%Y%m%d_%H%M%S')}.json"
-    f.write_text(json.dumps([i.to_dict() for i in items], ensure_ascii=False, indent=2), encoding="utf-8")
+    from .util import atomic_write_json
+
+    atomic_write_json(f, [i.to_dict() for i in items])
     return f
 
 
@@ -512,7 +516,10 @@ def cmd_knowledge_base(cfg: dict, args):
             new, changes = kb_lint.fix_card(card)
             if not changes:
                 continue
-            p.write_text(json.dumps(new, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            # 知识卡是手工维护的资产，非原子写一旦中断就毁掉整张卡
+            from .util import atomic_write_text
+
+            atomic_write_text(p, json.dumps(new, ensure_ascii=False, indent=2) + "\n")
             n_cards += 1
             n_changes += len(changes)
         print(f"\n[kb-lint] 已清理 {n_cards} 张卡 / {n_changes} 处改动")
@@ -621,9 +628,15 @@ def cmd_knowledge_base(cfg: dict, args):
                 print(f"\n[命中 {len(used)} 条]")
             return
         if action == "rebuild":
-            n = kb.rebuild(cfg)
+            if getattr(args, "resume", False):
+                # 断点续跑：不清空矩阵，只补 pending（每 10 批自动落盘，见 kb.index_pending）
+                n = kb.index_pending(cfg)
+                print(f"向量续跑：新增编码 {n} 条")
+            else:
+                n = kb.rebuild(cfg)
+                print(f"向量重建 {n} 条")
             c = kb.rebuild_cocomatrix(cfg)
-            print(f"向量重建 {n} 条 | 共现矩阵 {c}")
+            print(f"共现矩阵 {c}")
             return
         n = kb.ingest_materials(cfg, limit=getattr(args, "limit", 500))
         print(f"存量素材迁移：新增知识单元 {n} 条")
@@ -901,14 +914,19 @@ def cmd_produce(cfg: dict, args):
                                      top=8, direction_hint=direction)
             pipeline.stage_mine(cfg, llm, project, direction_hint=direction)
             pipeline.stage_select(project, pick="auto", llm=llm, cfg=cfg)
-        if not args.no_kb:
-            pipeline.stage_kb(cfg, llm, project, force=args.kb_refresh)
-        pipeline.stage_pitch(cfg, llm, project)
-        pipeline.stage_lead(cfg, llm, project)
-        pipeline.stage_outline(cfg, llm, project)
-        pipeline.stage_bible(cfg, llm, project)
-        pipeline.stage_write(cfg, llm, project)
-        pipeline.stage_polish(cfg, llm, project)
+        # 项目写锁：与 run/continue 同口径。旧实现全程不持锁，看板/调度器/另一个
+        # CLI 可在同一目录并发写（正文、report.json、drafts 标记互相覆盖）。
+        from .lock import project_lock
+
+        with project_lock(project.root, "produce"):
+            if not args.no_kb:
+                pipeline.stage_kb(cfg, llm, project, force=args.kb_refresh)
+            pipeline.stage_pitch(cfg, llm, project)
+            pipeline.stage_lead(cfg, llm, project)
+            pipeline.stage_outline(cfg, llm, project)
+            pipeline.stage_bible(cfg, llm, project)
+            pipeline.stage_write(cfg, llm, project)
+            pipeline.stage_polish(cfg, llm, project)
 
         # 字数门终审：最终成稿越界（不足或超标）。
         # 借鉴 openwrite B06「字数门保稿 + 标记回流，而不是整篇淘汰」：

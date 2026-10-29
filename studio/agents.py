@@ -212,9 +212,14 @@ class ReaderPanel:
             try:
                 r = self.llm.chat_json(system, user)
             except Exception:  # noqa: BLE001
-                r = {"persona": p["name"], "score": 7.2, "feel": "（读机临时故障，按中下分保守计）", "advice": ""}
+                # 读机故障时**不能**编一个分数：7.2 分低于 7.5 阈值，必然判不过，
+                # 会白白触发整章重写（一次几千字 LLM 调用）。标记 degraded 后由调用方
+                # 决定——跳过读者团门禁而不是伪造一个必然失败的分数。
+                r = {"persona": p["name"], "score": None,
+                     "feel": "（读机故障，本轮不计入）", "advice": "", "degraded": True}
             r.setdefault("persona", p["name"])
-            r["score"] = float(r.get("score", 7.0))
+            if r.get("score") is not None:
+                r["score"] = float(r["score"])
             out.append(r)
         return out
     @property
@@ -312,8 +317,8 @@ def _guard_rewrite(old: str, new: str, kind: str = "fix") -> str:
     """定点重写的长度守卫（所有 `WriterAgent.rewrite` 出口统一过这道）。
 
     为什么必须在**出口**统一守，而不是各调用点自己判：历史上只有「思考泄漏」那一处
-    接了 `_no_shrink`，其余 6 处（禁用道具 / 语言质检 / 语言病 / 读者团 / 情绪门 /
-    终稿复查）都没有长度校验。实测 e2e6 第 05 章：终稿复查一次重写只回了 458 token，
+    接了长度守卫（一个阈值 65% 的 `_no_shrink`，后已删除——它比本函数松，恒不触发），
+    其余 6 处（禁用道具 / 语言质检 / 语言病 / 读者团 / 情绪门 / 终稿复查）都没有校验。实测 e2e6 第 05 章：终稿复查一次重写只回了 458 token，
     1100 字的章节被替换成 583 字的片段，整章直接报废，而门禁仍报 `maxed_review`。
     同一类事故在历史项目里出现过（成稿被切碎后重写放大到 9.9 万字），
     所以长度守必须做成单一权威点，跟着写手出口走。
@@ -342,12 +347,19 @@ def _guard_rewrite(old: str, new: str, kind: str = "fix") -> str:
     return new
 
 
-def _no_shrink(old: str, new: str) -> str:
-    """重写防坍缩：新稿长度不足原稿 65%（疑似偷懒摘要）时保留原稿。"""
-    if new.strip() and len(new.strip()) < 0.65 * len(old.strip()):
-        print("    [guard] 重写稿长度不足原稿 65%，疑似坍缩，保留原稿并标记")
-        return old
-    return new
+def _mark_gate(report: dict, name: str) -> None:
+    """记录一个"门已打满/降级"的事实，**累积**而不是只留第一个。
+
+    `report["gate"]` 是单值，历史上用 `if report["gate"] == "pass": report["gate"]=X`
+    的写法：第一个命中的门永久占位，后续门再打满也写不进去。实测一章里思考泄漏、
+    禁用道具、语言质检、语言病可能**全部打满**，但复盘只看到"一个门没过"。
+    现在两处都写：`gates` 留全量（按命中顺序），`gate` 留第一个（兼容旧消费者）。
+    """
+    gates = report.setdefault("gates", [])
+    if name not in gates:
+        gates.append(name)
+    if report.get("gate", "pass") == "pass":
+        report["gate"] = name
 
 
 def emotion_check(
@@ -411,38 +423,6 @@ def emotion_verdict_ok(emo: dict, rcfg: dict) -> tuple[bool, str]:
     return True, ""
 
 
-def write_chapter_with_gates(
-    cfg: dict,
-    llm: BaseLLM,
-    writer: WriterAgent,
-    editor: ChiefEditor,
-    panel: ReaderPanel | None,
-    ctx: dict,
-    chapter_no: int,
-    prev_emotion: str = "",
-    *,
-    project=None,
-) -> tuple[str, str, dict]:
-    """返回 (正文, 本章摘要, 门禁报告)。串行版（保留原语义，供兼容调用）。
-
-    并行版见 pipeline.stage_write：把本函数拆为
-    _chapter_core（串行写稿）→ _gate_review_reader（章间并行）→ _gate_emotion（串行收尾）。
-    """
-    text, r1 = _chapter_core(cfg, writer, ctx, chapter_no, project=project)
-    text, r2 = _gate_review_reader(cfg, writer, editor, panel, ctx, text, chapter_no, project=project)
-    text, r3 = _gate_emotion(cfg, editor, writer, ctx, text, prev_emotion, chapter_no, project=project)
-    report = {**r1, **r2, **r3}
-    gate = "pass"
-    for part in (r3, r2, r1):
-        g = part.get("gate")
-        if g and g != "pass":
-            gate = g
-            break
-    report["gate"] = gate
-    body, summary = split_summary(text)
-    return body, summary, report
-
-
 def _gt(direction) -> tuple:
     """题材标签（薄封装，只为让调用点读起来不啰嗦）。"""
     from .langqa import genre_tags
@@ -499,7 +479,10 @@ def _chapter_core(
         if count_words_zh(_split_body(text2)) > int(target_w * 1.8):
             print(f"    [write] 扩写稿 {count_words_zh(_split_body(text2))} 字严重超标，保留原稿")
         else:
-            text = _no_shrink(text, text2)
+            # 不必再包一层长度守卫：WriterAgent.rewrite 的出口已统一过
+            # _guard_rewrite（下限 0.75 / 上限 2.2），历史 _no_shrink 用 0.65
+            # 判坍缩，比上游松，恒不触发——纯噪音。
+            text = text2
     # --- 门禁零·一：用户禁用道具硬检（确定性，零 token 成本；置于语言质检之前，
     #     先清道具再修语言，避免道具重写引入新的语言问题逃过质检）---
     if banned_regex(cfg) is not None:
@@ -512,8 +495,7 @@ def _chapter_core(
                 break
             report["ban_hits"] = brep["hits"]
             if b_rnd >= b_max:
-                if report["gate"] == "pass":
-                    report["gate"] = "maxed_banprops"
+                _mark_gate(report, "maxed_banprops")
                 print(
                     f"    [banprops] ⚠ 仍命中 {len(brep['hits'])} 种禁用道具"
                     f"（{b_rnd}/{b_max} 轮），已达上限按现稿放行并记录"
@@ -540,8 +522,7 @@ def _chapter_core(
                 print(f"    [langqa] 语言质检通过（第{rnd}轮扫描，0 阻断性命中）")
                 break
             if rnd >= lq_max:
-                if report["gate"] == "pass":
-                    report["gate"] = "maxed_langqa"
+                _mark_gate(report, "maxed_langqa")
                 print(f"    [langqa] ⚠ 仍 {len(lqrep['hits'])} 处命中，已达上限按现稿放行并记录")
                 break
             print(f"    [langqa] {len(lqrep['hits'])} 处命中（{_round_marker(rnd, lq_max)}），带清单重写 …")
@@ -588,8 +569,7 @@ def _chapter_core(
                                         "fails": []}
                 break
             if drows >= dmax:
-                if report["gate"] == "pass":
-                    report["gate"] = "maxed_langdefect"
+                _mark_gate(report, "maxed_langdefect")
                 report["langdefect"] = {"pass": False, "score": sc["score"], "rounds": drows,
                                         "fails": bad}
                 print(f"    [语言病] ⚠ {len(bad)} 项超标（{'；'.join(bad[:3])}），"
@@ -630,8 +610,7 @@ def _chapter_core(
                 report["dialog"] = {"pass": bool(_rt >= _dmin), "ratio": _rt,
                                     "min": _dmin, "rounds": _dr}
                 if _rt < _dmin:
-                    if report["gate"] == "pass":
-                        report["gate"] = "maxed_dialog"
+                    _mark_gate(report, "maxed_dialog")
                     print(f"    [对白] ⚠ 对白占比 {_rt:.2%} < {_dmin:.0%}，"
                           f"已达 {_dmax} 轮上限按现稿放行记 maxed_dialog")
                 break
@@ -693,7 +672,11 @@ def _gate_review_reader(
             _gaps = fmt_rubric_gaps(verdict)
             if _gaps:
                 _fb = _fb + "\n" + _gaps
-            text = _no_shrink(text, writer.rewrite(ctx, _fb, rnd))
+            # 重写必须拿到「上一稿全文」：不回填会让 WriterAgent.rewrite 对着空字符串改，
+            # 连带 _guard_rewrite 因原稿为空跳过长度守卫（坍缩/暴胀全部放行）。
+            ctx["_prev_text"] = _split_body(text)
+            # 同上：writer.rewrite 出口已有 _guard_rewrite 兜底，不再叠 _no_shrink
+            text = writer.rewrite(ctx, _fb, rnd)
             _save_draft(project, chapter_no, text, stage=f"主编打回第{rnd - 1}轮", gate="maxed_review")
         body = _split_body(text)
         verdict = editor.review(ctx, body, rnd, max_review)
@@ -762,26 +745,40 @@ def _gate_review_reader(
     if panel is not None:
         body = _split_body(text)
         scores = panel.score(ctx, body, 1)
-        avg = statistics.mean(s["score"] for s in scores)
+        # 读机故障的画像不计入均分（score=None）；全员故障则跳过本门禁并留 degraded 标记，
+        # 绝不伪造一个必然低于阈值的分数去触发白烧的重写。
+        _valid = [s for s in scores if s.get("score") is not None]
+        if len(_valid) < len(scores):
+            report["reader_degraded"] = len(scores) - len(_valid)
+            print(f"    [reader] ⚠ {len(scores) - len(_valid)}/{len(scores)} 个画像读机故障，已排除出均分")
+        avg = statistics.mean(s["score"] for s in _valid) if _valid else None
         rnd = 1
-        while avg < threshold and rnd < max_reader:
-            print(
-                f"    [reader] 读者团均分 {avg:.1f} < {threshold}（{_round_marker(rnd, max_reader)}），带反馈重写 …"
-            )
-            ctx["_prev_text"] = body
-            text = writer.rewrite(ctx, "读者团反馈（逐条吸收）：\n" + fmt_reader_feedback(scores), rnd + 1)
-            _save_draft(project, chapter_no, text, stage=f"读者团第{rnd}轮", gate="maxed_reader")
-            body = _split_body(text)
-            rnd += 1
-            scores = panel.score(ctx, body, rnd)
-            avg = statistics.mean(s["score"] for s in scores)
+        if avg is None:
+            report["gate"] = "skipped_reader_degraded"
+            print("    [reader] ⚠ 读者团全部读机故障，跳过本门禁（记 degraded）")
+        else:
+            while avg < threshold and rnd < max_reader:
+                print(
+                    f"    [reader] 读者团均分 {avg:.1f} < {threshold}（{_round_marker(rnd, max_reader)}），带反馈重写 …"
+                )
+                ctx["_prev_text"] = body
+                text = writer.rewrite(ctx, "读者团反馈（逐条吸收）：\n" + fmt_reader_feedback(_valid), rnd + 1)
+                _save_draft(project, chapter_no, text, stage=f"读者团第{rnd}轮", gate="maxed_reader")
+                body = _split_body(text)
+                rnd += 1
+                scores = panel.score(ctx, body, rnd)
+                _valid = [s for s in scores if s.get("score") is not None]
+                avg = statistics.mean(s["score"] for s in _valid) if _valid else None
+                if avg is None:
+                    print("    [reader] ⚠ 重写后读者团全部故障，停止迭代")
+                    break
         report["reader_rounds"] = rnd
         report["reader_scores"] = {s.get("persona", "?"): s["score"] for s in scores}
-        report["reader_avg"] = round(avg, 2)
-        if avg < threshold:
+        report["reader_avg"] = round(avg, 2) if avg is not None else None
+        if avg is not None and avg < threshold:
             report["gate"] = "maxed_reader"
             print(f"    [reader] ⚠ 读者均分 {avg:.1f} 仍未达标，按现稿放行并记录")
-        else:
+        elif avg is not None:
             print(
                 f"    [reader] 读者团第{rnd}轮：均分 {avg:.1f} ✔（{panel.names}）"
             )
@@ -826,8 +823,7 @@ def _gate_emotion(
             if degraded:
                 # LLM 不可解析：重写也是拿同一份坏输出做判断，直接记降级交上游。
                 report["emotion_error"] = emo.get("error", "")
-                if report["gate"] == "pass":
-                    report["gate"] = "degraded_emotion"
+                _mark_gate(report, "degraded_emotion")
                 print(f"    [emotion] ⚠ {why}，本门不计通过（已记降级）")
                 break
             if ok:
@@ -837,8 +833,7 @@ def _gate_emotion(
                 )
                 break
             if rnd >= e_max:
-                if report["gate"] == "pass":
-                    report["gate"] = "maxed_emotion"
+                _mark_gate(report, "maxed_emotion")
                 print(f"    [emotion] ⚠ {why}，已达上限按现稿放行并记录")
                 break
             print(f"    [emotion] {why}（{_round_marker(rnd, e_max)}），重写情绪线 …")
@@ -928,6 +923,11 @@ def deterministic_recheck(
             raise TypeError(f"writer 需为 WriterAgent 或 BaseLLM，收到 {type(writer).__name__}")
     rcfg = cfg["review"]
     report: dict = {"pass": True, "rounds": 0, "hits": {}}
+    # max_rounds<=0 必须与「检查通过」区分开：旧实现 range(1, 1) 空转，
+    # 直接返回 pass=True 却一项都没检查——和把 400 当可重试是同一类"静默成功"错误。
+    if max_rounds <= 0:
+        return text, {"pass": True, "rounds": 0, "hits": {}, "skipped": True,
+                      "gate": "skipped_disabled"}
     # mock/离线模式：MockLLM 永远返回同一段模板文本，重写不可能消除命中，
     # 只会空转 3 轮拖慢冒烟测试。直接跳过（与 word_gate 的 skipped_mock 一致）。
     if type(getattr(writer, "llm", writer)).__name__ == "MockLLM":
@@ -994,7 +994,9 @@ __all__ = [
     "WriterAgent",
     "ChiefEditor",
     "ReaderPanel",
-    "write_chapter_with_gates",
-    "_split_summary",
+    "split_summary",
     "deterministic_recheck",
+    "_chapter_core",
+    "_gate_review_reader",
+    "_gate_emotion",
 ]

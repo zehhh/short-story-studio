@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -139,16 +140,33 @@ def _laya_preload(cfg: dict):
 def _dedup_worker(cfg: dict, semantic: bool, threshold: float):
     from . import kb, kb_dedup
 
+    started = time.time()
+
+    def _on_progress(done: int, total: int, phase: str):
+        # 语义扫描是长任务（16 万单元实测数小时），必须给可读进度与速率，
+        # 否则用户看到「已启动」后再无动静，会判定卡死。
+        el = time.time() - started
+        rate = done / el if el > 0 and done else 0.0
+        eta = (total - done) / rate if rate > 0 else 0.0
+        DEDUP_STATE["progress"] = {
+            "phase": phase, "done": done, "total": total,
+            "pct": round(done / total * 100, 1) if total else 0.0,
+            "rate": round(rate, 1), "eta_sec": int(eta), "elapsed_sec": int(el),
+        }
+
     try:
-        res = kb_dedup.scan(cfg, semantic=semantic, threshold=threshold)
+        res = kb_dedup.scan(cfg, semantic=semantic, threshold=threshold,
+                            progress=_on_progress)
         kb_dedup.scan_keep_old_ids(res)
         out = kb_dedup.apply(cfg, res)
-        DEDUP_STATE["result"] = {**res["stats"], **out, "at": now_ts()}
+        DEDUP_STATE["result"] = {**res["stats"], **out, "at": now_ts(),
+                                 "elapsed_sec": int(time.time() - started)}
         DEDUP_STATE["error"] = ""
     except Exception as e:  # noqa: BLE001
         DEDUP_STATE["error"] = f"{type(e).__name__}: {str(e)[:200]}"
     finally:
         DEDUP_STATE["running"] = False
+        DEDUP_STATE["progress"] = None
 
 
 FETCH_STATE: dict = {"running": False, "result": None, "error": ""}
@@ -2112,9 +2130,19 @@ async function loadKbView(){
         ? `就绪（${laya.checkpoint} / ${laya.device}）｜本进程判重：候选 ${ls.cands||0} 个 → 杀重复 ${ls.dup||0} · 放行 ${ls.new||0} · 交主模型 ${ls.unsure||0}（省 ${ls.llm_saved||0} 次大模型调用）`
         : `预热中（${laya.checkpoint} / ${laya.device}，约半分钟）…`);
   const dd = st.dedup || {};
-  const ddTxt = dd.running ? '⏳ 后台去重进行中…'
+  const ddp = dd.progress || {};
+  const _fmtDur = s => {
+    s = Math.max(0, Math.round(s));
+    if (s < 60) return s + ' 秒';
+    if (s < 3600) return Math.round(s/60) + ' 分';
+    return (s/3600).toFixed(1) + ' 小时';
+  };
+  const ddTxt = dd.running
+    ? (ddp.total
+        ? `⏳ 后台去重进行中：${ddp.phase==='pair'?'分组比对':'向量化'} ${ddp.done}/${ddp.total}（${ddp.pct}%）｜${ddp.rate} 条/秒｜已耗时 ${_fmtDur(ddp.elapsed_sec||0)}｜预计还需 ${_fmtDur(ddp.eta_sec||0)}`
+        : '⏳ 后台去重进行中（正在准备…）')
     : (dd.error ? `⚠️ 上次去重失败：${dd.error}`
-    : (dd.result ? `上次去重：剔除 ${dd.result.drop_total ?? dd.result.dropped ?? 0} 条（${dd.result.at || ''}）`
+    : (dd.result ? `上次去重：剔除 ${dd.result.drop_total ?? dd.result.dropped ?? 0} 条（${dd.result.at || ''}，耗时 ${_fmtDur(dd.result.elapsed_sec||0)}）`
     : '尚未运行'));
   const nf = st.novel_fetch || {};
   const nfTxt = nf.running ? '⏳ 抓取+深拆进行中…'
@@ -2131,7 +2159,7 @@ async function loadKbView(){
     <div class="card" style="margin-top:10px"><b>🧹 知识库去重</b>
       <div class="dim" style="margin-top:4px">同文/同开头/语义近重复（cos≥0.93）三重清理，入库时自动防重。${ddTxt}</div>
       <div class="row" style="margin-top:6px">
-        <button class="btn" onclick="kbDedup(true)">全面去重（含语义扫描，约20分钟）</button>
+        <button class="btn" onclick="kbDedup(true)">全面去重（含语义扫描，耗时随库大小增长）</button>
         <button class="btn" onclick="kbDedup(false)">快速压实（同文/同开头，秒级）</button>
       </div>
       <div class="dim" id="kbDedupOut" style="margin-top:6px"></div>

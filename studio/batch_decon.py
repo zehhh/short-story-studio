@@ -47,7 +47,10 @@ def _progress_path(kbdir: Path) -> Path:
 
 
 def save_state(kbdir: Path, st: dict, total: int = 0):
-    (kbdir / STATE_FILE).write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+    """进度状态原子写：多 worker 并发写同一文件，非原子写会让看门狗读到半个 JSON。"""
+    from .util import atomic_write_text
+
+    atomic_write_text(kbdir / STATE_FILE, json.dumps(st, ensure_ascii=False))
     # 纯文本进度(看门狗/人工读,免 JSON 解析):done/总数|failed
     try:
         prog = _progress_path(kbdir)

@@ -536,6 +536,72 @@ def check_call_arity(sources: dict[str, str]) -> None:
          "没有直接改 project.meta（应走 project.update_meta(...)）" + (f"；命中：{mut}" if mut else ""))
 
 
+def check_undefined_names(sources: dict) -> None:
+    """模块里用到但从未定义/导入的全局名字（运行时会 NameError）。
+
+    为什么需要这一项：`compileall` 只验语法，名字解析在运行时。
+    实测事故（2026-10-29）：pipeline.py 里把一行改成 `atomic_write_json(lf, ...)`，
+    却忘了把它加进 `from .util import (...)` 的列表——编译通过、模块导入通过、
+    verify 全绿，直到真正产出数据复盘时才 NameError 崩在流水线尾部。
+    静态可达性检查必须能提前拦住这类「导入漏项」。
+
+    判据保守（宁可漏报不误报）：
+      - 先收集模块内所有「名字绑定」：def/class/import/赋值目标/参数/except as/
+        with as/comprehension 目标/global/nonlocal；
+      - 内置名与 dunder 视为已定义；
+      - 只报 Load 上下文的 Name 且该名字从未出现在任何绑定位置。
+    这一判据会漏掉「局部作用域遮蔽全局缺失」的情形，但不会误报。
+    """
+    import builtins
+
+    print("\n== 9. 未定义的名字（导入漏项）==")
+    problems: list[str] = []
+    for name, src in sorted(sources.items()):
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue  # 语法错误由编译检查负责
+        defined: set[str] = set(dir(builtins)) | {"__name__", "__file__", "__doc__"}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            elif isinstance(node, ast.Import):
+                for a in node.names:
+                    defined.add((a.asname or a.name).split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for a in node.names:
+                    if a.name != "*":
+                        defined.add(a.asname or a.name)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                defined.add(node.id)
+            elif isinstance(node, ast.arg):
+                defined.add(node.arg)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                defined.add(node.name)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                defined.update(node.names)
+            elif isinstance(node, ast.alias):
+                defined.add((node.asname or node.name).split(".")[0])
+            # with ... as X / comprehension 目标在 ast 里就是 Name(Store)，已覆盖
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                if node.id not in defined and not node.id.startswith("__"):
+                    problems.append(f"{name}:{node.lineno} 未定义 name `{node.id}`")
+    # 去重：同一 (文件,名字) 只报首个位置，避免一处漏导入刷出几十行
+    seen: set[tuple[str, str]] = set()
+    uniq: list[str] = []
+    for p in problems:
+        fpart, rest = p.split(":", 1)
+        ident = rest.rsplit("`", 2)[-2] if "`" in rest else rest
+        key = (fpart, ident)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+    item("ok" if not uniq else "FAIL",
+         "源码无未定义全局名字" + (f"；命中 {len(uniq)} 处：{uniq[:8]}" if uniq else ""))
+
+
 def main() -> int:
     print("短篇小说工作室 · 静态可达性检查（只报告，不改文件）")
     sources = studio_sources()
@@ -549,6 +615,7 @@ def main() -> int:
     check_test_registration()
     check_hygiene(sources)
     check_call_arity(sources)
+    check_undefined_names(sources)
 
     print(f"\n{_ok} 项通过 / {_fail} 项失败（另有 {_warn} 项警告）")
     return 1 if _fail else 0

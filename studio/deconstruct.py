@@ -164,7 +164,9 @@ def deconstruct_file(cfg: dict, llm, path: str | Path, title: str = "",
         "created_at": now_ts(),
     }
     out = decon_dir(cfg) / f"{_slug(result['title'])}.json"
-    out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    from .util import atomic_write_json
+
+    atomic_write_json(out, result)
 
     # 沉淀素材库（批量模式跳过，避免数千篇淹没素材库）
     try:

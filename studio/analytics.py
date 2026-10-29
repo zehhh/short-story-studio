@@ -149,7 +149,9 @@ def fetch_stats(cfg: dict, project_name: str, source: str | None = None) -> dict
     snap.setdefault("platform", _platform_of(cfg, project_name))
     d = project_dir(cfg, project_name)
     f = d / f"{date_stamp()}.json"
-    f.write_text(json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
+    from .util import atomic_write_json
+
+    atomic_write_json(f, snap)
     print(f"[analytics] 快照已保存：{f}")
     return snap
 
@@ -191,7 +193,9 @@ def import_stats(cfg: dict, project_name: str, file_path: str) -> dict:
         snap["chapter_retention"] = chapters
     d = project_dir(cfg, project_name)
     f = d / f"{date_stamp()}.json"
-    f.write_text(json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
+    from .util import atomic_write_json
+
+    atomic_write_json(f, snap)
     print(f"[analytics] 手动录入快照已保存：{f}（{len(metrics)} 项指标）")
     return snap
 

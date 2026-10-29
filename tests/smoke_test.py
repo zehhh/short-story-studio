@@ -246,6 +246,84 @@ def main() -> int:
     assert resolve_llm(cfg2, MockLLM(), "reviewer") is not rev  # mock 主导时忽略路由
     print("[ok] 角色路由：reviewer→本地 qwen3，panel 回落主 llm，mock 全局覆盖")
 
+    # 并发安全回归：LLM 缓存双检 + 限速器持锁 + 流式降级只作用于单次调用。
+    # 这三处是章级门禁 ThreadPoolExecutor 并行时的共享状态，历史上全是无锁/共享写：
+    #   · get_llm 的 check-then-act → 同一角色造出两个实例（连接池重复、限速器分裂）
+    #   · RateLimiter.wait 无锁 → 两线程读同一个 _last，限速形同虚设
+    #   · 流式失败写 self.stream=False → 进程级永久关流式（且 pipeline 的
+    #     stream_backup 备份到的已是 False，恢复无效）
+    import threading as _th
+    import time as _time
+
+    from studio.llm import _LLM_CACHE, _LLM_LOCK
+    from studio.llm import get_llm as _get_llm
+
+    _LLM_CACHE.clear()
+    cfg3 = {**cfg2, "llm_roles": {"panel": {"provider": "api", "base_url": "https://a.b/v1",
+                                            "model": "panel-model"}}}
+    _built: list = []
+
+    def _grab():
+        _built.append(_get_llm(cfg3, "panel"))
+
+    _ts = [_th.Thread(target=_grab) for _ in range(8)]
+    for _t in _ts:
+        _t.start()
+    for _t in _ts:
+        _t.join()
+    assert len({id(x) for x in _built}) == 1, f"get_llm 并发造出 {len({id(x) for x in _built})} 个实例"
+    assert _LLM_CACHE["role:panel"] is _built[0]
+    assert _LLM_LOCK is not None
+    print("[ok] get_llm 并发双检：8 线程同角色只构造 1 个实例")
+
+    # RateLimiter：8 线程各要一次，总耗时必须 >= 7 个间隔（串行化才算真的限速）
+    from studio.util import RateLimiter as _RL
+
+    _lim = _RL(min_interval=0.02)
+    _lim._last = 0.0
+    _t0 = _time.monotonic()
+    _ts = [_th.Thread(target=_lim.wait) for _ in range(8)]
+    for _t in _ts:
+        _t.start()
+    for _t in _ts:
+        _t.join()
+    _elapsed = _time.monotonic() - _t0
+    # 阈值取 6 个间隔而非 7：串行时理论值恰为 7×20ms=140ms，浮点与线程调度抖动
+    # 会让它偶尔落到 139.x ms。放宽到 6 个间隔仍有足够区分度——无锁时 8 线程
+    # 并发、间隔恒不触发，总耗时约等于 1 个间隔（20ms 量级）。
+    assert _elapsed >= 0.02 * 6, f"限速器未串行化：8 次调用仅耗时 {_elapsed:.3f}s"
+    print(f"[ok] RateLimiter 持锁：8 线程 20ms 间隔实测 {_elapsed:.2f}s（无锁时应≈0.02s）")
+
+    # 流式降级只影响本次调用：失败的调用结束后 self.stream 必须保持原值
+    from studio.llm import LLMError as _LE
+    from studio.llm import OpenAICompatLLM as _OCL
+
+    _inst = _OCL({**cfg2["llm"], "retries": 0, "qps": 0})
+    _inst.stream = True
+    _calls = {"stream": 0}
+
+    def _boom(*a, **k):
+        _calls["stream"] += 1
+        raise _LE("模拟流式失败")
+
+    _inst._chat_stream = _boom  # type: ignore[method-assign]
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": "降级后的文本"}}], "usage": {}}
+
+    _inst.session.post = lambda *a, **k: _Resp()  # type: ignore[method-assign]
+    _out = _inst.chat("sys", "user")
+    assert _out == "降级后的文本" and _calls["stream"] == 1
+    assert _inst.stream is True, "流式降级污染了共享实例的 stream 开关"
+    print("[ok] 流式降级只作用于单次调用，不污染进程级共享实例")
+
     # local 模块纯函数
     from studio import local as loc
 
@@ -371,6 +449,11 @@ def main() -> int:
     srv.shutdown()
     print("[ok] 看板：数据采集 + 静态导出 + HTTP 服务")
 
+    # ---- 低危修复的回归钉（防被后续改动悄悄退回去）----
+    _test_agents_all_resolves()
+    _test_deterministic_recheck_disabled()
+    _test_draft_prune_keeps_latest()
+
     print("\n全部冒烟测试通过 ✔")
     return 0
 
@@ -381,6 +464,55 @@ def _cleanup():
     d = Path("workspace/.smoke_tmp").resolve()
     if d.exists():
         shutil.rmtree(d, ignore_errors=True)
+
+
+def _test_agents_all_resolves():
+    """L4：__all__ 里出现模块中不存在的名字会让 star-import 直接 AttributeError。"""
+    import studio.agents as agents
+
+    missing = [n for n in agents.__all__ if not hasattr(agents, n)]
+    assert not missing, f"agents.__all__ 有不存在于模块的名字：{missing}"
+    ns: dict = {}
+    exec("from studio.agents import *", ns)   # 真跑一次 star-import
+    print(f"[ok] agents.__all__ 全部可解析（{len(agents.__all__)} 个名字）")
+
+
+def _test_deterministic_recheck_disabled():
+    """L10：max_rounds<=0 曾静默返回 pass=True 却一项检查都没做，必须与「通过」区分。"""
+    import studio.agents as agents
+    from studio.llm import MockLLM
+
+    cfg = {"review": {}}
+    _, rep = agents.deterministic_recheck(cfg, MockLLM(), {}, "正文", max_rounds=0)
+    assert rep.get("skipped") is True and rep.get("gate") == "skipped_disabled", rep
+    _, rep2 = agents.deterministic_recheck(cfg, MockLLM(), {}, "正文", max_rounds=3)
+    assert rep2.get("gate") == "skipped_mock" and "skipped" not in rep2, rep2
+    print("[ok] deterministic_recheck：max_rounds=0 → skipped_disabled，与 mock 跳过不混淆")
+
+
+def _test_draft_prune_keeps_latest():
+    """L6：DRAFT_KEEP 曾定义后无人引用、_prune 是空壳，旧版本从不归档。"""
+    import shutil
+    import tempfile
+
+    import studio.drafts as drafts
+
+    class _P:
+        def __init__(self, root):
+            self.root = root
+
+    tmp = tempfile.mkdtemp()
+    try:
+        p = _P(tmp)
+        for i in range(1, 6):
+            drafts.save_draft(p, 1, f"第{i}版正文内容，足够长一些用于快照。" * 3)
+        hist = Path(tmp) / "chapters" / ".drafts" / ".history"
+        snaps = sorted(x.name for x in hist.glob("ch01_r*.md"))
+        assert len(snaps) == drafts.DRAFT_KEEP, f"快照数 {len(snaps)} != DRAFT_KEEP {drafts.DRAFT_KEEP}"
+        assert "第5版" in (hist / snaps[-1]).read_text(encoding="utf-8"), "最新快照不是最后一版"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"[ok] 草稿归档：保留最近 {drafts.DRAFT_KEEP} 版，最旧自动淘汰")
 
 
 if __name__ == "__main__":

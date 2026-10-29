@@ -24,6 +24,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 from . import kb_lint
+from .util import atomic_write_text
 
 # 明显不属于"可写进正文"的文艺腔 / 空转词（比 kb_lint._AIRY 更严，仅用于新增条目）
 _BAN_WORDS = ("意象", "隐喻", "象征", "哲学", "岁月", "时光", "灵魂", "远方", "星河", "诗意",
@@ -221,12 +222,11 @@ def enrich_all(cfg: dict, directions: list[str] | None = None, per_field: int = 
             stat["detail"].append({"card": p.stem, "added": 0, "rejected": n_rej})
             continue
         if not (bak / p.name).exists():
-            (bak / p.name).write_text(json.dumps(card, ensure_ascii=False, indent=2) + "\n",
-                                      encoding="utf-8")
+            atomic_write_text(bak / p.name, json.dumps(card, ensure_ascii=False, indent=2) + "\n")
         out = res["card"]
         out["_enriched_at"] = __import__("time").strftime("%Y-%m-%d %H:%M:%S")
         if not dry_run:
-            p.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            atomic_write_text(p, json.dumps(out, ensure_ascii=False, indent=2) + "\n")
         stat["cards"] += 1
         stat["added"] += n_added
         stat["detail"].append({"card": p.stem, "added": n_added, "rejected": n_rej,
@@ -363,12 +363,11 @@ def rewrite_all(cfg: dict, directions: list[str] | None = None, min_score: int =
             stat["rejected"] += len(res["rejected"])
             continue
         if not (bak / p.name).exists():
-            (bak / p.name).write_text(json.dumps(card, ensure_ascii=False, indent=2) + "\n",
-                                      encoding="utf-8")
+            atomic_write_text(bak / p.name, json.dumps(card, ensure_ascii=False, indent=2) + "\n")
         out = res["card"]
         out["_rewritten_at"] = __import__("time").strftime("%Y-%m-%d %H:%M:%S")
         if not dry_run:
-            p.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            atomic_write_text(p, json.dumps(out, ensure_ascii=False, indent=2) + "\n")
         stat["cards"] += 1
         stat["changed"] += len(res["changed"])
         stat["rejected"] += len(res["rejected"])

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import threading
 import time
 
 import requests
@@ -245,11 +246,15 @@ class OpenAICompatLLM(BaseLLM):
 
         last_err: Exception | None = None
         attempt = 0
+        # 流式降级只作用于**本次调用**：self 来自 _LLM_CACHE，是进程内所有线程
+        # 共享的实例。历史写法 `self.stream = False` 会让一次读超时永久关掉整个
+        # 进程的流式（且 pipeline 里 stream_backup 备份到的已是 False，恢复无效）。
+        local_stream = self.stream
         while True:
             attempt += 1
             self.limiter.wait()
             try:
-                if self.stream:
+                if local_stream:
                     try:
                         text, usage = self._chat_stream(url, payload)
                         self._record(sum(len(m.get("content", "")) for m in messages), len(text), usage)
@@ -257,8 +262,9 @@ class OpenAICompatLLM(BaseLLM):
                     except (requests.RequestException, LLMError) as e:
                         if attempt >= self.retries + 2:
                             raise
-                        print(f"    [llm] 流式失败（{e}），降级为非流式重试")
-                        self.stream = False
+                        print(f"    [llm] 流式失败（{e}），本次降级为非流式重试")
+                        local_stream = False
+                        time.sleep(min(30, 2 ** attempt))
                         continue
                 # OpenCode 网关每次请求都要新 session UUID（复用会触发网关断连）
                 extra_headers = {}
@@ -266,17 +272,29 @@ class OpenAICompatLLM(BaseLLM):
                     import uuid as _uuid
                     extra_headers["x-opencode-session"] = str(_uuid.uuid4())
                 resp = self.session.post(url, json=payload, timeout=self.timeout, headers=extra_headers)
+                # 不可恢复的 4xx：认证/额度/权限错了，重试永远不可能成功。
+                # 历史行为：401/402/403 也走 retries 次指数退避（4+8+16+32 秒 ≈ 60 秒），
+                # 把"配置错了"变成一分钟静默挂起，日志里还只看到"重试中"。
+                if resp.status_code in (401, 402, 403):
+                    raise LLMError(
+                        f"LLM 认证/额度/权限错误（HTTP {resp.status_code}）：{resp.text[:300]}；"
+                        "重试无意义，请检查 config.yaml 的 llm.api_key / base_url"
+                    )
                 if resp.status_code in (400, 404, 422):
                     # response_format / reasoning_effort / thinking 不被支持：剔除后重试
+                    _stripped = None
                     if "response_format" in payload:
                         payload.pop("response_format", None)
                         json_mode = False
-                        continue
-                    if "reasoning_effort" in payload:
+                        _stripped = "response_format"
+                    elif "reasoning_effort" in payload:
                         payload.pop("reasoning_effort", None)
-                        continue
-                    if "thinking" in payload:
+                        _stripped = "reasoning_effort"
+                    elif "thinking" in payload:
                         payload.pop("thinking", None)
+                        _stripped = "thinking"
+                    if _stripped:
+                        print(f"    [llm] HTTP {resp.status_code}，剔除不受支持的 {_stripped} 后重试")
                         continue
                 resp.raise_for_status()
                 data = resp.json()
@@ -317,8 +335,11 @@ class OpenAICompatLLM(BaseLLM):
                 status = getattr(getattr(e, "response", None), "status_code", None)
                 rate_limited = status == 429
                 # 429 限流多给两次机会、等更久（云厂商免费档并发/RPM 限制常见）；
-                # 其他错误维持原有 retries 次指数退避
+                # 其他错误维持原有 retries 次指数退避。
+                # 例外：4xx 中除 408/409/429 外都不可恢复，直接放弃（见上方的 401/402/403 分支）。
                 max_attempts = self.retries + (2 if rate_limited else 0)
+                if status and 400 <= status < 500 and status not in (408, 409, 429):
+                    max_attempts = min(max_attempts, 1)
                 if attempt >= max_attempts:
                     break
                 if rate_limited:
@@ -517,6 +538,13 @@ class OpenCodeServeLLM(BaseLLM):
         except Exception as e:  # noqa: BLE001
             info.close(); err.close()
             raise LLMError(f"拉起 opencode serve 失败：{e}")
+        finally:
+            # Popen 只 dup fd，不给父进程句柄做所有权移交，成功分支也必须关；
+            # 否则 _ensure_once 门闩下虽最多泄漏 2 个 fd，仍属无谓泄漏。
+            if info is not None and not info.closed:
+                info.close()
+            if err is not None and not err.closed:
+                err.close()
         # 等待就绪（最多 30s）
         import time as _t
         for _ in range(30):
@@ -681,7 +709,7 @@ class AnthropicCompatLLM(BaseLLM):
             payload["system"] = (payload.get("system", "") + "\n\n严格只输出合法 JSON 对象，不要 markdown 围栏或解释。").strip()
 
         last_err = None
-        for attempt in range(1, self.retries + 3):
+        for attempt in range(1, self.retries + 2):
             self.limiter.wait()
             try:
                 # OpenCode 网关每次请求都要新 session UUID（复用会触发网关断连）
@@ -705,8 +733,7 @@ class AnthropicCompatLLM(BaseLLM):
                 return text
             except Exception as e:
                 last_err = e
-                status = getattr(getattr(e, "response", None), "status_code", None)
-                if attempt >= self.retries + 2:
+                if attempt >= self.retries + 1:
                     break
                 wait = min(120, 2 ** attempt * 5)
                 print(f"    [llm] 第{attempt}次调用失败：{e}，{wait}s 后重试…", flush=True)
@@ -719,6 +746,17 @@ class AnthropicCompatLLM(BaseLLM):
             runlog.note_llm(self.role, self.model, int((usage or {}).get("completion_tokens") or completion_chars / 1.6))
         except Exception:
             pass
+        # 与 OpenAICompatLLM 同口径：Anthropic 用 input_tokens/output_tokens，先归一化再记账，
+        # 否则走 claude-* 时 USAGE_LOG 恒空，"这篇烧了多少钱"完全看不见。
+        pt = ct = None
+        if usage:
+            pt = usage.get("prompt_tokens")
+            ct = usage.get("completion_tokens")
+        if pt is None:
+            pt = int(prompt_chars / 1.6)
+        if ct is None:
+            ct = int(completion_chars / 1.6)
+        record_usage(self.role, self.model, pt, ct, est=usage is None)
 
 
 class MockLLM(BaseLLM):
@@ -1070,25 +1108,38 @@ def get_llm(cfg: dict, role: str | None = None) -> BaseLLM:
 
     角色规划：writer(写手) / reviewer(主编+体检) / panel(读者团) /
              planner(提梗/方案/大纲/圣经) / light(知识卡蒸馏)
+
+    缓存必须双检加锁：pipeline 的章级门禁并行（ThreadPoolExecutor），两个线程
+    同时首次请求同一角色时会各造一个实例，后写的覆盖缓存、先造的被线程继续
+    持有 → 连接池重复、RateLimiter 分裂（限速锁不住另一个实例）、stream 降级
+    状态不共享。不会崩，但并发数与实际连接数脱钩。
     """
     if role:
         rcfg = (cfg.get("llm_roles") or {}).get(role)
         # 角色配置必须至少有 base_url/provider/model 之一，否则回落主 llm（防空配置）
         if rcfg and (rcfg.get("base_url") or rcfg.get("provider") or rcfg.get("model")):
             key = "role:" + role
-            if key not in _LLM_CACHE:
-                merged = {**cfg["llm"], **rcfg}
-                if merged.get("provider") == "local":
-                    merged["api_key"] = ""  # 本地引擎不校验，也不该带云端密钥
-                inst = _build_llm(merged, key)
-                inst.role = role
-                _LLM_CACHE[key] = inst
-            return _LLM_CACHE[key]
-    if "main" not in _LLM_CACHE:
-        inst = _build_llm(cfg["llm"], "main")
-        inst.role = "main"
-        _LLM_CACHE["main"] = inst
-    return _LLM_CACHE["main"]
+            inst = _LLM_CACHE.get(key)
+            if inst is None:
+                with _LLM_LOCK:
+                    inst = _LLM_CACHE.get(key)
+                    if inst is None:
+                        merged = {**cfg["llm"], **rcfg}
+                        if merged.get("provider") == "local":
+                            merged["api_key"] = ""  # 本地引擎不校验，也不该带云端密钥
+                        inst = _build_llm(merged, key)
+                        inst.role = role
+                        _LLM_CACHE[key] = inst
+            return inst
+    inst = _LLM_CACHE.get("main")
+    if inst is None:
+        with _LLM_LOCK:
+            inst = _LLM_CACHE.get("main")
+            if inst is None:
+                inst = _build_llm(cfg["llm"], "main")
+                inst.role = "main"
+                _LLM_CACHE["main"] = inst
+    return inst
 
 
 def resolve_llm(cfg: dict, base: BaseLLM, role: str) -> BaseLLM:
@@ -1099,6 +1150,8 @@ def resolve_llm(cfg: dict, base: BaseLLM, role: str) -> BaseLLM:
 
 
 _LLM_CACHE: dict[str, BaseLLM] = {}
+# 保护 _LLM_CACHE 的双检构造：章级门禁并行时多个线程会同时首次请求同一角色
+_LLM_LOCK = threading.Lock()
 
 
 def _build_llm(llm_cfg: dict, key: str) -> BaseLLM:

@@ -372,6 +372,14 @@ def unit_text_for_embed(u: dict) -> str:
 # 向量索引：增量编码 + 全量重建 + KNN
 # ---------------------------------------------------------------------------
 
+def _atomic_save_json(p: Path, obj) -> None:
+    """与 _atomic_save_npy 同理：游标/共现矩阵是「矩阵 + 索引」的一半，
+    非原子写会让两者行数对不上，下次加载读到错位的向量。"""
+    from .util import atomic_write_text
+
+    atomic_write_text(p, json.dumps(obj, ensure_ascii=False))
+
+
 def _atomic_save_npy(p: Path, mat) -> None:
     """写临时文件后原子替换，避免并发读（knn）撞上写一半的矩阵。"""
     np = _numpy()
@@ -436,6 +444,11 @@ def index_pending(cfg: dict, batch_size: int = 32) -> int:
             return 0
         added = 0
         new_rows = []
+        # 断点落盘：16 万单元的库全量编码要几小时，旧实现只在 for 循环结束后存一次，
+        # 中途任何失败（网络/额度/中断）都让已花的 token 全部作废。改成每 FLUSH_EVERY
+        # 批把矩阵与游标原子落盘一次，重跑时按 rows 过滤自动续跑。
+        FLUSH_EVERY = 10
+        n_batches = 0
         for i in range(0, len(pending), batch_size):
             batch = pending[i:i + batch_size]
             embs = _embed_texts([unit_text_for_embed(u) for u in batch], cfg)
@@ -444,12 +457,19 @@ def index_pending(cfg: dict, batch_size: int = 32) -> int:
             mat = np.vstack([mat, np.array(embs, dtype=np.float32)])
             new_rows.extend(u["id"] for u in batch)
             added += len(batch)
+            n_batches += 1
+            if n_batches % FLUSH_EVERY == 0:
+                _atomic_save_npy(vectors_path(cfg), mat)
+                off["rows"] = rows + new_rows
+                off["count"] = int(mat.shape[0])
+                off["lines"] = len(all_lines)
+                _atomic_save_json(done, off)
         if added:
             _atomic_save_npy(vectors_path(cfg), mat)
             off["rows"] = rows + new_rows
             off["count"] = int(mat.shape[0])
             off["lines"] = len(all_lines)   # 原始行游标；并发追加只会让下次多解析几行，rows 过滤兜底
-            done.write_text(json.dumps(off), encoding="utf-8")
+            _atomic_save_json(done, off)
         return added
 
 
@@ -726,8 +746,7 @@ def _rebuild_cocomatrix_locked(cfg: dict) -> dict:
             continue
         matrix.setdefault(a, {})[b] = round(w, 3)
         matrix.setdefault(b, {})[a] = round(w, 3)
-    coco_path(cfg).write_text(json.dumps(
-        {"n_units": n, "matrix": matrix}, ensure_ascii=False), encoding="utf-8")
+    _atomic_save_json(coco_path(cfg), {"n_units": n, "matrix": matrix})
     return {"n_units": n, "nodes": len(freq), "edges": sum(len(v) for v in matrix.values()) // 2}
 
 

@@ -187,8 +187,10 @@ def build(cfg: dict, force: bool = False) -> int:
                 {"i": i, "tf": f, "idf": round(idf, 4), "norm": f / (1 - B + B * dl / (avgdl or 1))}
             )
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"stamp": stamp, "N": N, "docs": docs, "postings": postings},
-                            ensure_ascii=False), encoding="utf-8")
+    from .util import atomic_write_text
+
+    atomic_write_text(p, json.dumps({"stamp": stamp, "N": N, "docs": docs, "postings": postings},
+                                    ensure_ascii=False))
     return N
 
 

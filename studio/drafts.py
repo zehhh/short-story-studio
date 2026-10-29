@@ -106,15 +106,39 @@ def save_draft(project, no: int, text: str, *, stage: str = "draft",
 
 
 def _prune(project, no: int) -> None:
-    """保留最近 DRAFT_KEEP 版：历史版本挪进 .history/，只留指针，防止磁盘膨胀。
+    """把超出 DRAFT_KEEP 的旧版本归档进 .history/（不删除，保留取证能力）。
 
-    实际上短篇一章最多十几轮、单版 2-3KB，膨胀风险很小；这里只在超过阈值时
-    把最旧的几版移到 `.history/` 而不是删除，保留取证能力。
+    旧实现是空壳：`DRAFT_KEEP` 定义后无人引用，`_prune` 在 `if not hist.exists(): return`
+    之后没有任何逻辑，docstring 承诺的"保留最近 3 版"完全不存在。现在改为每次保存新草稿
+    时把当前版本的正文快照留档（按 round 命名），再按 DRAFT_KEEP 淘汰最旧的快照。
     """
     root = _drafts_root(project)
+    stem = f"ch{int(no):02d}"
+    body_path = root / f"{stem}.md"
+    meta_path = root / f"{stem}.json"
+    if not body_path.exists():
+        return
     hist = root / ".history"
-    # 只对单章单文件的实现来说没有多版本；保留钩子，避免将来加多版本时忘记清理
-    if not hist.exists():
+    try:
+        keep = max(1, int(DRAFT_KEEP))
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) or {} if meta_path.exists() else {}
+        rnd = int(meta.get("round") or 0)
+        # 上一版（当前 body 已被覆盖前的内容）无法复原，只能在每次保存后留档当前版本；
+        # 用 round 命名保证唯一，同一轮重复保存时覆盖同一个快照。
+        hist.mkdir(parents=True, exist_ok=True)
+        snap = hist / f"{stem}_r{rnd:03d}.md"
+        from .util import atomic_write_text
+
+        atomic_write_text(snap, body_path.read_text(encoding="utf-8"))
+        # 只保留最近 keep 个快照，更早的删掉（快照是派生物，正文与 draft 才是真相）
+        snaps = sorted(hist.glob(f"{stem}_r*.md"))
+        for old in snaps[:-keep]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    except (OSError, json.JSONDecodeError, ValueError):
+        # 归档是可选能力，失败不应影响草稿本身落盘
         return
 
 
@@ -235,12 +259,18 @@ def list_recoverable(project) -> list[dict]:
             seen.add(no)
 
     # ② 半状态正文：存在 chNN.md 但没有合法 commit 标记
-    #    历史项目兼容：本模块上线前产出的项目**全都没有** commit 标记，若照直报会把
-    #    几十篇老稿全标成"半状态"，告警噪声淹没真问题。判据：整个项目连一个 commit
-    #    标记都没有 → 视为旧版项目，跳过这一路（只报 .drafts 里的真草稿）。
+    #    历史项目兼容：本模块上线前产出的项目全都没有 commit 标记，若照直报会把
+    #    几十篇老稿全标成"半状态"，告警噪声淹没真问题。
+    #    旧判据"整个项目连一个 commit 标记都没有 → 视为旧版"选错了：零标记在两类
+    #    完全不同的情况下都成立 ——（i）旧版项目；（ii）**新项目第一轮就崩在
+    #    commit_chapter 的两次写之间**。后者恰恰是最该恢复的那次，却被跳过；
+    #    再叠加 stage_write 用 .exists() 判完成（会跳过这章）→ 两边都沉默。
+    #    新判据：本项目是否启用过新流程，看 `.drafts/` 目录是否存在
+    #    （commit_chapter 第一次写就建它），而不是看标记数量。
     chapters_dir = root / "chapters"
+    new_flow = (chapters_dir / ".drafts").is_dir() if chapters_dir.is_dir() else False
     has_any_marker = bool(list(chapters_dir.glob("ch*.commit.json"))) if chapters_dir.is_dir() else False
-    if chapters_dir.is_dir() and has_any_marker:
+    if chapters_dir.is_dir() and (new_flow or has_any_marker):
         for body_path in sorted(chapters_dir.glob("ch*.md")):
             try:
                 no = int(body_path.stem[2:])

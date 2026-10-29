@@ -8,11 +8,19 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 from .util import atomic_write_json, atomic_write_text, date_stamp, now_ts, slugify
 
 STAGES = ["hotspots", "concepts", "concept", "pitch", "lead", "outline", "bible", "chapters", "final"]
+
+# project.json 的读-改-写必须串行：atomic_write_json 只保证"不写出半个文件"，
+# 不保证"不丢更新"。同一章内会多次 save_meta（换衔接状态、落 reviews、改 status），
+# 章级门禁又是 ThreadPoolExecutor 并行，两个线程各自 load → 改 → 整份覆盖，
+# 后者会把前者的 chapters_state / reviews / status 整份回退（typical lost update）。
+# 跨进程由 lock.project_lock 负责，这里管进程内的线程。
+_META_LOCK = threading.RLock()
 
 
 class Project:
@@ -35,10 +43,14 @@ class Project:
         return {"name": self.root.name, "created_at": now_ts(), "status": {}}
 
     def update_meta(self, **kv) -> dict:
-        """读-改-写一次的原子元信息更新（替代 `project.meta[k]=v` 那套写法）。"""
-        meta = self.meta
-        meta.update(kv)
-        self.save_meta(meta)
+        """读-改-写一次的原子元信息更新（替代 `project.meta[k]=v` 那套写法）。
+
+        持 `_META_LOCK`：见模块头注释——并行门禁下这是 lost update 的唯一防线。
+        """
+        with _META_LOCK:
+            meta = self.meta
+            meta.update(kv)
+            self.save_meta(meta)
         return meta
 
     def save_meta(self, meta: dict):
@@ -48,9 +60,23 @@ class Project:
         atomic_write_json(self.root / "project.json", meta)
 
     def set_stage(self, stage: str, detail: str = "done"):
-        meta = self.meta
-        meta["status"][stage] = detail
-        self.save_meta(meta)
+        # 必须持锁包住"读 → 改 → 写"，否则与同进程内另一个线程的 save_meta 交错
+        with _META_LOCK:
+            meta = self.meta
+            meta.setdefault("status", {})[stage] = detail
+            self.save_meta(meta)
+
+    def merge_meta(self, patch_fn) -> dict:
+        """锁内读-改-写：`patch_fn(meta)` 原地改，返回值无用。
+
+        并行阶段写 meta 的正确姿势（`update_meta(**kv)` 只做顶层浅更新，
+        改 `reviews["3"]` / `chapters_state` 这类嵌套键必须走这里）。
+        """
+        with _META_LOCK:
+            meta = self.meta
+            patch_fn(meta)
+            self.save_meta(meta)
+        return meta
 
     def stage_status(self) -> dict:
         return self.meta.get("status", {})

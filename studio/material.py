@@ -70,12 +70,15 @@ def _load(cfg: dict) -> list[dict]:
 
 
 def _save(cfg: dict, items: list[dict]):
+    """全库重写。走原子写：素材库是全量重写的单文件，写一半崩掉就是整库丢失。"""
+    from .util import atomic_write_text
+
     p = materials_path(cfg)
     if p.exists():
         import shutil
 
         shutil.copy2(p, p.with_suffix(".jsonl.bak"))
-    p.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in items), encoding="utf-8")
+    atomic_write_text(p, "\n".join(json.dumps(x, ensure_ascii=False) for x in items))
 
 
 def _fingerprint(text: str) -> str:

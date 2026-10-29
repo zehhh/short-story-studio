@@ -58,9 +58,12 @@ def load_schedules(cfg: dict) -> list[dict]:
 
 
 def save_schedules(cfg: dict, jobs: list[dict]):
+    """定时任务表全量重写。原子写：写一半崩掉会丢掉用户配的全部任务。"""
+    from .util import atomic_write_json
+
     p = schedules_path(cfg)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"jobs": jobs}, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(p, {"jobs": jobs})
 
 
 def new_job(cfg: dict, name: str, trigger: dict, count: int = 1,
@@ -230,8 +233,21 @@ def run_job(cfg: dict, job: dict, runner=None, log_dir: Path | None = None) -> d
             lock.unlink()
         except OSError:
             pass
-    lock.write_text(json.dumps({"pid": os.getpid(), "ts": time.time(), "at": now_ts()},
-                               ensure_ascii=False), encoding="utf-8")
+    # 排他创建而非「先检查再写」：两个调度进程同时进入时，上面的 exists()
+    # 可能都为假，随后双双写锁、并发跑同一任务（check-then-act 竞态）。
+    # O_CREAT|O_EXCL 让内核替我们仲裁，抢不到的那个直接跳过。
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        winner = _lock_holder(lock)
+        print(f"[scheduler] 另一个调度进程已抢先取得运行锁（pid={winner[0] if winner else '?'}），"
+              f"跳过 {job.get('name')}")
+        return {"status": "skipped"}
+    with os.fdopen(fd, "w", encoding="utf-8") as _lf:
+        _lf.write(json.dumps({"pid": os.getpid(), "ts": time.time(), "at": now_ts()},
+                             ensure_ascii=False))
+        _lf.flush()
+        os.fsync(_lf.fileno())
     log_dir = log_dir or (Path(cfg["studio"]["workspace_abs"]).parent / "workspace_logs")
     log_dir.mkdir(parents=True, exist_ok=True)
     results = []
@@ -264,17 +280,21 @@ def run_job(cfg: dict, job: dict, runner=None, log_dir: Path | None = None) -> d
                 results.append({"index": i, "cmd": " ".join(cmd[3:]), "code": code,
                                 "log": str(log_file), "at": now_ts()})
     finally:
-        job["last_run"] = now_ts()
-        ok = sum(1 for r in results if r["code"] == 0)
-        job["last_result"] = f"{ok}/{len(results)} 篇成功"
-        all_jobs = load_schedules(cfg)
-        for j in all_jobs:
-            if j.get("id") == job["id"]:
-                j.update({k: job.get(k) for k in ("last_run", "last_result")})
-                j.setdefault("history", []).append({"at": now_ts(), "results": results})
-                j["history"] = j["history"][-10:]
-        save_schedules(cfg, all_jobs)
-        lock.unlink(missing_ok=True)
+        # 锁必须无条件释放：写 schedules 失败时若跳过 unlink，锁会留到 6 小时
+        # 陈旧判定之后才被回收，期间每次调度都跳过（用户看到的就是"调度器不动了"）。
+        try:
+            job["last_run"] = now_ts()
+            ok = sum(1 for r in results if r["code"] == 0)
+            job["last_result"] = f"{ok}/{len(results)} 篇成功"
+            all_jobs = load_schedules(cfg)
+            for j in all_jobs:
+                if j.get("id") == job["id"]:
+                    j.update({k: job.get(k) for k in ("last_run", "last_result")})
+                    j.setdefault("history", []).append({"at": now_ts(), "results": results})
+                    j["history"] = j["history"][-10:]
+            save_schedules(cfg, all_jobs)
+        finally:
+            lock.unlink(missing_ok=True)
     return {"status": "done", "results": results}
 
 
