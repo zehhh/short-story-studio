@@ -32,7 +32,7 @@ python -m studio run --idea "退婚被索88万彩礼，女主用一张十年前�
 Windows 也可双击 `启动工作室.bat` 走菜单式操作（一键创作 / 看板 / 热点榜 / 投稿包 / 复盘）。
 
 支持任何 **OpenAI 兼容接口**：DeepSeek、智谱 GLM、Kimi、通义 Qwen，或本地 Ollama / LM Studio
-（见 [docs/LOCAL_LLM.md](docs/LOCAL_LLM.md)）。`config.yaml` 含 API Key，已在 `.gitignore` 中排除。
+（见 [docs/LOCAL_LLM.md](docs/LOCAL_LLM.md)）
 
 ## 命令一览
 
