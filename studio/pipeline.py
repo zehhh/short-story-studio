@@ -2670,6 +2670,11 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
     prev_carry = ""
     cast = _plan_cast(plan)
     plan_cast_all = [c["name"] for c in cast]
+    # 第一人称主角的名字：计划里标了 pov 的优先，否则取第一个主要人物。拿它查
+    # 「叙述里有没有突然用第三人称叫主角」——真实终审 3 处 high 硬伤有 2 处是它。
+    _pov_name = next((c["name"] for c in cast if c.get("pov")), "")
+    if not _pov_name:
+        _pov_name = next((c["name"] for c in cast if c.get("major")), "")
     if cast:
         print("[stage] 人物名册：" + "、".join(
             f"{c['name']}{'' if c['major'] else '(过场)'}" for c in cast))
@@ -2690,8 +2695,12 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
         carry_out = (sec.get("carry_out") or "").strip()
 
         # 摘要只用「计划里的 goal + 上一节正文首句」，不用模型自报的 [本章摘要]
+        # （实测模型会把没写的情节写进摘要，污染下一节的衔接）。
+        # PREV_TAIL 给**上一节全文**而不是末 300 字：终审 5 处 high 里 4 处是
+        # 「上一节写过的事，这一节换了个说法」——道具来源、药的成分、前两位
+        # 妃子的死因、时间推进。只给结尾 300 字，写手根本看不到那些设定。
         if prev_body:
-            prev_tail = prev_body[-300:]
+            prev_tail = prev_body
             prev_summary = f"{secs[i - 2].get('goal', '')}（正文开头：{_first_sentence(prev_body)}）"
         else:
             prev_tail = "（小节01，无）"
@@ -2734,10 +2743,25 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             # 线索不丢：上一节声明要留下的东西，这一节开头必须正面接住。
             # 只给一次重写机会（第 1 次尝试后才追加）——同义改写本来就抓不准，
             # 硬卡会产生假阳性连环重写；抓到了就提示，抓不到就落到连续性体检里。
-            if prev_carry and attempt == 1 and not _contin._n_gram_hit(prev_carry, body, 4):
+            if prev_carry and attempt == 1 and not _contin.carry_hit(prev_carry, body):
                 problems = problems + [
                     f"没有接住上一节留下的「{prev_carry}」：这一节开头必须正面处理它，"
                     "不能另起炉灶、也不能当它没发生"]
+            # 人称断裂 / 节尾复述：两类真实终审 high 硬伤，判据零成本。
+            # 把它们放在写作时就拦，比等到终审让 LLM 判官发现再补丁修复便宜得多
+            # ——补丁轮实测会把硬伤越改越多（3 → 4 → 5 处）。
+            if _pov_name and attempt == 1:
+                _pb = _contin.pov_breaks(body, _pov_name)
+                if _pb:
+                    problems = problems + [
+                        f"叙述里出现了主角名字「{_pov_name}」：「{_pb[0][:24]}」——"
+                        "全篇第一人称，主角的名字只能出现在别人嘴里（引号内），"
+                        "其余一律写「我」"]
+            _tr = _contin.tail_repeat(body)
+            if _tr and attempt == 1:
+                problems = problems + [
+                    f"节尾把前文又讲了一遍：「{_tr[:24]}」——最后一段只许用动作或"
+                    "台词把 end_hook 落下，不许复述本节已写过的场景或台词"]
             # 语言病在节级只给**一次**修正机会。实测：整节盲改三轮压不住 AI 口癖
             # （「嘴角勾起一抹」三轮全在），白烧 token 还照样带病交付。真正的去处是
             # 整稿 `_ai_deflavor`——它把命中词与所在句一起喂给模型。这里第二次起放行，
@@ -2796,7 +2820,8 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
         _secs_for_cont = [{"no": f"{int(s.get('no') or k):02d}", "text": t}
                           for k, (s, t) in enumerate(zip(secs, body_list), 1)]
         _cont = _contin.report(_secs_for_cont, plan_sections=secs,
-                               cast=cast or None, min_dup=_SEC_DUP_MIN)
+                               cast=cast or None, min_dup=_SEC_DUP_MIN,
+                               pov_name=_pov_name)
         project.save_json("continuity.json", {
             **_cont, "dup_fixes": dup_fixes, "cast_roster": plan_cast_all})
         print("[stage] 连续性体检：" + _contin.summary(_cont))
@@ -4661,6 +4686,14 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
             # 最小改动：每轮只修最严重的 6 处（补丁过多会累积引入新问题，实测26补丁→分数反降）。
             _sev_rank = {"high": 0, "mid": 1, "low": 2}
             issues = sorted(issues, key=lambda x: _sev_rank.get(x.get("severity"), 1))[:6]
+            # 终审原始判词必须落盘：此前只在内存里流转，跑完只剩下最后一轮，
+            # 「判官到底点了哪几处 high」只能靠猜（v6/v7 两轮都卡在 66 分、
+            # high 5-6 处的复盘就吃了这个亏）。
+            try:
+                project.save_json(f"r{rnd_f:02d}.json", report,
+                                  subdir="final_review_rounds")
+            except Exception as e:  # noqa: BLE001
+                print(f"[stage] ⚠ 终审判词落盘失败（{type(e).__name__}: {e}）")
             _why_f = []
             if float(report.get("score") or 0) < floor:
                 _why_f.append(f"{report.get('score')} 分 < 门槛 {floor}")

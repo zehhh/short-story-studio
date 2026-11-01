@@ -458,10 +458,13 @@ def euro_report(text: str) -> dict:
     """欧化/翻译腔检测：中文语序被英语语序污染（长定语前置、从句套从句、被动滥用）。"""
     hits: list[dict] = []
     for label, pat, sev in _EURO_RULES:
-        found = re.findall(pat, text)
+        # 必须用 finditer 取 group(0)：十几条规则自带捕获组（「是一个…的(人|男人)」
+        # 「对于…(来说|而言)」），findall 在有分组时只返回分组内容——实测报告里
+        # 样本变成了「人」「来说」，定点返修拿这个当靶子根本无从下手。
+        found = [m.group(0) for m in re.finditer(pat, text)]
         if found:
-            sample = found[0] if isinstance(found[0], str) else str(found[0])
-            hits.append({"kind": label, "text": sample[:20], "count": len(found), "severity": sev})
+            hits.append({"kind": label, "text": found[0][:20], "count": len(found),
+                         "severity": sev})
     return {"count": sum(h["count"] for h in hits), "hits": hits}
 
 

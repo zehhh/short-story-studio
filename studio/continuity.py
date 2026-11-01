@@ -114,6 +114,47 @@ def _next_sec(secs: list[dict], no: str) -> str:
     return ""
 
 
+# 大词/泛词：单凭它们命中说明不了「这一节接住了上一节的交接项」。
+# 例：carry_out 写「禁军将领的名字」，下一节满篇「名字」也不算接住。
+_GENERIC_TOKENS = (
+    "名字", "东西", "事情", "地方", "时候", "问题", "办法", "样子", "消息",
+    "身份", "关系", "证据", "秘密", "真相", "线索", "结果", "原因", "过去",
+)
+
+_TRIM_HEAD = "的了着过一这个那个把被将从向在是一有"
+
+_CARRY_PUNCT = "，。！？；：、…— \t\n「」『』“”‘’\"'（）()《》"
+
+
+def carry_hit(token: str, text: str) -> bool:
+    """下一节有没有正面处理上一节留下的交接项（宽松代理判据）。
+
+    中文中心语在短语尾部（「袖中藏着的**银针**」「半张残缺**信笺**」），所以从尾
+    往前找最长的、能在正文里出现的连续片段：
+    - ≥3 字命中即算接住；
+    - 只有 2 字且该词是泛词（名字/东西/真相…）不算——
+      否则「禁军将领的名字」会被下一节任何一处「名字」蒙过去。
+    这是**低误报优先**的代理判据：宁可漏报也不能天天喊假断头（实测旧版 4 字
+    连续片段对真实中文几乎不命中，9 个交接项报出 5 个假阳性）。
+    """
+    t = "".join(ch for ch in (token or "") if ch not in _CARRY_PUNCT).lstrip(_TRIM_HEAD)
+    if len(t) < 2 or not text:
+        return False
+    # ① 尾部中心语（中文中心语在后）：≥3 字命中直接算，2 字要过泛词表
+    for n in range(min(8, len(t)), 1, -1):
+        frag = t[-n:]
+        if frag in text:
+            if n >= 3 or frag not in _GENERIC_TOKENS:
+                return True
+    # ② 任意 3 字窗口：放过「那碗黑沉的汤药 → 黑沉的药液泼在金砖上」「密室的
+    #    钥匙孔 → 锁孔里塞着铁丝」这类换了中心语的正当接续。取 3 字而不是 2 字，
+    #    是因为 2 字窗口在万字正文里几乎必然撞上（实测会退化成永远命中）。
+    for i in range(len(t) - 2):
+        if t[i:i + 3] in text:
+            return True
+    return False
+
+
 def cast_gaps(secs: list[dict], cast) -> dict:
     """人物断档（硬判）：**重要且非视角**人物中途退场，或声明了却从未出场。
 
@@ -168,11 +209,10 @@ def thread_gaps(secs: list[dict], plan_sections: list[dict] | None = None,
         if not c:
             continue
         nxt = secs[idx + 1].get("text") or ""
-        # 先按 4 字连续片段判；判不过再退到 3 字。carry_out 在计划里被要求写成
-        # 6-12 字的具体名词（见 prompts/section_plan.md 铁律 9），本身就是「可被
-        # 逐字复述」的短语，退一档不会误伤；而在旧格式（一句话概述）下 4 字几乎
-        # 不可能连续命中，会制造大量假断头（实测 9 个交接项报 2 个假阳性）。
-        if not (_n_gram_hit(c, nxt, min_hit) or _n_gram_hit(c, nxt, 3)):
+        # 用 carry_hit（尾部中心语 + 泛词过滤）而不是裸 n-gram：真实中文里
+        # 「袖中藏着的银针」这种短语按 4 字连续片段几乎不可能原样出现在下一节，
+        # 报出来的断头绝大多数是假阳性，反而让真问题被噪声淹没。
+        if not carry_hit(c, nxt):
             gaps.append({"no": _sec_no(s), "next": _sec_no(secs[idx + 1]),
                          "carry_out": c[:80]})
     return {"gaps": gaps, "declared": len(carry), "skipped": not carry}
@@ -193,13 +233,95 @@ def dup_across(secs: list[dict], min_len: int = 14) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------- 人称 / 复述
+# 第一人称文最刺眼的硬伤是「叙述里突然叫主角的名字」：全篇用「我」，却在段落里
+# 写「苏清婉站在阶下」——读者会以为换了视角。判据必须只扫引号外，因为别人嘴里
+# 喊「苏清婉」是完全正常的。
+_DQ_RE = re.compile(r"[「『“][^」』”]*[」』”]")
+
+_SENT_SPLIT = re.compile(r"[。！？；\n]")
+
+
+def _sentences(text: str) -> list[str]:
+    return [s.strip() for s in _SENT_SPLIT.split(text or "") if s.strip()]
+
+
+def pov_breaks(text: str, name: str) -> list[str]:
+    """叙述里出现了主角的名字（引号外），返回命中的句子。
+
+    名字只该出现在别人嘴里；叙述一律是「我」。这条在中文里可以零成本精确判：
+    把成对引号整段抠掉，再看名字还在不在。
+    """
+    if not name:
+        return []
+    bare = _DQ_RE.sub("", text or "")
+    return [s[:60] for s in _sentences(bare) if name in s]
+
+
+def _longest_common(a: str, b: str, min_len: int = 12) -> str:
+    """a、b 的最长公共子串（限长 min_len 以上），用于判「复述」。"""
+    if len(a) < min_len or len(b) < min_len:
+        return ""
+    best, i, n = "", 0, len(a)
+    while i <= n - min_len:
+        frag = a[i:i + min_len]
+        if frag in b:
+            j = min_len
+            while i + j < n and a[i:i + j + 1] in b:
+                j += 1
+            if j > len(best):
+                best = a[i:i + j]
+            i += j
+        else:
+            i += 1
+    return best
+
+
+def tail_repeat(text: str, min_len: int = 12) -> str:
+    """节尾把前文复述了一遍？返回那段重复的文字。
+
+    真实缺陷长这样：本节中段太后说「就像有些人，心死了，也就完了」，结尾又把
+    这句原样说一遍收束。它同时污染两件事——本节显得注水、下一节开头的「接住」
+    只能对着同一句话重写，于是相邻两节撞车。
+    """
+    if not text:
+        return ""
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if len(paras) >= 2:
+        tail, head = paras[-1], "\n".join(paras[:-1])
+        hit = _longest_common(tail, head, min_len)
+        if hit:
+            return hit
+    sents = _sentences(text)
+    if len(sents) >= 4:
+        tail = "。".join(sents[-2:])
+        head = "。".join(sents[:-2])
+        return _longest_common(tail, head, min_len)
+    return ""
+
+
 def report(secs: list[dict], plan_sections: list[dict] | None = None,
-           cast: list[str] | set[str] | None = None, min_dup: int = 14) -> dict:
-    """三项检查一次跑完，返回可直接落盘/打印的结构。"""
+           cast: list[str] | set[str] | None = None, min_dup: int = 14,
+           pov_name: str = "") -> dict:
+    """各项检查一次跑完，返回可直接落盘/打印的结构。
+
+    `pov_name` 给了才查人称断裂（第一人称文里叙述出现主角名字）与节尾复述——
+    这两项是真实终审里被判 high 的常客，判据零成本，不该等模型来发现。
+    """
     cg = cast_gaps(secs, cast or [])
     tg = thread_gaps(secs, plan_sections)
     dups = dup_across(secs, min_dup)
-    hard = bool(cg["gaps"] or tg["gaps"] or dups)
+    pov, tails = [], []
+    for s in secs or []:
+        txt = s.get("text") or ""
+        if pov_name:
+            hits = pov_breaks(txt, pov_name)
+            if hits:
+                pov.append({"no": _sec_no(s), "n": len(hits), "samples": hits[:2]})
+        rep_tail = tail_repeat(txt)
+        if rep_tail:
+            tails.append({"no": _sec_no(s), "text": rep_tail[:60]})
+    hard = bool(cg["gaps"] or tg["gaps"] or dups or pov or tails)
     return {
         "pass": not hard,
         "cast": cg["gaps"],
@@ -209,8 +331,10 @@ def report(secs: list[dict], plan_sections: list[dict] | None = None,
         "threads_declared": tg["declared"],
         "threads_skipped": tg["skipped"],
         "dups": dups,
+        "pov": pov,
+        "tails": tails,
         "n": {"cast": len(cg["gaps"]), "threads": len(tg["gaps"]),
-              "dups": len(dups)},
+              "dups": len(dups), "pov": len(pov), "tails": len(tails)},
     }
 
 
@@ -219,11 +343,12 @@ def summary(rep: dict) -> str:
     n = rep.get("n") or {}
     parts = []
     for key, label in (("cast", "人物断档"), ("threads", "线索断头"),
-                       ("dups", "跨节重复")):
+                       ("dups", "跨节重复"), ("pov", "人称断裂"),
+                       ("tails", "节尾复述")):
         if n.get(key):
             parts.append(f"{label} {n[key]}")
     if rep.get("cast_skipped"):
         parts.append("人物：计划未声明人物表，跳过")
     if rep.get("threads_skipped"):
         parts.append("线索：计划未声明交接项，跳过")
-    return "；".join(parts) if parts else "人物/线索/重复三项均无问题"
+    return "；".join(parts) if parts else "人物/线索/重复/人称/节尾五项均无问题"

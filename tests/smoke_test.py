@@ -458,6 +458,7 @@ def main() -> int:
     _test_title_gate_rewards_real_titles()
     _test_section_cast_and_words()
     _test_dedup_guard_reverts_mass_deletion()
+    _test_continuity_pov_and_tail()
 
     print("\n全部冒烟测试通过 ✔")
     return 0
@@ -634,6 +635,37 @@ def _test_dedup_guard_reverts_mass_deletion():
     assert rep2.get("deduped_paras") == 1, rep2
     assert "dedup_guard" not in rep2
     print("[ok] 删重复段有销毁上限：整篇复读撤销，单处贴重照删")
+
+
+def _test_continuity_pov_and_tail():
+    """连续性两项零成本判据：人称断裂、节尾复述。
+
+    真实终审 3 处 high 硬伤里 2 处是「叙述里突然用第三人称叫主角」、1 处是
+    「节尾把本节台词原样再说一遍」。这两类都能确定性判出来，不该留给 LLM 判官
+    到终审才发现——补丁轮实测会把硬伤越改越多（3 → 4 → 5 处）。
+    """
+    from studio import continuity as C
+
+    # 人称：叙述里出现主角名 → 命中；只在别人嘴里 → 不命中
+    assert C.pov_breaks("苏清婉握紧银针。", "苏清婉"), "叙述里的主角名必须抓到"
+    assert not C.pov_breaks('我握紧银针。赵嬷嬷道：“苏清婉，你可知罪？”', "苏清婉"), \
+        "引号里的名字是别人在叫，不是人称跳"
+    assert not C.pov_breaks("我握紧银针。", ""), "没给名字时不许炸"
+
+    # 节尾复述：末句与前文逐字重合 ≥12 字 → 命中
+    dup = ("我数着步数走进长街，数到第七步停下。风从巷口灌进来，吹得灯影乱晃。"
+           "墙根下蹲着个卖炭的老汉，他抬头看我一眼又低下去。我摸到袖里那根银针，针尖凉得刺手。"
+           "风从巷口灌进来，吹得灯影乱晃。")
+    assert C.tail_repeat(dup), "节尾整句复述前文必须抓到"
+    fresh = ("我数着步数走进长街，数到第七步停下。风从巷口灌进来，吹得灯影乱晃。"
+             "墙根下蹲着个卖炭的老汉，他抬头看我一眼又低下去。我摸到袖里那根银针，针尖凉得刺手。"
+             "我推开门，屋里的灯没点。")
+    assert not C.tail_repeat(fresh), "正常收尾不许误报"
+
+    # 线索交接：中文中心语在短语尾部，尾部 ≥3 字命中即算接住；泛词 2 字不算
+    assert C.carry_hit("袖中藏着的银针", "我摸到那根银针，指尖一凉。"), "尾部中心语必须能召回"
+    assert not C.carry_hit("半张残缺信笺", "我推开门，屋里没人。"), "没接住就是没接住"
+    print("[ok] 连续性：人称断裂/节尾复述/线索接住 三项判据零误报")
 
 
 if __name__ == "__main__":
