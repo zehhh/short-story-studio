@@ -2747,18 +2747,19 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
                 problems = problems + [
                     f"没有接住上一节留下的「{prev_carry}」：这一节开头必须正面处理它，"
                     "不能另起炉灶、也不能当它没发生"]
-            # 人称断裂 / 节尾复述：两类真实终审 high 硬伤，判据零成本。
-            # 把它们放在写作时就拦，比等到终审让 LLM 判官发现再补丁修复便宜得多
-            # ——补丁轮实测会把硬伤越改越多（3 → 4 → 5 处）。
-            if _pov_name and attempt == 1:
+            # 人称断裂 / 节尾复述：两类真实终审 high 硬伤，判据零成本且**零误报**
+            # （见决策 35），所以每一轮都判，不学 carry_hit 只给一次机会——
+            # 实测 v8 第 09 节第一轮被拦、重写后仍留「李承乾看向沈清秋」，
+            # 若第二轮不判，就带着硬伤过关了。
+            if _pov_name:
                 _pb = _contin.pov_breaks(body, _pov_name)
                 if _pb:
                     problems = problems + [
                         f"叙述里出现了主角名字「{_pov_name}」：「{_pb[0][:24]}」——"
                         "全篇第一人称，主角的名字只能出现在别人嘴里（引号内），"
-                        "其余一律写「我」"]
+                        "其余一律写「我」（「李承乾看向沈清秋」要写成「李承乾看向我」）"]
             _tr = _contin.tail_repeat(body)
-            if _tr and attempt == 1:
+            if _tr:
                 problems = problems + [
                     f"节尾把前文又讲了一遍：「{_tr[:24]}」——最后一段只许用动作或"
                     "台词把 end_hook 落下，不许复述本节已写过的场景或台词"]
@@ -5051,6 +5052,27 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
         except Exception as e:  # noqa: BLE001
             _dia2_rep = {"enabled": True, "error": f"{type(e).__name__}: {e}"}
             print(f"[dialog] ⚠ 交付前补对白跳过（{type(e).__name__}: {e}）")
+
+    # 第一人称人名收口（确定性、零 token）：润色/扩写/补对白这几步会把叙述里的
+    # 「我」改回主角名字——终审实测每轮都报「叙述里突然出现沈清秋」这类 high 硬伤，
+    # 而且判官明确说是「扩写越界造成」。写作门禁拦不住它，因为它是**改稿之后**才出现的，
+    # 所以在所有整稿改写完成、字数重算之前再收一次口。引号内的台词不动（那是别人在叫她）。
+    try:
+        from . import continuity as _contin_d
+
+        _plan_d = project.load_json("section_plan.json") or {}
+        _cast_d = _contin_d._norm_cast(_plan_d.get("characters") or [])
+        _pov_d = next((c["name"] for c in _cast_d if c.get("pov")), "")
+        if not _pov_d:
+            _pov_d = next((c["name"] for c in _cast_d if c.get("major")), "")
+        if _pov_d:
+            _fixed_d, _pn_d = _contin_d.fix_pov(full, _pov_d)
+            if _pn_d:
+                print(f"[stage] 人称收口：{_pn_d} 处叙述里的「{_pov_d}」改回「我」")
+                full = _fixed_d
+                report["pov_fix"] = {"name": _pov_d, "fixed": _pn_d}
+    except Exception as e:  # noqa: BLE001 —— 收口失败不该毁掉整篇成稿
+        print(f"[stage] ⚠ 人称收口失败（{type(e).__name__}: {e}）")
 
     # 平台成稿格式：导语 + 01/02/03 编号小节（assemble 已统一小节头为 NN 标题）
     plat_fmt = plat.get("format", "chapters")

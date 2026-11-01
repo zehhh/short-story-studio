@@ -300,6 +300,37 @@ def tail_repeat(text: str, min_len: int = 12) -> str:
     return ""
 
 
+def fix_pov(text: str, name: str) -> tuple[str, int]:
+    """把**叙述**里误用的主角名字换成「我」，返回 (新文本, 改动处数)。
+
+    第一人称文里「李承乾看向沈清秋」应当写「李承乾看向我」——这是纯词法错误，
+    可以精确替换。引号内的台词一律不动（那是别人在叫她，本来就该有名有姓）。
+
+    为什么要做修复而不只是标记：这类错误绝大多数是**改稿步骤引入的**
+    （扩写把「我」换成名字）。写作门禁拦不住改稿之后新产生的病，只能在整个
+    改稿流程末尾收一次口，否则终审每轮都会重新报它。
+    """
+    if not name or name not in (text or ""):
+        return text, 0
+    out: list[str] = []
+    pos = 0
+    n = 0
+    for m in _DQ_RE.finditer(text):
+        seg = text[pos:m.start()]
+        if name in seg:
+            n += seg.count(name)
+            seg = seg.replace(name, "我")
+        out.append(seg)
+        out.append(m.group(0))   # 引号整段原样保留
+        pos = m.end()
+    tail = text[pos:]
+    if name in tail:
+        n += tail.count(name)
+        tail = tail.replace(name, "我")
+    out.append(tail)
+    return "".join(out), n
+
+
 def report(secs: list[dict], plan_sections: list[dict] | None = None,
            cast: list[str] | set[str] | None = None, min_dup: int = 14,
            pov_name: str = "") -> dict:
