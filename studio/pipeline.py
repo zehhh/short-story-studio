@@ -2904,6 +2904,15 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
                 if _lang_p and len(_lang_p) == len(problems):
                     lang_deferred.extend(_lang_p)
                     problems = []
+                elif _lang_p and attempt >= retries:
+                    # 最后一轮还不合格，且剩下的问题里**只有**语言病是语言类的：
+                    # 把语言病摘出来放行，别的问题（重演/人称/字数）照样拦。
+                    # 实测第 08 节连着三轮都因「重演 + AI 口癖」一起挂，结果整节
+                    # 回落「最接近的一版」——连已经改好的重演问题也一起丢了。
+                    # AI 口癖的真去处是整稿 _ai_deflavor（逐句喂命中词），
+                    # 不该在节级把整节判死。
+                    lang_deferred.extend(_lang_p)
+                    problems = [p for p in problems if not p.startswith("语言病：")]
             n = count_words_zh(body)
             off = 0 if lo_i <= n <= hi_i else abs(n - lo_i if n < lo_i else n - hi_i)
             if not problems:
