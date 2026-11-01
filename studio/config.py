@@ -57,6 +57,17 @@ DEFAULT_CONFIG = {
         "stage_gate_rounds": 2,        # 阶段门打回重做上限
         "stage_gate_threshold": 8.0,   # 阶段门达标分（0-10）
     },
+    "write": {
+        # direct = 写手一次写完整篇（现役默认）；section = 按分节计划逐节写，
+        # 每节一次独立对话（上下文从 ~28k token 降到 ~2k）。
+        # 实测依据：同一份提示词下，整篇写碎句 16/千字、碎句链 20/千字；
+        # 逐节写两项均为 0，对白占比从 0.27 升到 0.46-0.50。
+        "mode": "direct",
+        "section_retries": 3,          # 单节不合格重写上限（含首次）
+        "section_lo": 600,             # 单节字数下限（低于即重写）
+        "section_hi": 1000,            # 单节字数上限（高于即重写）
+        "section_words": 750,          # 每节目标字数（用于算节数）
+    },
     "knowledge": {
         "auto_collect": True,          # 写作前自动搜集题材知识
         "max_pages": 8,                # 每个题材最多抓取的网页数

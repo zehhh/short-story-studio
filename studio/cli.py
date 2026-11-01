@@ -71,6 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="正文生成模式：agent=多agent逐章门禁（默认）；hybrid=单writer同上下文续写整稿（不做逐章打回）")
     sp.add_argument("--direct", action="store_true",
                     help="直接写模式：跳过提梗/大纲/圣经，写手从idea从头写到尾，只保留审核+读者团")
+    sp.add_argument("--section", action="store_true",
+                    help="逐节写模式：按分节计划一节一次独立对话（上下文 ~2k token），"
+                         "节级门禁不过就重写该节；碎句/碎句链显著低于整篇一次写")
     _add_gate_args(sp)
 
     sp = sub.add_parser("continue", parents=[common], help="续跑最近/匹配的项目至成稿")
@@ -388,6 +391,13 @@ def cmd_run(cfg: dict, args):
 
     with project_lock(project.root, "run") as lock:
         pipeline.stage_kb(cfg, llm, project, force=getattr(args, "kb_refresh", False))
+
+        # 逐节写模式：与直接写同样跳过提梗/大纲/圣经，但正文按分节计划逐节生成
+        if getattr(args, "section", False):
+            pipeline.stage_write_section(cfg, llm, project)
+            pipeline.stage_polish(cfg, llm, project, force=getattr(args, "refresh_polish", False))
+            _summary(project)
+            return
 
         # 直接写模式：跳过提梗/大纲/圣经，写手从头写到尾
         if getattr(args, "direct", False):

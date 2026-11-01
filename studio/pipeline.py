@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 NL = chr(10)
-from . import agents, drafts as _drafts, foreshadow as _foreshadow, hotspots, knowledge
+from . import agents, drafts as _drafts, foreshadow as _foreshadow, hotspots, knowledge, langqa
 from . import title_gate as _TG
 from . import review as review_mod
 from .config import data_path, load_config
@@ -1881,6 +1881,31 @@ def _final_clean(full: str, keep_titles: bool = False,
     return full
 
 
+def _join_sections(secs: list[dict], full: str = "") -> str:
+    """把节列表拼回整稿，**保住第一个节头之前的序言**（书名行 + 导语）。
+
+    `_split_full_sections` 只从第一个「NN 标题」节头开始切，序言不属于任何一节；
+    各处逐节处理完直接 `"\\n\\n".join(s["text"] for s in secs)` 回写，就把序言整段
+    丢了——实测 `_rewrite_density_sections` 跑一轮，11006 字 → 10502 字，丢的正是
+    504 字的书名+导语（体检里 A结构/导语 会因此判不过）。
+    """
+    body = "\n\n".join(s["text"] for s in secs)
+    if not full or not secs:
+        return body
+    first = ((secs[0]["text"].splitlines() or [""])[0]).strip()
+    if not first:
+        return body
+    # 必须按「整行内容相等」定位，不能用 `full.find(first)`：逐节写的节头是裸编号
+    # （"01"），而书名行里「字数：10174」就含 "01"，find 会命中那里，拼出
+    # full[:48] + body —— 序言被截成半句，仍然不是原文。
+    lines = full.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.strip() == first:
+            pre = "\n".join(lines[:i]).rstrip()
+            return (pre + "\n\n" + body) if pre else body
+    return body
+
+
 def _dedup_section_boundaries(full: str) -> str:
     """删除相邻小节边界上的重复句（扩写越界导致同一句在两节都出现）。
 
@@ -1923,7 +1948,7 @@ def _dedup_section_boundaries(full: str) -> str:
         _hl = s["text"].splitlines()
         _head = _hl[0].strip() if _hl else f"{s['no']:02d}"
         s["text"] = f"{_head}\n\n{b}".strip()
-    return "\n\n".join(s["text"] for s in secs)
+    return _join_sections(secs, full)
 
 
 
@@ -2324,6 +2349,261 @@ def stage_write_direct(cfg: dict, llm: BaseLLM, project: Project) -> None:
     project.save_meta(_meta)
     project.set_stage("chapters", "直接写完成")
     print(f"    → 直接写完成 {count_words_zh(raw)} 字 | 标题《{title}》")
+
+
+# ---------------------------------------------------------------------------
+# 逐节写作（write.mode = section）
+#
+# 为什么要单独一条路（2026-11-01 实测，本地 Clover-35B-A3B 扩散模型，同一份真实提示词）：
+#   · 整篇一次写：提示词 40797 字 / ~28k token → 碎句 16/千字、碎句链 20/千字、对白占比 0.27
+#   · 逐节写   ：提示词  3174 字 / ~2k token  → 碎句 0、碎句链 0、      对白占比 0.46-0.50
+# 即"碎句"是长上下文衰减，不是模型没有中文能力——同一模型在 2k 上下文里句子完全通顺。
+# 附带收益：失败面从「整篇作废」收窄到「只废一节」，单节重写约 25 秒（本地 GPU）。
+#
+# 这条路的成立条件不是"每节都能一次写好"，而是"每节重试到达标"：
+# 实测单节一次通过率约 50-75%，靠下面的节级门禁 + 重试把它抬到 100%。
+# ---------------------------------------------------------------------------
+
+
+def _sec_clean(raw: str) -> str:
+    """小节输出清洗：去 markdown 围栏、首行编号、文末 [本章摘要]。"""
+    t = (raw or "").strip()
+    t = re.sub(r"^```[a-zA-Z]*[ \t]*\r?\n", "", t)
+    t = re.sub(r"\r?\n```[ \t]*$", "", t)
+    lines = t.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and re.fullmatch(r"\s*(?:第\s*)?0?\d{1,2}\s*[章节]?\s*", lines[0]):
+        lines.pop(0)
+    body = "\n".join(lines).strip()
+    i = body.find("[本章摘要]")
+    if i >= 0:
+        body = body[:i].rstrip()
+    return body
+
+
+def _sec_quants(text: str) -> list[str]:
+    """本节用过的数量词/数字（进下一节的「已用清单」，防跨节复用同一批碎拍）。"""
+    seen: list[str] = []
+    for pat in (_QUANT_MICRO, _QUANT_HALF, _QUANT_ONE, _QUANT_BEAT):
+        for m in pat.finditer(text or ""):
+            w = (m.group(0) or "").strip()
+            if w and w not in seen:
+                seen.append(w)
+    return seen
+
+
+def _first_sentence(text: str, limit: int = 60) -> str:
+    """取首句（供下一节的「上一节发生了什么」，必须来自正文而非模型自报摘要）。
+
+    为什么不信模型的 [本章摘要]：实测 Clover 会写出正文根本没发生的情节
+    （"秀兰回到城中村出租屋"，正文只写到巷口）。那种脏摘要会直接被下一节当事实接住，
+    一路错到底；从正文首句+计划 goal 拼出来的摘要才是可核验的。
+    """
+    body = (text or "").strip()
+    if not body:
+        return ""
+    for i, ch in enumerate(body):
+        if ch in "。！？…" and i >= 6:
+            return body[:i + 1]
+    return body[:limit]
+
+
+def _section_gate(cfg: dict, body: str, lo: int, hi: int) -> list[str]:
+    """节级确定性门禁。返回不合格原因列表（空 = 通过）。零 token。"""
+    problems: list[str] = []
+    n = count_words_zh(body)
+    if n < lo:
+        problems.append(f"字数只有 {n} 字，低于 {lo}：这一节的事件没演完，把对话与动作展开写够")
+    elif n > hi:
+        problems.append(f"字数 {n} 字，超过 {hi}：把次要情节留给下一节，这一节只写一个主事件")
+    if _english_think_leak(body):
+        problems.append("夹带了英文思考过程：只输出中文正文，不要任何推理文字")
+    b = langqa.scan_banned(body, cfg)
+    if not b.get("pass", True):
+        terms = "、".join(f"「{h['term']}」" for h in b["hits"][:3])
+        problems.append(f"出现禁用道具 {terms}：换成具体行为、眼神、狠话或信物来承载")
+    rep = langqa.scan(body, langqa.load_rules(cfg))
+    if not rep.get("pass", True):
+        labels = []
+        for h in (rep.get("hits") or [])[:4]:
+            if h.get("severity") in ("high", "mid"):
+                labels.append(h.get("label") or h.get("kind") or "")
+        if labels:
+            problems.append("语言病：" + "；".join(x for x in labels if x)
+                            + "（改成正常中文语序，一句话说完的不要拆成几个短句）")
+    return problems
+
+
+@runlog.staged("逐节写作")
+def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
+    """按分节计划逐节写：每节一次独立对话（上下文 ~2k token）。"""
+    from .publish import normalize_quotes
+
+    wcfg = cfg.get("write") or {}
+    retries = max(1, int(wcfg.get("section_retries", 3)))
+    sec_lo = int(wcfg.get("section_lo", 600))
+    sec_hi = int(wcfg.get("section_hi", 1000))
+
+    concept = project.load_json("concept.json") or {}
+    idea = concept.get("idea", "") or concept.get("core_trope", "") or project.root.name
+    direction = concept.get("direction", "")
+    total_words = concept.get("words", 9000)
+
+    writer_llm = resolve_llm(cfg, llm, "writer")
+    genre_guide = load_genre_guide(cfg, direction)
+    style_sample = ""
+    try:
+        from . import kb as _kb
+        style_sample = _kb.style_samples(cfg, direction=direction, n=2, max_chars=500)
+    except Exception as e:  # noqa: BLE001
+        print(f"[kb] ⚠ 风格样本不可用（{type(e).__name__}: {e}），本节文风将少一个锚点")
+
+    # 1) 分节计划 —— 复用生产同一个模板，保证两种模式的可比性
+    n_sections = max(6, int(total_words) // max(400, int(wcfg.get("section_words", 750))))
+    plan_file = project.root / "section_plan.json"
+    plan = None
+    if plan_file.exists():
+        try:
+            plan = json.loads(plan_file.read_text(encoding="utf-8"))
+            print(f"[stage] 复用分节计划（{len(plan.get('sections') or [])} 节）")
+        except Exception:  # noqa: BLE001
+            plan = None
+    if not plan:
+        psys, puser = render_prompt(
+            "section_plan", IDEA=idea, DIRECTION=direction, WORDS=total_words,
+            N=n_sections, GENRE_GUIDE=genre_guide, BAN_PROPS=_ban_props_text(cfg))
+        plan = writer_llm.chat_json(psys, puser)
+        project.save_json("section_plan.json", plan)
+    secs = plan.get("sections") or []
+    if not secs:
+        print("[stage] ⚠ 分节计划生成失败，回落到整篇一次写")
+        return stage_write_direct(cfg, llm, project)
+    print(f"[stage] 逐节写作：{len(secs)} 节，每节 {sec_lo}-{sec_hi} 字，"
+          f"单节最多重写 {retries} 次")
+
+    # 书名与导语复用生产同一套带门的阶段（stage_pitch / stage_lead），而不是自己另起一套：
+    # 逐节写原先从正文里抓标题，实测抓到册文「贵妃沈氏，淑慎性成，勤勉柔顺……」
+    # → 卖点分 2/10，投稿第一道门（书名卖点）就被拦；导语更是整条链路没人产出，
+    # 体检「A结构/导语」必挂。两处都改成调既有阶段，判据只有一份实现。
+    try:
+        _pitch = stage_pitch(cfg, llm, project) or {}
+        title = _pitch.get("title") or ""
+    except Exception as e:  # noqa: BLE001
+        print(f"[stage] 书名方案生成失败（{type(e).__name__}: {e}），标题退回正文抽取")
+    try:
+        stage_lead(cfg, llm, project)
+    except Exception as e:  # noqa: BLE001
+        print(f"[stage] 导语生成失败（{type(e).__name__}: {e}），成稿将缺导语")
+
+    used: list[str] = []
+    parts: list[str] = []
+    stats: list[dict] = []
+    prev_body = ""
+
+    for i, sec in enumerate(secs, 1):
+        no = int(sec.get("no") or i)
+        goal = (sec.get("goal") or "").strip()
+        end_hook = (sec.get("end_hook") or "").strip()
+        ch_title = (sec.get("title") or f"小节{no:02d}").strip()
+
+        # 摘要只用「计划里的 goal + 上一节正文首句」，不用模型自报的 [本章摘要]
+        if prev_body:
+            prev_tail = prev_body[-300:]
+            prev_summary = f"{secs[i - 2].get('goal', '')}（正文开头：{_first_sentence(prev_body)}）"
+        else:
+            prev_tail = "（小节01，无）"
+            prev_summary = "（小节01，无）"
+
+        system, user = render_prompt(
+            "write_section",
+            TITLE=title or idea,
+            NO2=f"{no:02d}", TOTAL2=f"{len(secs):02d}",
+            CH_TITLE=ch_title,
+            PLAN=json.dumps(plan, ensure_ascii=False, indent=1),
+            PREV_TAIL=prev_tail,
+            PREV_SUMMARY=prev_summary,
+            GOAL=goal,
+            END_HOOK=end_hook,
+            USED_QUANTS="、".join(used[-40:]) if used else "（本节是第一节，尚无）",
+            STYLE_SAMPLE=style_sample or STYLE_SAMPLE_EMPTY,
+            GENRE_GUIDE=genre_guide,
+            BAN_PROPS=_ban_props_text(cfg),
+        )
+
+        best, best_pb, best_off = "", None, 10 ** 9
+        problems: list[str] = []
+        for attempt in range(1, retries + 1):
+            sys_i = system
+            if problems:
+                sys_i = (system + "\n\n【上一次输出不合格，必须逐条修正后重写这一节】\n"
+                         + "\n".join(f"- {p}" for p in problems)
+                         + "\n\n只输出这一节正文，不要解释、不要道歉。")
+            raw = writer_llm.chat(sys_i, user)
+            body = normalize_quotes(_sec_clean(raw))
+            problems = _section_gate(cfg, body, sec_lo, sec_hi)
+            n = count_words_zh(body)
+            off = 0 if sec_lo <= n <= sec_hi else abs(n - sec_lo if n < sec_lo else n - sec_hi)
+            if not problems:
+                best, best_off = body, 0
+                break
+            if off < best_off:  # 没通过也要留最接近合格的那一版，避免全废
+                best, best_pb, best_off = body, problems, off
+            print(f"[sec {no:02d}] 第{attempt}次不合格：{'；'.join(problems)}")
+            if attempt == retries:
+                best, best_pb = best or body, problems
+        if not best:
+            best = ""
+        if best_pb:
+            print(f"[sec {no:02d}] ⚠ 重写 {retries} 次仍未全过（{'; '.join(best_pb)}），采用最接近的一版")
+            runlog.event("section_write", f"小节{no:02d} 未过门禁：{best_pb}")
+
+        parts.append(f"{no:02d} {ch_title}\n\n{best}")
+        used.extend(_sec_quants(best))
+        prev_body = best
+        stats.append({"no": no, "words": count_words_zh(best),
+                      "pass": not best_pb, "problems": best_pb or []})
+        print(f"[sec {no:02d}] {count_words_zh(best)} 字 "
+              f"{'✓' if not best_pb else '×'} | {ch_title}")
+
+    full = "\n\n".join(parts).strip()
+    project.save_json("section_stats.json", {"sections": stats,
+                                             "words": count_words_zh(full)})
+    print(f"[stage] 逐节装配完成 {count_words_zh(full)} 字 / {len(stats)} 节")
+
+    # 与整篇写同一套收尾：标题、末节收束、pitch/bible、提交
+    raw = _normalize_sections(full)
+    try:
+        raw = _force_ending_rewrite(cfg, llm, project, raw,
+                                    style_sample or STYLE_SAMPLE_EMPTY,
+                                    plan_sections=secs)
+    except Exception as e:  # noqa: BLE001
+        print(f"[stage] 末节收束异常（{type(e).__name__}），继续")
+
+    if not title:  # stage_pitch 失败时才有这条退路
+        title = _extract_direct_title(raw, idea)
+    raw = _strip_direct_title_line(raw, title)
+    # 保留 stage_pitch 已经过门的那份方案（人物/轴/平台），只把标题与方向补齐重算
+    pitch = project.load_json("pitch.json") or {}
+    pitch.update({
+        "title": title,
+        "direction": pitch.get("direction") or direction,
+        "title_score": _TG.score(title),
+        "title_family": _TG.family(title),
+    })
+    pitch.setdefault("logline", _extract_logline(raw, idea))
+    pitch.setdefault("chapter_count", 1)
+    project.save_json("pitch.json", pitch)
+    project.save_json("bible.json", {"characters": [], "world": "", "rules": []})
+    _drafts.commit_chapter(project, 1, raw, gate="section")
+    project.save_json("direct_draft.json", {"raw_length": len(raw), "direction": direction,
+                                            "title": title, "mode": "section"})
+    _meta = project.meta
+    _meta["mode"] = "direct"
+    _meta["write_mode"] = "section"
+    project.save_meta(_meta)
+    project.set_stage("chapters", "逐节写作完成")
+    print(f"    → 逐节写作完成 {count_words_zh(raw)} 字 | 标题《{title}》")
 
 
 @runlog.staged("逐章扩写与门禁")
@@ -3150,7 +3430,7 @@ def word_gate(cfg: dict, llm, project: Project, full: str) -> tuple[str, dict]:
         if total < gate_floor and is_direct and not secs:
             print(f"[gate] 字数门（direct模式，第{rounds + 1}/{max_r}轮）：全稿 {total} 字 → 整稿扩写…")
             runlog.event("word_gate", f"direct整稿扩写：当前 {total} 字")
-            full = "\n\n".join(s["text"] for s in _split_full_sections(full)) or full
+            full = _join_sections(_split_full_sections(full), full) or full
             sys_p, user_p = render_prompt(
                 "polish_final",
                 IDEA=(project.load_json("concept.json") or {}).get("core_trope", ""),
@@ -3192,18 +3472,18 @@ def word_gate(cfg: dict, llm, project: Project, full: str) -> tuple[str, dict]:
                     secs)
                 if new_text:
                     gain += count_words_zh(new_text) - now
-                total = count_words_zh("\n\n".join(s["text"] for s in secs))
+                total = count_words_zh(_join_sections(secs, full))
                 if total >= gate_floor:
                     break
             # 扩写落盘：secs 已被 _rewrite_section 就地更新，必须回写 full——
             # 旧代码只在兜底路径回写，正常扩写路径的 total 涨了但 full 还是旧文本，
             # 「字数门结束：NNNN 字（pass）」是假象，返回给润色段的full并未变长（实测 8140→成稿7781）
-            full = "\n\n".join(s["text"] for s in secs)
+            full = _join_sections(secs, full)
             # 扩写增益不足 → 整稿扩写兜底（每轮都可尝试，最多一次）
             if total < gate_floor and gain < 400 and rounds == max_r - 1:
                 print(f"[gate] 小节扩写增益仅 {gain} 字，整稿扩写兜底 …")
                 runlog.event("word_gate", f"整稿扩写兜底：当前 {total} 字")
-                full = "\n\n".join(s["text"] for s in secs)
+                full = _join_sections(secs, full)
                 sys_p, user_p = render_prompt(
                     "polish_final",
                     IDEA=(project.load_json("concept.json") or {}).get("core_trope", ""),
@@ -3261,7 +3541,7 @@ def word_gate(cfg: dict, llm, project: Project, full: str) -> tuple[str, dict]:
                 runlog.event("word_gate", f"打回压缩：全稿{total}字，小节{target['no']:02d}（目标约{tgt}字）")
                 _rewrite_section(target, "压缩", tgt,
                                  f"全稿 {total} 字超出上限 {ceil} 字；压缩本节冗余，保留情节骨架与钩子", secs)
-                full = "\n\n".join(s["text"] for s in secs)
+                full = _join_sections(secs, full)
                 total = count_words_zh(full)
         # 空转守卫：连续 2 轮字数几乎没变（<300 字）说明本轮所有改写都被守卫拒绝，
         # 继续跑只是烧 token（实测 8 轮空转 = 16 次 writer 调用、约 2/3 写手预算）。
@@ -3347,12 +3627,80 @@ def _section_quant_stats(text: str) -> str:
     return "\n".join(lines)
 
 
+def _section_ai_hits(text: str, cfg: dict) -> list[str]:
+    """单节命中的 AI 腔判据标签（只取 high/mid，去重）。
+
+    为什么必须用 langqa 而不是自己再写一套正则：投稿判定（submission）挂的正是
+    langqa 的 high/mid 命中（实测终稿残留「AI口癖·一丝」「句式黑名单·当…的时候」
+    「AI味·古言表情模板」→ D规范/AI味/黑名单(硬) 判 C 不可投），而 `_section_quant_score`
+    只数数量词碎拍，对这批词完全瞎。两个判据各管一摊的结果就是：打磨把缺陷分
+    62 打到 17，投稿判定仍因 AI 腔 6 命中挂掉。
+    """
+    try:
+        rep = langqa.scan(text, langqa.load_rules(cfg))
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[str] = []
+    for h in rep.get("hits") or []:
+        if h.get("severity") not in ("high", "mid"):
+            continue
+        lab = (h.get("label") or h.get("kind") or "").strip()
+        if lab and lab not in out:
+            out.append(lab)
+    return out
+
+
+def _full_ai_hits(full: str, cfg: dict) -> list[str]:
+    """整稿层面的 AI 腔判据集合（**逐节扫描后并集**，不是整稿一把扫）。
+
+    为什么不能直接 `_section_ai_hits(full, cfg)`：langqa 里有「节长失衡」这类
+    只有整稿才成立的判据，扫全文会把它混进「AI 腔」标签里，导致
+    `report["langqa_ai_repair"]["labels"]` 出现根本不是 AI 味的条目。
+    """
+    out: list[str] = []
+    for s in _split_full_sections(full):
+        for lab in _section_ai_hits(s["text"], cfg):
+            if lab not in out:
+                out.append(lab)
+    return out
+
+
+def _ai_deflavor(cfg: dict, llm: BaseLLM, project: Project, full: str,
+                 style_sample: str, max_rounds: int = 2) -> tuple[str, dict]:
+    """把「langqa 判出的 AI 腔」从全稿里定向换掉，返回 (新正文, 留痕)。
+
+    为什么要单独一步：终审评分（卡点/连续性/文风/安全）不看 langqa 的 AI 腔黑名单，
+    而投稿判定挂的正是它。两者各自成立，合起来就是「终审 66 分 + 投稿 C 不可投」。
+    这里用同一套 langqa 判据定位问题节，交给 `_rewrite_density_sections` 整节重写。
+
+    抽成函数而不是内联在 stage_polish：内联时曾因作用域里没有 `style_sample`
+    抛 NameError 被 except 吞掉，白跑一轮还只在日志里留一行「异常…继续落盘」。
+    """
+    try:
+        hits = _full_ai_hits(full, cfg)
+        rounds = 0
+        while hits and rounds < max_rounds:
+            rounds += 1
+            print(f"[lang] AI 腔去味第 {rounds} 轮：命中 {len(hits)} 类"
+                  f"（{'、'.join(hits[:5])}）")
+            before = full
+            full = _rewrite_density_sections(cfg, llm, project, full, style_sample, max_secs=3)
+            if full == before:
+                print("[lang] AI 腔去味无节可比（或全部未达标），停止")
+                break
+            hits = _full_ai_hits(full, cfg)
+        return full, {"rounds": rounds, "remaining": len(hits), "labels": hits[:8]}
+    except Exception as e:  # noqa: BLE001
+        print(f"[lang] AI 腔去味异常（{type(e).__name__}: {e}），继续落盘")
+        return full, {"rounds": 0, "error": f"{type(e).__name__}: {e}"[:200]}
+
+
 def _rewrite_density_sections(cfg: dict, llm: BaseLLM, project: Project, full: str,
                               style_sample: str, max_secs: int = 3) -> str:
-    """对数量词密度最高的几节做"只改表达、不改情节"的定向重写。
+    """对数量词密度 / AI 腔命中最高的几节做"只改表达、不改情节"的定向重写。
 
     比整稿重写安全（只动问题节，其余零改动），比定点补丁有效（整节重写能
-    改变该节的整体数量词密度）。逐节重写后校验：字数不缩水、密度必须下降。
+    改变该节的整体数量词密度）。逐节重写后校验：字数不缩水、问题指标必须下降。
     """
     secs = _split_full_sections(full)
     if not secs:
@@ -3360,14 +3708,20 @@ def _rewrite_density_sections(cfg: dict, llm: BaseLLM, project: Project, full: s
     writer_p = resolve_llm(cfg, llm, "writer")
     direction = (project.load_json("concept.json") or {}).get("direction", "")
     gdir = load_genre_guide(cfg, direction)
-    # 密度最高的 max_secs 节（阈值 8：只改明显严重的节；分数 5-7 的节重写反而帮倒忙，
-    # 实测第二轮改这些节会把 74 分降到 68。提高阈值后，第二轮无节达标、自动停止）
-    targets = sorted(secs, key=lambda s: -_section_quant_score(s["text"]))
-    targets = [s for s in targets if _section_quant_score(s["text"]) >= 8][:max_secs]
+    ai_map = {s["no"]: _section_ai_hits(s["text"], cfg) for s in secs}
+
+    def _pen(s) -> int:
+        # 数量词碎拍 1 分/处；AI 腔命中按 3 分/条加权——它们直接决定投稿判定
+        return _section_quant_score(s["text"]) + 3 * len(ai_map.get(s["no"]) or [])
+
+    # 阈值 8：只改明显严重的节；分数 5-7 的节重写反而帮倒忙（实测第二轮改这些节
+    # 会把 74 分降到 68）。提高阈值后，第二轮无节达标、自动停止。
+    targets = sorted(secs, key=lambda s: -_pen(s))
+    targets = [s for s in targets if _pen(s) >= 8][:max_secs]
     if not targets:
         return full
-    print(f"[density] 逐节定向去味：小节 "
-          + "、".join(f"{s['no']:02d}({_section_quant_score(s['text'])})" for s in targets))
+    print("[density] 逐节定向去味：小节 "
+          + "、".join(f"{s['no']:02d}({_pen(s)})" for s in targets))
 
     def _body_of(t):
         bl = t["text"].splitlines()
@@ -3379,6 +3733,9 @@ def _rewrite_density_sections(cfg: dict, llm: BaseLLM, project: Project, full: s
         no = target["no"]
         now = count_words_zh(target["text"])
         before_score = _section_quant_score(target["text"])
+        before_ai = ai_map.get(no) or []
+        hits_txt = ("；".join(before_ai) if before_ai
+                    else "（本节无 AI 腔命中，只处理数量词）")
         body = _body_of(target)
         sents = [s for s in re.split(r"(?<=[。！？])", body) if s.strip()]
         sec_end = sents[-1] if sents else body[-30:]
@@ -3394,6 +3751,7 @@ def _rewrite_density_sections(cfg: dict, llm: BaseLLM, project: Project, full: s
                 SECTION_END=sec_end,
                 NEXT_START=next_start,
                 QUANT_STATS=_section_quant_stats(target["text"]),
+                AI_HITS=hits_txt,
                 STYLE_SAMPLE=style_sample,
                 GENRE_GUIDE=gdir,
             )
@@ -3403,8 +3761,10 @@ def _rewrite_density_sections(cfg: dict, llm: BaseLLM, project: Project, full: s
             continue
         new_w = count_words_zh(new_text)
         new_score = _section_quant_score(new_text)
-        # 校验：字数不缩水超 15%、密度必须下降，否则保留原文
-        if new_w >= now * 0.85 and new_score < before_score:
+        new_ai = _section_ai_hits(new_text, cfg)
+        # 校验：字数不缩水超 15%，且至少一项问题指标真的下降了
+        improved = new_score < before_score or len(new_ai) < len(before_ai)
+        if new_w >= now * 0.85 and improved:
             # 保证节头统一
             hl = new_text.splitlines()
             if not (hl and _SEC_HEAD.match(hl[0].strip())):
@@ -3412,10 +3772,12 @@ def _rewrite_density_sections(cfg: dict, llm: BaseLLM, project: Project, full: s
             for s in secs:
                 if s is target:  # 就地改目标节（按 no 回写会在节号重复时污染多节）
                     s["text"] = new_text
-            print(f"[density] 小节{no:02d} 去味 {before_score}→{new_score}（{new_w}字）")
+            print(f"[density] 小节{no:02d} 去味 密度{before_score}→{new_score}"
+                  f" / AI腔{len(before_ai)}→{len(new_ai)}（{new_w}字）")
         else:
-            print(f"[density] 小节{no:02d} 去味未达标（字数{new_w}/{now}、密度{new_score}/{before_score}），保留原文")
-    return "\n\n".join(s["text"] for s in secs)
+            print(f"[density] 小节{no:02d} 去味未达标（字数{new_w}/{now}、"
+                  f"密度{new_score}/{before_score}、AI腔{len(new_ai)}/{len(before_ai)}），保留原文")
+    return _join_sections(secs, full)
 
 
 def _force_ending_rewrite(cfg: dict, llm: BaseLLM, project: Project, full: str,
@@ -3474,7 +3836,7 @@ def _force_ending_rewrite(cfg: dict, llm: BaseLLM, project: Project, full: str,
             new_text = f"{no:02d}\n\n" + new_text
         secs[-1]["text"] = new_text
         print(f"[ending] 末节强制收束完成（{now}→{new_w}字）")
-        return "\n\n".join(s["text"] for s in secs)
+        return _join_sections(secs, full)
     print(f"[ending] 末节收束缩水（{new_w}/{now}），保留原文")
     return full
 
@@ -3949,7 +4311,7 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
                     break
                 if count_words_zh(new_text) > now:
                     target["text"] = new_text  # 就地改目标节，避免按 no 回写污染同号节
-                    text = "\n\n".join(s["text"] for s in secs)
+                    text = _join_sections(secs, full)
                 else:
                     break
             return text
@@ -3972,10 +4334,21 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
         best_report = report  # 与 best_full 同时刻的体检结论（见下方"留优回填"）
         fail_streak = 0  # 连续"补丁后未提升/未达标"的轮数（≥2 即收敛终止）
         _rewrite_n = 0  # 密度型整稿重写次数（独立上限4次，防无限循环）
+        # 无界空转的两道闸（实测教训）：`final_fix_rounds=0` 的语义是"修到达标为止"，
+        # 但每轮只涨 1 分（58→62→63）会让 fail_streak 永远停在 0——因为"提升"就重置。
+        # 于是一次女主后宫向实测跑到第 5 轮仍未到 72 分，累计烧掉 15 万 output token。
+        # ①绝对轮次上限 6（与 fix_rounds 取小）；②相对起点的累计增益 <3 分即判定为
+        # 抖动式微涨，收敛终止（保证"明显在改好"的稿子仍然修得下去）。
+        ABS_FIX_ROUNDS = 6
+        MIN_TOTAL_GAIN = 3.0
+        _gain_start = best_score
+        _abs_n = 0
         while (report.get("mode") != "local-stats"
                and (report.get("verdict") == "need_fix"
                     or float(report.get("score") or 0) < floor)
-               and (fix_rounds < 0 or rnd_f < fix_rounds)):
+               and (fix_rounds < 0 or rnd_f < fix_rounds)
+               and _abs_n < ABS_FIX_ROUNDS):
+            _abs_n += 1
             rnd_f += 1
             issues = list(report.get("issues") or [])
             if not issues:
@@ -4109,6 +4482,11 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
                     fail_streak = 0
                     print(f"[stage] 复评 {cur} 分（接受，best {best_score}，"
                           f"{count_words_zh(full)} 字）")
+                    if (_abs_n >= 3 and best_score < floor
+                            and best_score - _gain_start < MIN_TOTAL_GAIN):
+                        print(f"[guard] {_abs_n} 轮累计只涨 {best_score - _gain_start:.1f} 分"
+                              f"（<{MIN_TOTAL_GAIN}），判定为抖动式微涨，收敛终止")
+                        break
                 else:
                     fail_streak += 1
                     print(f"[stage] 复评 {cur} 分未提升（best {best_score}），回滚；"
@@ -4262,6 +4640,12 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
         _rc_final = {"pass": False, "error": f"{type(e).__name__}: {e}"}
     report["deterministic_recheck_final"] = _rc_final
 
+    # AI 腔定向去味（投稿硬门）：终审分只算卡点/连续性/文风/安全，**不含** langqa 的
+    # AI 腔黑名单；而投稿判定（verdict.submission）挂的正是 langqa high/mid 命中。
+    # 结果就是打磨把缺陷分从 62 打到 17、终审 66 分，投稿仍判「D规范/AI味/黑名单(硬)
+    # → C 不可投」。这里补上唯一缺的一环：用同一套 langqa 判据找节、逐节定向重写。
+    full, report["langqa_ai_repair"] = _ai_deflavor(cfg, llm, project, full, _style_sample_f)
+
     total_words = count_words_zh(full)
     # 全稿确定性兜底复查：润色/补丁/读者重写都可能把道具或思考泄漏写回来。
     # 章级已在落盘前复查过；这里再兜一层并落 report，避免"成稿带禁用道具却无人知晓"。
@@ -4366,6 +4750,9 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
     project.save_text("成稿.md", final_md, subdir="final")
     project.save_text("成稿.txt", submit_text, subdir="final")
     report["final_words"] = total_words
+    # 正文来源（agent / hybrid / direct / section）落 report：复盘时要能回答
+    # 「这篇是逐节写的还是整篇写的」，以及逐节写的节级统计在哪。
+    report["write_mode"] = (project.meta or {}).get("write_mode") or "agent"
     # 平台字数判据必须用**投稿全文**（标题 + 导语 + 正文），不能用正文净字数：
     # 实测 e2e5 正文 7997 字被判 fail，而落到 成稿.txt 里是 8430 字（导语 403 字），
     # 平台看到的稿子明明达标。两个口径混用会让成稿在字数边缘被误淘汰。
@@ -4508,14 +4895,26 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
         _rvs = [float(v["review_score"]) for v in (project.meta.get("reviews") or {}).values()
                 if isinstance(v, dict) and isinstance(v.get("review_score"), (int, float))]
         _ravg = round(sum(_rvs) / len(_rvs), 2) if _rvs else None
+        _rsrc = "rubric_mean" if _rvs else ""
+        # 逐节写/直接写没有「章」，meta.reviews 永远是空的，于是体检里那行
+        # 「主编评分 实测 None」必然出现——但终审明明给了分（final_review.score）。
+        # 口径统一：没有章级分就退回全稿终审分，别让两种模式报两套空值。
+        if _ravg is None:
+            _fr = report.get("final_review") or {}
+            _fs = _fr.get("score")
+            if isinstance(_fs, (int, float)):
+                # final_review.score 走百分制（门槛 72），review_score 走十分制
+                # （门槛 7.0）——换算是必须的，否则 68 会被当成「68 分满分」读出幻觉。
+                _ravg = round(float(_fs) / 10.0, 2)
+                _rvs = [_ravg]
+                _rsrc = "final_review"
         report["review_score"] = _ravg
         report["review_score_min"] = round(min(_rvs), 2) if _rvs else None
-        report["review_score_src"] = "rubric_mean" if _rvs else ""
+        report["review_score_src"] = _rsrc
         report["review_score_n"] = len(_rvs)
-        _rub = report.get("rubric_rollup") or {}
         if _ravg is not None:
-            print(f"[review] 主编评分（评分卡折算）章节均值 {_ravg} / 最低 "
-                  f"{report['review_score_min']}（{len(_rvs)} 章）")
+            print(f"[review] 主编评分（{_rsrc}）{_ravg} / 最低 "
+                  f"{report['review_score_min']}（{len(_rvs)}）")
     except Exception as e:  # noqa: BLE001
         report["review_score_error"] = f"{type(e).__name__}: {e}"[:200]
     # 投稿判定（单一权威源 studio/verdict.py）：把并列的 platform_check /

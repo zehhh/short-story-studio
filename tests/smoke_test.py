@@ -453,6 +453,7 @@ def main() -> int:
     _test_agents_all_resolves()
     _test_deterministic_recheck_disabled()
     _test_draft_prune_keeps_latest()
+    _test_join_sections_keeps_preamble()
 
     print("\n全部冒烟测试通过 ✔")
     return 0
@@ -513,6 +514,33 @@ def _test_draft_prune_keeps_latest():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"[ok] 草稿归档：保留最近 {drafts.DRAFT_KEEP} 版，最旧自动淘汰")
+
+
+def _test_join_sections_keeps_preamble():
+    """逐节回写不得丢序言（书名行 + 导语）。
+
+    历史缺陷：`_split_full_sections` 只从第一个节头开始切，各处逐节处理完直接
+    `"\\n\\n".join(s["text"] for s in secs)` 回写，把第一个节头之前的书名行与导语
+    整段丢掉——实测 11006 字 → 10502 字，且体检里「A结构/导语」直接判不过。
+    第二个坑：定位序言不能用 `full.find(节头)`，逐节写的节头是裸编号 "01"，
+    而书名行「字数：10174」里就含 "01"，会拼出半句序言。
+    """
+    from studio.pipeline import _join_sections, _split_full_sections
+
+    full = (
+        "# 封妃当日太后赐我一碗药\n\n"
+        "> 平台：知乎盐选 | 字数：10174 | 题材：女主后宫\n\n"
+        "**一句话故事**：小官之女封妃当日获太后赐药。\n\n"
+        "01\n\n第一节的正文，写得足够长以便被识别成正文。\n\n"
+        "02\n\n第二节的正文，同样要有点长度。\n"
+    )
+    secs = _split_full_sections(full)
+    assert len(secs) == 2, f"应切出 2 节，实际 {len(secs)}"
+    out = _join_sections(secs, full)
+    assert out.startswith("# 封妃当日太后赐我一碗药"), "序言书名行被丢掉了"
+    assert "字数：10174" in out, "序言里的元信息行被丢掉了（find 命中了编号）"
+    assert "第一节的正文" in out and "第二节的正文" in out, "正文被丢了"
+    print("[ok] 逐节回写保住序言（书名行 + 导语），且不被书名行里的裸编号误定位")
 
 
 if __name__ == "__main__":

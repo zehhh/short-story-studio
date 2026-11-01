@@ -344,6 +344,7 @@ _EXPECT_STAGE_FUNCS = {
     "章节大纲": ("stage_outline",),
     "故事圣经": ("stage_bible",),
     "逐章扩写与门禁": ("stage_write",),
+    "逐节写作": ("stage_write_section",),
     "数据复盘": ("stage_improve",),
     "润色体检": ("stage_polish",),
 }
