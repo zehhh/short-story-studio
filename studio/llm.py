@@ -1095,9 +1095,17 @@ class MockLLM(BaseLLM):
             n = int(m.group(1)) if m else 10
             n = max(6, min(n, 20))
             return json.dumps(
-                {"sections": [
+                {"characters": [
+                    {"name": "林晚", "role": "主角", "major": True, "pov": True},
+                    {"name": "王秀兰", "role": "对手", "major": True, "pov": False},
+                    {"name": "陈树", "role": "关键配角", "major": True, "pov": False},
+                ],
+                 "sections": [
                     {"no": i, "title": f"第{i}场",
                      "goal": f"mock 第{i}节的核心事件：冲突升级一次",
+                     "cast": ["林晚", "王秀兰"],
+                     "carry_out": f"mock 第{i}节留下的交接项：一句话没答完",
+                     "words": 750,
                      "end_hook": f"mock 第{i}节末的钩子：有人推门进来"}
                     for i in range(1, n + 1)],
                  "logline": "mock：一句话故事"},

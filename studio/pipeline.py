@@ -13,7 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 NL = chr(10)
-from . import agents, drafts as _drafts, foreshadow as _foreshadow, hotspots, knowledge, langqa
+from . import agents, continuity as _contin, drafts as _drafts, foreshadow as _foreshadow
+from . import hotspots, knowledge, langqa
 from . import title_gate as _TG
 from . import review as review_mod
 from .config import data_path, load_config
@@ -945,14 +946,23 @@ def _title_ok(title: str) -> bool:
     return _TG.acceptable(title)
 
 
-def _pick_title(pitch: dict) -> str | None:
-    """从 pitch 的 title/titles 里挑一个合格标题；都不合格返回 None。"""
-    if _title_ok(pitch.get("title", "")):
-        return pitch["title"].strip()
-    for tt in pitch.get("titles", []) or []:
-        if _title_ok(tt):
-            return tt.strip()
-    return None
+def _pick_title(pitch: dict) -> tuple[str | None, int]:
+    """从 title/titles 候选里挑**卖点分最高**的合格标题，返回 (标题, 分数)。
+
+    为什么不是「第一个合格的」：模型一次给 3-5 个候选时，第一个往往是它自己
+    觉得"稳妥"的那个，而短篇书名是信息流里的广告位，必须取分高的。
+    """
+    cands = [pitch.get("title", "")] + list(pitch.get("titles") or [])
+    best: str | None = None
+    best_s = -1
+    for tt in cands:
+        tt = (tt or "").strip()
+        if not tt or not _title_ok(tt):
+            continue
+        s = _TG.score(tt)
+        if s > best_s:
+            best, best_s = tt, s
+    return (best, max(best_s, 0)) if best else (None, 0)
 
 
 def _fallback_title(concept: dict) -> str:
@@ -1055,18 +1065,34 @@ def stage_pitch(cfg: dict, llm: BaseLLM, project: Project) -> dict:
     )
     print("[stage] 生成书名与故事方案 …")
     pitch = None
+    _p = None
     _base_user_p = user_p
-    for _attempt in range(2):
+    _best_pitch = None
+    _best_title = ""
+    _best_score = -1
+    # 3 次：卖点分 ≥7 才收（5 分只是"能发"，7 分才是"在信息流里有竞争力"）。
+    # 每次重试都带着**上一版的具体毛病**回去改，不是只说"再想一个"。
+    for _attempt in range(3):
         _p = llm.chat_json(sys_p, user_p)
         if isinstance(_p, dict):
-            _t = _pick_title(_p)
-            if _t:
+            _t, _s = _pick_title(_p)
+            if _t and _s > _best_score:
+                _best_pitch, _best_title, _best_score = _p, _t, _s
+            if _t and _s >= 7:
                 _p["title"] = _t
                 pitch = _p
                 break
-        if _attempt == 0:
-            print("[stage] 书名不合格（卖点不足/过长过短/引号问号），带卖点公式重新生成 …")
-            user_p = _base_user_p + "\n\n" + _TG.hint()
+        if _attempt < 2:
+            _why = _TG.issues(_best_title) if _best_title else ["没有给出任何合格书名"]
+            print(f"[stage] 书名卖点分 {max(_best_score, 0)} < 7（{'；'.join(_why[:3])}），"
+                  "带卖点公式与真实样本重新生成 …")
+            user_p = (_base_user_p + "\n\n"
+                      + f"【上一版书名】《{_best_title}》只有 {max(_best_score, 0)} 分，问题：\n- "
+                      + "\n- ".join(_why)
+                      + "\n\n" + _TG.hint())
+    if pitch is None and _best_pitch is not None:
+        _best_pitch["title"] = _best_title
+        pitch = _best_pitch
     if not isinstance(pitch, dict):
         pitch = _p if isinstance(_p, dict) else {}
     if not _title_ok(pitch.get("title", "")):
@@ -1150,19 +1176,30 @@ def _fix_banned_text(cfg: dict, llm: BaseLLM, text: str, what: str) -> tuple[str
 
 @runlog.staged("导语")
 def stage_lead(cfg: dict, llm: BaseLLM, project: Project) -> dict:
-    """生成 300-400 字导语（六拍框架：噱头→接情绪→叠加反转→下饵），带阶段达标门。"""
+    """生成导语（六拍框架：噱头→接情绪→叠加反转→下饵），带阶段达标门。
+
+    字数区间来自 `studio.lead.words`（默认 150-220）。历史上硬编码 300-400，
+    实测交付稿导语 359 字——用户反馈「导语字数太多」。导语是钩子不是摘要，
+    150-220 字足够把六拍走完，太长会把正文的第一次反转提前剧透掉。
+    """
     if project.has("lead.json"):
         return project.load_json("lead.json")
     pitch = project.load_json("pitch.json") or {}
     concept = project.load_json("concept.json") or {}
     llm = resolve_llm(cfg, llm, "planner")
 
+    _lw = (cfg.get("lead") or {}).get("words") or [150, 220]
+    lo, hi = int(_lw[0]), int(_lw[1])
     _last = {"text": "", "words": 0}
 
     def _gen(round: int, issues: str):
         sys_p, user_p = render_prompt(
             "lead",
             TITLE=pitch.get("title", ""),
+            LEAD_LO=lo,
+            LEAD_HI=hi,
+            LEAD_LO_MIN=int(lo * 0.8),
+            LEAD_HI_MAX=int(hi * 1.25),
             CORE_TROPE=concept.get("core_trope", ""),
             CONFLICT=concept.get("conflict", "") or pitch.get("core_conflict", ""),
             HOOK=concept.get("hook", ""),
@@ -1175,22 +1212,22 @@ def stage_lead(cfg: dict, llm: BaseLLM, project: Project) -> dict:
             # 字数纠偏：评审文字建议常被写手无视（235→509→237 式震荡），
             # 改为把上一稿原文回灌做「只扩不改 / 只压不删拍」的具体任务——比整篇重写容易得多
             prev_t, prev_w = _last["text"], _last["words"]
-            if prev_t and prev_w < 280:
+            if prev_t and prev_w < lo - 20:
                 user_p += (
                     f"\n\n【扩写任务（只扩不改）】下面这篇导语初稿只有 {prev_w} 字，太短。"
                     "请一字不改地保留它的全部句子、语序和情节，只在每一拍内部补充具体细节"
-                    "（场景名称、人物动作与反应、具体数字、对话碎片），把全文扩写到 320-400 字。"
+                    f"（场景名称、人物动作与反应、具体数字、对话碎片），把全文扩写到 {lo}-{hi} 字。"
                     "严禁新增情节、严禁换一种写法、严禁删句子。\n【初稿】\n" + prev_t
                 )
-            elif prev_t and prev_w > 420:
+            elif prev_t and prev_w > hi + 20:
                 user_p += (
                     f"\n\n【压缩任务（只压不删拍）】下面这篇导语初稿 {prev_w} 字，太长。"
-                    "请保留六拍各自的核心信息，删掉背景铺垫、次要人物反应与抒情闲笔，压到 300-400 字。\n【初稿】\n" + prev_t
+                    f"请保留六拍各自的核心信息，删掉背景铺垫、次要人物反应与抒情闲笔，压到 {lo}-{hi} 字。\n【初稿】\n" + prev_t
                 )
             elif prev_t:
                 user_p += (
                     f"\n\n【保数令】上一稿 {prev_w} 字已在合格区间。本稿修改内容问题时，"
-                    "全文必须保持 300-400 字：每删一句就要在原位补一句，净增减不超过 ±30 字，"
+                    f"全文必须保持 {lo}-{hi} 字：每删一句就要在原位补一句，净增减不超过 ±30 字，"
                     "不许整篇重写导致字数漂移。"
                 )
             user_p += (f"\n\n【主编打回意见（必须逐条改进，这是第{round}稿）】\n{issues}")
@@ -2217,12 +2254,16 @@ def stage_write_direct(cfg: dict, llm: BaseLLM, project: Project) -> None:
     # 分节计划：写手先自己拆成一节节（每节 goal/end_hook），再据此一次写。
     # 计划保证"梗的设定分节落地、节与节首尾相接、写满末节不提前收尾"，比让模型临场决定更稳。
     n_sections = max(10, int(total_words) // 800)
+    _wcfg_d = cfg.get("write") or {}
+    _ps_lo = int(_wcfg_d.get("section_lo", 600))
+    _ps_hi = int(_wcfg_d.get("section_hi", 1000))
     plan_text = ""
     plan_sections = []
     try:
         psys, puser = render_prompt(
             "section_plan", IDEA=idea, DIRECTION=direction, WORDS=total_words,
-            N=n_sections, GENRE_GUIDE=genre_guide, BAN_PROPS=_ban_props_text(cfg))
+            N=n_sections, GENRE_GUIDE=genre_guide, BAN_PROPS=_ban_props_text(cfg),
+            SEC_LO=_ps_lo, SEC_HI=_ps_hi)
         plan = writer_llm.chat_json(psys, puser)
         plan_sections = plan.get("sections", []) or []
         if plan_sections:
@@ -2425,14 +2466,135 @@ def _section_gate(cfg: dict, body: str, lo: int, hi: int) -> list[str]:
         problems.append(f"出现禁用道具 {terms}：换成具体行为、眼神、狠话或信物来承载")
     rep = langqa.scan(body, langqa.load_rules(cfg))
     if not rep.get("pass", True):
+        # 节级只卡 **high**（黑名单硬伤：AI 腔套句、翻译腔句式）。
+        # 「mid」里的 AI 口癖（一丝/只见/就在这时/时间过渡词）在节级是**不可达成的**
+        # 指标——实测 12 节里 12 节全部因此判不合格，每节白烧 3 次重写还照样带着病
+        # 交付。这类问题留给整稿 `_ai_deflavor`：它按节定位、把命中词与所在句一起
+        # 喂给模型，比「整节盲改」有效得多（详见 docs/dev/DECISIONS.md 决策 30）。
         labels = []
         for h in (rep.get("hits") or [])[:4]:
-            if h.get("severity") in ("high", "mid"):
+            if h.get("severity") == "high":
                 labels.append(h.get("label") or h.get("kind") or "")
         if labels:
             problems.append("语言病：" + "；".join(x for x in labels if x)
                             + "（改成正常中文语序，一句话说完的不要拆成几个短句）")
     return problems
+
+
+_CAST_ROLE_HINT = {
+    "protagonist": "主角", "antagonist": "对手", "support": "配角",
+    "minor": "过场", "narrator": "叙述者",
+}
+
+# 跨节逐字重复的检测长度。14 字是标定值：实测真实稿里「读者一眼看出」的复用
+# 都在 14-20 字（如「凤冠上的珠翠剧烈晃动厉声喝道大胆」16 字），再短会误伤
+# 正常的高频短语（「她抬起头看他」这类）。
+_SEC_DUP_MIN = 14
+
+
+def _plan_cast(plan: dict) -> list[dict]:
+    """分节计划里声明的人物名册（计划没写就返回空表，不做猜测）。"""
+    out: list[dict] = []
+    for c in (plan.get("characters") or []):
+        if isinstance(c, str):
+            c = {"name": c}
+        if not isinstance(c, dict):
+            continue
+        name = (c.get("name") or "").strip()
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "role": (c.get("role") or "").strip(),
+            "major": bool(c.get("major", True)),
+            "pov": bool(c.get("pov", False)),
+        })
+    return out
+
+
+def _cast_block(cast: list[dict], sec_cast: list[str]) -> str:
+    """写进提示词的人物名册：全篇名字定死，本节只许用这几个人。"""
+    if not cast:
+        return "（计划未声明人物名册；按本节 goal 里出现的人写，不要新造名字）"
+    lines = []
+    for c in cast:
+        tags = []
+        if c["pov"]:
+            tags.append("第一人称主角，通篇写「我」不写名字")
+        if c["role"]:
+            tags.append(_CAST_ROLE_HINT.get(c["role"], c["role"]))
+        if not c["major"] and c["role"] != "minor":
+            tags.append("过场人物，可用一次就走")
+        lines.append(f"- {c['name']}（{'；'.join(tags) or '主要人物'}）")
+    if sec_cast:
+        lines.append(f"- 本节出场：{'、'.join(sec_cast)}（不要引入名册之外的新名字）")
+    return "\n".join(lines)
+
+
+def _sec_words(sec: dict, total_words: int, n: int, lo: int, hi: int) -> int:
+    """本节目标字数：以「总字数均摊」为准，计划的 words 只在接近时采信。
+
+    为什么不直接信计划的 words：模型每节自然产出 1000-1300 字，而计划常写 700-800，
+    照计划设门禁的结果是**每一节都超字数**、整轮门禁从未通过（实测 12 节 12 挂）。
+    低于自然长 80% 的计划值说明它只是随手填的，以均摊值为准才可达成。
+    """
+    natural = int(round(total_words / max(1, n)))
+    try:
+        w = int(sec.get("words") or 0)
+    except (TypeError, ValueError):
+        w = 0
+    if w < natural * 0.8 or not (lo <= w <= hi):
+        w = natural
+    return max(lo, min(hi, w))
+
+
+def _fix_sec_dup(cfg: dict, llm: BaseLLM, text: str, dups: list[dict],
+                 prev_texts: list[str], sec_no: int) -> tuple[str, dict]:
+    """把本节与前面小节**逐字重复**的句子改掉：只动撞车的句子，不动情节。
+
+    为什么不整节重写：重复通常只有 1-2 句（实测 16 字），整节重写会带进新的
+    比例失衡与语言病，且成本是 10 倍。改完仍重复就退回原文并留痕，交给装配后的
+    整稿复查兜底。
+    """
+    frags = [str(d.get("text") or "") for d in dups if d.get("text")]
+    rep: dict = {"before": frags, "applied": False}
+    if not frags:
+        return text, rep
+    try:
+        sys_p = ("你是短篇校对员。任务只有一件事：把正文里与前面章节逐字重复的句子"
+                 "换一种写法，情节、人物、信息量全部保留。")
+        user_p = (
+            "【必须改掉的重复片段（这些句子已经在前面的小节里逐字出现过）】\n"
+            + "\n".join(f"- {f}" for f in frags)
+            + "\n\n【硬约束】\n"
+            "- 只改含这些片段的句子，其余句子逐字保留、顺序不动\n"
+            "- 改后不许再出现上面任何片段（差一两个字也不行）\n"
+            f"- 本节字数保持原样（±10%，原文 {count_words_zh(text)} 字）\n"
+            "- 只输出正文，不要解释、不要加标题、不要分节号\n"
+            f"【原文】\n{text}"
+        )
+        new = (llm.chat(sys_p, user_p) or "").strip()
+        new = _sec_clean(new)
+        if not new:
+            rep["reject"] = "empty"
+            return text, rep
+        _r = len(new) / max(1, len(text))
+        if not (0.85 <= _r <= 1.2):
+            rep["reject"] = f"长度漂移 {len(text)}→{len(new)}"
+            print(f"[sec {sec_no:02d}] ⚠ 去重复写长度漂移（{len(text)}→{len(new)} 字），保留原稿")
+            return text, rep
+        _after = langqa.cross_dup(new, prev_texts, n=_SEC_DUP_MIN)
+        rep["after"] = [d["text"] for d in _after]
+        if _after:
+            rep["reject"] = "still_dup"
+            print(f"[sec {sec_no:02d}] ⚠ 去重复写后仍残留 {len(_after)} 处重复，保留原稿")
+            return text, rep
+        rep["applied"] = True
+        return new, rep
+    except Exception as e:  # noqa: BLE001
+        rep["error"] = f"{type(e).__name__}: {e}"
+        print(f"[sec {sec_no:02d}] ⚠ 去重复写失败（{e}），保留原稿")
+        return text, rep
 
 
 @runlog.staged("逐节写作")
@@ -2460,7 +2622,9 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
         print(f"[kb] ⚠ 风格样本不可用（{type(e).__name__}: {e}），本节文风将少一个锚点")
 
     # 1) 分节计划 —— 复用生产同一个模板，保证两种模式的可比性
-    n_sections = max(6, int(total_words) // max(400, int(wcfg.get("section_words", 750))))
+    # 每节目标长度按「模型实际能写出来的量」定，不是拍脑袋：实测单节约 1000 字
+    # 最自然。按 750 分节会让节数偏多、每节都超字数。
+    n_sections = max(6, int(round(total_words / max(400, int(wcfg.get("section_words", 1000))))))
     plan_file = project.root / "section_plan.json"
     plan = None
     if plan_file.exists():
@@ -2472,7 +2636,8 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
     if not plan:
         psys, puser = render_prompt(
             "section_plan", IDEA=idea, DIRECTION=direction, WORDS=total_words,
-            N=n_sections, GENRE_GUIDE=genre_guide, BAN_PROPS=_ban_props_text(cfg))
+            N=n_sections, GENRE_GUIDE=genre_guide, BAN_PROPS=_ban_props_text(cfg),
+            SEC_LO=sec_lo, SEC_HI=sec_hi)
         plan = writer_llm.chat_json(psys, puser)
         project.save_json("section_plan.json", plan)
     secs = plan.get("sections") or []
@@ -2499,13 +2664,30 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
     used: list[str] = []
     parts: list[str] = []
     stats: list[dict] = []
+    body_list: list[str] = []
+    dup_fixes: list[dict] = []
     prev_body = ""
+    prev_carry = ""
+    cast = _plan_cast(plan)
+    plan_cast_all = [c["name"] for c in cast]
+    if cast:
+        print("[stage] 人物名册：" + "、".join(
+            f"{c['name']}{'' if c['major'] else '(过场)'}" for c in cast))
 
     for i, sec in enumerate(secs, 1):
         no = int(sec.get("no") or i)
         goal = (sec.get("goal") or "").strip()
         end_hook = (sec.get("end_hook") or "").strip()
         ch_title = (sec.get("title") or f"小节{no:02d}").strip()
+        # 本节目标字数：计划给了 words 就照计划，否则总字数均摊。
+        # 门禁区间跟着目标走（±25%），不再是一刀切的 600-1000——实测 12 节里
+        # 7 节数 1105-1278，全挂字数门，门禁等于摆设。
+        tgt = _sec_words(sec, int(total_words), len(secs), sec_lo, sec_hi)
+        # 区间取宽（-30% / +45%）：模型对单节长度的控制力有限，卡死在 ±25% 会
+        # 让「多写 30 字」也触发整节重写；总量由装配后的字数门兜。
+        lo_i, hi_i = int(tgt * 0.7), int(tgt * 1.45)
+        sec_cast = [str(x).strip() for x in (sec.get("cast") or []) if str(x).strip()]
+        carry_out = (sec.get("carry_out") or "").strip()
 
         # 摘要只用「计划里的 goal + 上一节正文首句」，不用模型自报的 [本章摘要]
         if prev_body:
@@ -2529,10 +2711,17 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             STYLE_SAMPLE=style_sample or STYLE_SAMPLE_EMPTY,
             GENRE_GUIDE=genre_guide,
             BAN_PROPS=_ban_props_text(cfg),
+            SEC_LO=lo_i, SEC_HI=hi_i,
+            SEC_LO_MIN=int(tgt * 0.75), SEC_HI_MAX=int(tgt * 1.25),
+            PER_WORDS=tgt,
+            CAST=_cast_block(cast, sec_cast),
+            CARRY_IN=prev_carry or "（本节是第一节，无交接项）",
+            CARRY_OUT=carry_out or "（计划未给本节交接项）",
         )
 
         best, best_pb, best_off = "", None, 10 ** 9
         problems: list[str] = []
+        lang_deferred: list[str] = []
         for attempt in range(1, retries + 1):
             sys_i = system
             if problems:
@@ -2541,11 +2730,30 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
                          + "\n\n只输出这一节正文，不要解释、不要道歉。")
             raw = writer_llm.chat(sys_i, user)
             body = normalize_quotes(_sec_clean(raw))
-            problems = _section_gate(cfg, body, sec_lo, sec_hi)
+            problems = _section_gate(cfg, body, lo_i, hi_i)
+            # 线索不丢：上一节声明要留下的东西，这一节开头必须正面接住。
+            # 只给一次重写机会（第 1 次尝试后才追加）——同义改写本来就抓不准，
+            # 硬卡会产生假阳性连环重写；抓到了就提示，抓不到就落到连续性体检里。
+            if prev_carry and attempt == 1 and not _contin._n_gram_hit(prev_carry, body, 4):
+                problems = problems + [
+                    f"没有接住上一节留下的「{prev_carry}」：这一节开头必须正面处理它，"
+                    "不能另起炉灶、也不能当它没发生"]
+            # 语言病在节级只给**一次**修正机会。实测：整节盲改三轮压不住 AI 口癖
+            # （「嘴角勾起一抹」三轮全在），白烧 token 还照样带病交付。真正的去处是
+            # 整稿 `_ai_deflavor`——它把命中词与所在句一起喂给模型。这里第二次起放行，
+            # 但记进 stats 与连续性报告，不许静默当成「合格」。
+            if attempt >= 2 and problems:
+                _lang_p = [p for p in problems if p.startswith("语言病：")]
+                if _lang_p and len(_lang_p) == len(problems):
+                    lang_deferred.extend(_lang_p)
+                    problems = []
             n = count_words_zh(body)
-            off = 0 if sec_lo <= n <= sec_hi else abs(n - sec_lo if n < sec_lo else n - sec_hi)
+            off = 0 if lo_i <= n <= hi_i else abs(n - lo_i if n < lo_i else n - hi_i)
             if not problems:
-                best, best_off = body, 0
+                # best_pb 必须一起清空：否则「第 1 次不合格、第 2 次合格」的节
+                # 仍然被记成不合格（实测 12 节 12 挂，门禁全挂 → 一律回落
+                # 「最接近合格的一版」，等于门禁没起作用）。
+                best, best_off, best_pb = body, 0, None
                 break
             if off < best_off:  # 没通过也要留最接近合格的那一版，避免全废
                 best, best_pb, best_off = body, problems, off
@@ -2558,17 +2766,46 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             print(f"[sec {no:02d}] ⚠ 重写 {retries} 次仍未全过（{'; '.join(best_pb)}），采用最接近的一版")
             runlog.event("section_write", f"小节{no:02d} 未过门禁：{best_pb}")
 
+        # 跨节逐字重复：写完**立刻**查、就地改。装配完整稿再修的话，改动要跨
+        # 十几个节定位，且下游语言返修会把改掉的句子又写回来（实测过两次）。
+        if body_list:
+            _dups = langqa.cross_dup(best, body_list, n=_SEC_DUP_MIN)
+            if _dups:
+                print(f"[sec {no:02d}] 与前面小节逐字重复 {len(_dups)} 处（最长 {_dups[0]['len']} 字："
+                      f"「{_dups[0]['text'][:18]}」），就地改写")
+                _nb, _rep = _fix_sec_dup(cfg, writer_llm, best, _dups, body_list, no)
+                if _rep.get("applied"):
+                    best = _nb
+                dup_fixes.append({"no": no, **_rep})
+
         parts.append(f"{no:02d} {ch_title}\n\n{best}")
         used.extend(_sec_quants(best))
         prev_body = best
-        stats.append({"no": no, "words": count_words_zh(best),
-                      "pass": not best_pb, "problems": best_pb or []})
-        print(f"[sec {no:02d}] {count_words_zh(best)} 字 "
+        prev_carry = carry_out
+        body_list.append(best)
+        stats.append({"no": no, "words": count_words_zh(best), "target": tgt,
+                      "pass": not best_pb, "problems": best_pb or [],
+                      "lang_deferred": lang_deferred})
+        print(f"[sec {no:02d}] {count_words_zh(best)} 字（目标 {tgt}）"
               f"{'✓' if not best_pb else '×'} | {ch_title}")
 
     full = "\n\n".join(parts).strip()
+    # 全篇连续性体检：人物断档 / 线索断头 / 跨节重复。
+    # 声明过的才查（没声明就 skipped）——不做名字猜测，见 studio/continuity.py。
+    try:
+        _secs_for_cont = [{"no": f"{int(s.get('no') or k):02d}", "text": t}
+                          for k, (s, t) in enumerate(zip(secs, body_list), 1)]
+        _cont = _contin.report(_secs_for_cont, plan_sections=secs,
+                               cast=cast or None, min_dup=_SEC_DUP_MIN)
+        project.save_json("continuity.json", {
+            **_cont, "dup_fixes": dup_fixes, "cast_roster": plan_cast_all})
+        print("[stage] 连续性体检：" + _contin.summary(_cont))
+    except Exception as e:  # noqa: BLE001
+        print(f"[stage] ⚠ 连续性体检异常（{type(e).__name__}: {e}）")
     project.save_json("section_stats.json", {"sections": stats,
-                                             "words": count_words_zh(full)})
+                                             "words": count_words_zh(full),
+                                             "dup_fixes": len([d for d in dup_fixes if d.get("applied")]),
+                                             "targets": [s["target"] for s in stats]})
     print(f"[stage] 逐节装配完成 {count_words_zh(full)} 字 / {len(stats)} 节")
 
     # 与整篇写同一套收尾：标题、末节收束、pitch/bible、提交
@@ -2953,7 +3190,7 @@ _MAX_SECTIONS = MAX_SECTIONS
 
 _STAGE_CRITERIA = {
     "导语": (
-        "1) 300-400 字（低于 280 或超过 420 视为不合格），第一句就是炸裂冲突或反常画面；\n"
+        "1) {lo}-{hi} 字（低于 {lo_min} 或超过 {hi_max} 视为不合格），第一句就是炸裂冲突或反常画面；\n"
         "2) 细节具体到钱数/物件/地名，禁空话套话与文艺腔；\n"
         "3) 至少一次反转或反差（如'她笑了'紧跟坏事）；\n"
         "4) 末句留悬念钩子，逼人往下读；\n"
@@ -2975,6 +3212,18 @@ _STAGE_CRITERIA = {
 }
 
 
+def _stage_criteria(stage: str, cfg: dict) -> str:
+    """阶段评审标准（导语的字数区间从配置现算，与生成/判定同源）。"""
+    txt = _STAGE_CRITERIA.get(stage)
+    if not txt:
+        return "按下沉市场短篇行业达标线核对。"
+    if "{lo}" not in txt:
+        return txt
+    _lw = (cfg.get("lead") or {}).get("words") or [150, 220]
+    lo, hi = int(_lw[0]), int(_lw[1])
+    return txt.format(lo=lo, hi=hi, lo_min=int(lo * 0.8), hi_max=int(hi * 1.25))
+
+
 def _gate_llm_check(cfg, llm, project, stage, content_text):
     """LLM 评审：返回 (score, issues_str)。评审失败视为中性通过（不阻塞流水线）。"""
     editor = resolve_llm(cfg, llm, "reviewer")
@@ -2982,7 +3231,7 @@ def _gate_llm_check(cfg, llm, project, stage, content_text):
     try:
         sys_p, user_p = render_prompt(
             "gate", STAGE=stage, TITLE=pitch.get("title", ""),
-            CRITERIA=_STAGE_CRITERIA.get(stage, "按下沉市场短篇行业达标线核对。"),
+            CRITERIA=_stage_criteria(stage, cfg),
             PREV_ISSUES="", CONTENT=content_text[:4000],
         )
         data = editor.chat_json(sys_p, user_p)
@@ -3055,10 +3304,13 @@ def _det_check_split(stage: str, content, cfg: dict | None = None
     if stage == "导语":
         text = (content.get("text") or "").strip() if isinstance(content, dict) else str(content)
         w = count_words_zh(text)
-        if w < 260:
-            issues.append(f"导语仅 {w} 字，单薄（要求 300-400 字）")
-        if w > 460:
-            issues.append(f"导语 {w} 字过长，压缩到 300-400 字")
+        # 阈值与 stage_lead 同源：改配置改一处，生成与判定不会打架
+        _lw = (cfg.get("lead") or {}).get("words") or [150, 220]
+        _lo, _hi = int(_lw[0]), int(_lw[1])
+        if w < int(_lo * 0.8):
+            issues.append(f"导语仅 {w} 字，单薄（要求 {_lo}-{_hi} 字）")
+        if w > int(_hi * 1.25):
+            issues.append(f"导语 {w} 字过长，压缩到 {_lo}-{_hi} 字")
         if _AI_CLICHE.search(text):
             issues.append("导语含 AI 口癖词，改成口语白话")
         if not re.search(r"[0-9一二三四五六七八九十百千万]+|[，,]", text):
@@ -4565,6 +4817,15 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
             "threshold": floor,
             "reached": bool(_fs >= floor),
             "rounds": rnd_f,
+            # 判官给的问题清单必须落盘：以前只打一行「未达 72」，复盘时既不知道
+            # 差在哪，也无法验证修复有没有对症（人只能靠日志猜）。
+            "issues": [
+                {"severity": i.get("severity"), "type": i.get("type"),
+                 "location": i.get("location"), "note": str(i.get("note") or "")[:300],
+                 "fix": str(i.get("fix") or "")[:200]}
+                for i in (report.get("issues") or [])[:12] if isinstance(i, dict)
+            ],
+            "verdict": report.get("verdict"),
             "note": "内部质检分（卡点/连续性/文风/安全），非投稿线；投稿判定见 market_lang",
         }
 

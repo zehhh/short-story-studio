@@ -66,7 +66,14 @@ DEFAULT_CONFIG = {
         "section_retries": 3,          # 单节不合格重写上限（含首次）
         "section_lo": 600,             # 单节字数下限（低于即重写）
         "section_hi": 1000,            # 单节字数上限（高于即重写）
-        "section_words": 750,          # 每节目标字数（用于算节数）
+        "section_words": 1000,         # 每节目标字数（用于算节数；实测单节写 1000 最自然）
+        "section_lo_min": 0,           # 目标字数下浮闸（0 = 用 section_lo）
+        "section_hi_max": 0,           # 目标字数上浮闸（0 = 用 section_hi）
+    },
+    "lead": {
+        # 导语字数区间。历史上硬编码 300-400，用户反馈「导语字数太多」——
+        # 知乎/番茄短故事的导语是「钩子」不是「摘要」，150-220 字足够把六拍走完。
+        "words": [150, 220],
     },
     "knowledge": {
         "auto_collect": True,          # 写作前自动搜集题材知识

@@ -45,6 +45,18 @@ _CONFLICT = (
     "骂", "打", "绑", "锁", "推", "泼", "烧", "断", "拒", "退", "休", "夺走",
     "离婚", "断绝", "过户", "霸占", "吞掉", "拉黑", "退婚", "休妻", "流放",
     "抄家", "抵押", "拍卖", "抛下", "赶出", "改名", "顶替", "冒领",
+    # 古言/宫廷向：赐死、灌药、罚跪、废位、逐出、毒害——短故事频道的古言书名
+    # 靠的就是这一类"上位者对下位者下手"的动作（实测《太后赐我一碗药》拿不到
+    # 冲突分，就是因为「赐」不在表里）。
+    "赐", "赏", "灌", "罚", "废", "杖", "毒", "囚", "幽禁", "遣散",
+    "害死", "逼死", "烧死", "弄死", "毒死", "赶走", "发落", "赐死",
+)
+
+# 前例钩：「前两个都没活过三年」——短故事书名里最强的一类钩子，
+# 它不描述冲突本身，而是告诉读者**同样的位置已经死过人**。
+_OMEN = (
+    "都没", "全没", "无一", "没一个", "前两个", "前三个", "上一个", "都没活",
+    "活不过", "没活过", "个个", "无人生还", "来一个死一个", "没有例外",
 )
 
 # 反转连接词：读者的「哦？」时刻。
@@ -98,6 +110,7 @@ def parts(title: str) -> dict:
         "identity": _hit(t, _IDENTITY),
         "conflict": _hit(t, _CONFLICT),
         "reversal": _hit(t, _REVERSAL),
+        "omen": _hit(t, _OMEN),
         "numbers": _NUM_RE.findall(t),
         "sep": bool(re.search(r"[，,：:]", t)),
         "airy": _hit(t, _AIRY),
@@ -116,6 +129,8 @@ def score_relation(title: str) -> int:
     if p["identity"]:
         s += 2
     if p["reversal"]:
+        s += 2
+    if p["omen"]:
         s += 2
     if p["numbers"]:
         s += 1
@@ -173,7 +188,11 @@ def score(title: str, *, min_len: int = 10, max_len: int = 32) -> int:
 
 
 def issues(title: str, *, min_len: int = 10, max_len: int = 32) -> list[str]:
-    """可读问题清单，直接拼进重试提示。"""
+    """可读问题清单，直接拼进重试提示。
+
+    分两套说：关系式缺「身份/冲突/反转」；设定式缺「高概念词/数量等级」。
+    混着说会给出自相矛盾的修改建议（对着脑洞名喊"没有身份锚点"）。
+    """
     t = (title or "").strip()
     p = parts(t)
     out: list[str] = []
@@ -184,12 +203,18 @@ def issues(title: str, *, min_len: int = 10, max_len: int = 32) -> list[str]:
                    f"番茄三段式要 15–30 字）")
     elif p["len"] > max_len:
         out.append(f"{p['len']} 字偏长（信息流会截断，压到 30 字内）")
-    if not p["conflict"]:
-        out.append("没有任何冲突动作（撕/扔/卖/赶/过户/拉黑…），读者看不出发生了什么")
-    if not p["identity"]:
-        out.append("没有身份或关系锚点（我妈/我弟/婆婆/嫡姐/前夫…），读者代入不进来")
-    if not p["reversal"]:
-        out.append("没有反转钩（却/转头/直到/原来/那天…），三段式缺最后一折")
+    if score_concept(t) >= score_relation(t):
+        if not _hit(t, _CONCEPT):
+            out.append("没有高概念词（重生/穿成/系统/开局/苗疆/深宫…），设定卖点立不住")
+        if not _CONCEPT_NUM_RE.search(t):
+            out.append("没有等级或数量（第73章/200万/S级/三年…），脑洞没有量级感")
+    else:
+        if not p["conflict"]:
+            out.append("没有任何冲突动作（撕/扔/卖/赶/赐/灌/过户/拉黑…），读者看不出发生了什么")
+        if not p["identity"]:
+            out.append("没有身份或关系锚点（我妈/我弟/婆婆/太后/嫡姐/前夫…），读者代入不进来")
+        if not p["reversal"] and not p["omen"]:
+            out.append("没有反转钩或前例钩（却/转头/直到/原来/前两个都没活过…），三段式缺最后一折")
     if p["airy"]:
         out.append(f"含文艺空词 {p['airy']}，这类词在榜单书名里几乎不用")
     if any(w in t for w in _BAN_WORDS):

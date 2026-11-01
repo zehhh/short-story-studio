@@ -882,6 +882,7 @@ def cmd_produce(cfg: dict, args):
     """
     from . import analytics as an
     from . import publish as pub
+    from . import runlog as _rl
     from .llm import get_llm
     from pathlib import Path as _P
 
@@ -971,7 +972,6 @@ def cmd_produce(cfg: dict, args):
             _meta["gate_status"] = "length_out_of_range"
             _meta["gate_reason"] = _why
             project.save_meta(_meta)
-            from . import runlog as _rl
 
             if getattr(args, "reject_overflow", False):
                 rejected = ws / "rejected"

@@ -1298,7 +1298,17 @@ def deterministic_repair(text: str, log=print) -> tuple[str, dict]:
     最后切段（把合并后变长的段落按 180 字重新排版）。
     """
     rep: dict = {}
+    _orig = text
+    _before = len(text)
     text, n_rm = dedupe_paragraphs(text)
+    # 防线：删重复段超过全文 40%，说明不是「贴重了」而是模型在复读整段。
+    # 这种情况下删下去会把稿子删成空壳——99617 字事故就是清理步骤把 48% 正文
+    # 销毁。宁可留着重复交语言返修按语义重写，也不能在这里毁稿。
+    if _before and len(text) < _before * 0.6:
+        log(f"[repair] ⚠ 删重复段会砍掉 {(_before - len(text)) / _before:.0%} 正文"
+            f"（{_before}→{len(text)} 字），判定为复读而非贴重，撤销本步")
+        rep["dedup_guard"] = f"{_before}->{len(text)}"
+        text, n_rm = _orig, 0
     rep["deduped_paras"] = n_rm
     text, n_en = dedupe_enums(text)
     rep["deduped_enums"] = n_en

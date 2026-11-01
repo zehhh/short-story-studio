@@ -455,6 +455,9 @@ def main() -> int:
     _test_draft_prune_keeps_latest()
     _test_join_sections_keeps_preamble()
     _test_full_ai_hits_excludes_global_labels()
+    _test_title_gate_rewards_real_titles()
+    _test_section_cast_and_words()
+    _test_dedup_guard_reverts_mass_deletion()
 
     print("\n全部冒烟测试通过 ✔")
     return 0
@@ -562,6 +565,75 @@ def _test_full_ai_hits_excludes_global_labels():
     labels = _full_ai_hits(full, cfg)
     assert "节长失衡" not in labels, f"整稿级判据混进了 AI 腔标签：{labels}"
     print("[ok] 整稿 AI 腔判据逐节取并集，不混入整稿级判据")
+
+
+def _test_title_gate_rewards_real_titles():
+    """书名卖点分必须能分清「真实榜单名」和「文艺空名」。
+
+    历史缺陷：`_CONFLICT` 里没有「赐/赏/灌/罚」这类古言动作，`_REVERSAL` 里没有
+    「前两个都没活过」这类前例钩，于是实测交付稿《封妃当日太后赐我一碗药，前两个
+    妃子都没活过三年》只拿 5 分（刚过门线），改标题的重试循环永远收不到「更好」的信号。
+    """
+    from studio import title_gate as TG
+
+    good = "封妃当日太后赐我一碗药，前两个妃子都没活过三年"
+    assert TG.score(good) >= 8, f"真实古言强书名只拿 {TG.score(good)} 分"
+    assert TG.family(good) == "relation", "应判为关系冲突式"
+    # 文艺空名必须仍然是 0 分：这条线是「短篇借不到作者名望」的立足点
+    for bad in ("萤火之城", "娇养玫瑰", "心肝宠", "够野"):
+        assert TG.score(bad) == 0, f"文艺空名 {bad} 拿到了 {TG.score(bad)} 分"
+    # 概念式书名不能因为新加的冲突词表被抬高到关系式
+    assert TG.family("我在大清当老六") == "concept"
+    print("[ok] 书名卖点分：真实强名 8+，文艺空名 0，两套战法不互相污染")
+
+
+def _test_section_cast_and_words():
+    """逐节写的两个契约：人物名册不许丢、每节字数跟计划走。"""
+    from studio.pipeline import _cast_block, _plan_cast, _sec_words
+
+    plan = {"characters": [
+        {"name": "沈清秋", "role": "主角", "major": True, "pov": True},
+        {"name": "赵太后", "role": "对手", "major": True, "pov": False},
+        {"name": "柳如烟", "role": "配角", "major": False, "pov": False},
+        "李承乾",
+    ]}
+    cast = _plan_cast(plan)
+    assert [c["name"] for c in cast] == ["沈清秋", "赵太后", "柳如烟", "李承乾"], cast
+    assert cast[0]["pov"] is True and cast[3]["major"] is True
+    block = _cast_block(cast, ["沈清秋", "赵太后"])
+    assert "第一人称" in block and "沈清秋" in block
+    assert "本节出场：沈清秋、赵太后" in block
+    assert _plan_cast({}) == [] and _cast_block([], [])  # 没声明时不许炸
+
+    # 字数：计划给了就照计划；没给或越界就总字数均摊，并夹到区间内
+    assert _sec_words({"words": 820}, 10000, 13, 600, 1000) == 820
+    assert _sec_words({"words": 9999}, 10000, 13, 600, 1000) == 769
+    assert _sec_words({}, 10000, 13, 600, 1000) == 769
+    print("[ok] 人物名册与每节目标字数均按计划契约解析，缺声明时安全退化")
+
+
+def _test_dedup_guard_reverts_mass_deletion():
+    """复读型输出不许被「删重复段」删成空壳。
+
+    99617 字事故与 mock 实测（7828 字 → 817 字）是同一种死法：确定性清理步骤
+    把正文大面积销毁。守卫口径是「超过 40% 就撤销本步」。
+    """
+    from studio.language import deterministic_repair
+
+    para = "她把碗往桌上一推，说这三年辛苦你了，房子归你妹妹我们两清。"
+    text = "\n".join([para] * 20)
+    out, rep = deterministic_repair(text, log=lambda *a, **k: None)
+    assert rep.get("deduped_paras") == 0, f"应当撤销删除，实际删了 {rep.get('deduped_paras')} 段"
+    assert rep.get("dedup_guard"), "撤销必须留痕"
+    assert len(out) >= len(text) * 0.95, f"正文被销毁：{len(text)}→{len(out)}"
+
+    # 正常「贴重一次」必须照删，守卫不能把功能挡死
+    ok_text = "\n".join([para, "她没再说话，屋里只剩钟摆声。", "我数了数柜子里的碗，一共七个。",
+                         para, "夜里我听见她在院里咳嗽。"])
+    out2, rep2 = deterministic_repair(ok_text, log=lambda *a, **k: None)
+    assert rep2.get("deduped_paras") == 1, rep2
+    assert "dedup_guard" not in rep2
+    print("[ok] 删重复段有销毁上限：整篇复读撤销，单处贴重照删")
 
 
 if __name__ == "__main__":
