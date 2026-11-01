@@ -2548,6 +2548,124 @@ def _sec_words(sec: dict, total_words: int, n: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, w))
 
 
+_FACTS_SYS = (
+    "你是长篇小说连续性校对。给你一节正文，请提取其中**已经写死、后面不许改**的硬事实。"
+    "硬事实指：道具从哪来/到哪去、药或伤的具体成分与效果、人物的位份与称呼、"
+    "死了谁/怎么死的/死了几个、时间过了多久、谁在场谁不在场、关键数字。"
+    "只提取正文里**确实写了**的，不许推测、不许补充。"
+)
+
+_FACTS_USER = """正文：
+{text}
+
+输出 JSON（只输出 JSON，不要解释）：
+{{"facts": [{{"quote": "正文里逐字出现的一段原句（10-40 字）", "fact": "这条原句锁定了什么（不超过 30 字）"}}]}}
+
+最多 4 条。至少要有一条，且 quote 必须能在正文里逐字找到，否则不许输出。"""
+
+
+def _extract_facts(llm: BaseLLM, text: str, keep: list[str]) -> list[str]:
+    """从一节正文里抽「硬事实」，并用逐字校验挡掉模型编造。
+
+    为什么要这一步：终审 5 处 high 硬伤里有 4 处是「上一节写过的设定，这一节换了
+    个说法」——药是安神汤还是断肠草、前两位妃子是怎么死的、停灵几天、信物从哪来。
+    写手看不到这些，只能自己编，于是相邻小节互相打架。
+
+    为什么不让模型自报摘要：实测 `[本章摘要]` 会写正文里根本没发生的情节，注入
+    下一节只会把错误放大。所以这里要求**给出正文原句**，并用 `quote in text` 硬校验：
+    编造的原句找不到，这条事实直接丢掉。
+    """
+    text = (text or "").strip()
+    if len(text) < 200:
+        return keep
+    try:
+        raw = llm.chat(_FACTS_SYS, _FACTS_USER.format(text=text[:2400]), json_mode=True)
+    except Exception as e:  # noqa: BLE001 —— 抽事实失败不该影响写作
+        print(f"[facts] ⚠ 硬事实抽取失败（{type(e).__name__}），本节跳过")
+        return keep
+    from .util import extract_json
+
+    try:
+        data = extract_json(raw or "")
+    except Exception:  # noqa: BLE001
+        return keep
+    got = []
+    for item in (data.get("facts") or [])[:4]:
+        if isinstance(item, str):
+            continue
+        quote = str(item.get("quote") or "").strip()
+        fact = str(item.get("fact") or "").strip()
+        if not fact or len(quote) < 8:
+            continue
+        if quote not in text:      # 编造的原句直接丢
+            continue
+        got.append(f"{fact}（原句：{quote[:28]}）")
+    if not got:
+        return keep
+    out = keep + got
+    # 留痕：没有这行日志就看不出「硬事实注没注入」——静默成功和静默失败
+    # 在日志里长得一模一样，排障时最先要问的就是它。
+    print(f"[facts] 新增硬事实 {len(got)} 条，累计 {len(out[-14:])} 条：{got[0][:40]}")
+    return out[-14:]               # 只留最近 14 条，防止提示词无限膨胀
+
+
+_REPLAY_SYS = (
+    "你是长篇连载的衔接校对。只判断一件事：这一节的开头，是不是在**重演**上一节"
+    "已经写完的事件。重演指：同一场戏、同一个动作、同一个信息再来一遍（哪怕换了"
+    "说法），时间线因此原地倒退。正常的「接着往下写」不算重演——上一节停在半途，"
+    "这一节把它顺势写完，是正常承接。"
+)
+
+_REPLAY_USER = """上一节正文（结尾部分）：
+{prev}
+
+这一节开头：
+{cur}
+
+只输出 JSON：{{"replay": true 或 false, "why": "不超过 40 字的理由", "rewrite_hint": "若 replay=true，给出这一节开头应该从哪一刻写起（不超过 40 字）"}}"""
+
+
+def _sec_replay(llm: BaseLLM, prev_text: str, cur_text: str) -> dict:
+    """判「这一节开头有没有重演上一节」。
+
+    为什么要用 LLM 判而不是词法判：实测过三种确定性做法——
+    最长公共子串（重演时句子是改写的，抓不到）、句级 bigram Jaccard
+    （「碗沿贴上嘴唇」与「碗沿磕在唇齿间」只共享「碗沿」）、
+    时间词表（中文叙事里时间关系不靠词标）。终审 4 轮里这条硬伤每轮都出现，
+    是当前唯一的稳定失分项，值得花 9 次轻模型调用换来。
+
+    成本：每节 1 次、输入约 800 token、输出约 60 token。
+    """
+    prev_text = (prev_text or "").strip()
+    cur_text = (cur_text or "").strip()
+    if len(prev_text) < 200 or len(cur_text) < 200:
+        return {"replay": False}
+    try:
+        raw = llm.chat(_REPLAY_SYS,
+                       _REPLAY_USER.format(prev=prev_text[-900:], cur=cur_text[:1300]),
+                       json_mode=True)
+    except Exception as e:  # noqa: BLE001 —— 判不了就当没重演，不影响写作
+        print(f"[replay] ⚠ 衔接判重演失败（{type(e).__name__}），本节跳过")
+        return {"replay": False}
+    from .util import extract_json
+
+    try:
+        d = extract_json(raw or "")
+    except Exception:  # noqa: BLE001
+        return {"replay": False}
+    if not isinstance(d, dict):
+        return {"replay": False}
+    return {"replay": bool(d.get("replay")),
+            "why": str(d.get("why") or "")[:60],
+            "hint": str(d.get("rewrite_hint") or "")[:60]}
+
+
+def _facts_block(facts: list[str]) -> str:
+    if not facts:
+        return "（第一节，尚无）"
+    return "\n".join(f"- {f}" for f in facts)
+
+
 def _fix_sec_dup(cfg: dict, llm: BaseLLM, text: str, dups: list[dict],
                  prev_texts: list[str], sec_no: int) -> tuple[str, dict]:
     """把本节与前面小节**逐字重复**的句子改掉：只动撞车的句子，不动情节。
@@ -2668,6 +2786,8 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
     dup_fixes: list[dict] = []
     prev_body = ""
     prev_carry = ""
+    # 已确立的硬事实（每节抽一次，逐字校验过的才留下），注入下一节防自相矛盾
+    facts: list[str] = []
     cast = _plan_cast(plan)
     plan_cast_all = [c["name"] for c in cast]
     # 第一人称主角的名字：计划里标了 pov 的优先，否则取第一个主要人物。拿它查
@@ -2714,6 +2834,7 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             PLAN=json.dumps(plan, ensure_ascii=False, indent=1),
             PREV_TAIL=prev_tail,
             PREV_SUMMARY=prev_summary,
+            FACTS=_facts_block(facts),
             GOAL=goal,
             END_HOOK=end_hook,
             USED_QUANTS="、".join(used[-40:]) if used else "（本节是第一节，尚无）",
@@ -2763,6 +2884,17 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
                 problems = problems + [
                     f"节尾把前文又讲了一遍：「{_tr[:24]}」——最后一段只许用动作或"
                     "台词把 end_hook 落下，不许复述本节已写过的场景或台词"]
+            # 相邻小节重演上一节的戏：终审 4 轮里每轮都报，是当前唯一稳定失分项
+            # （06/07 各写一遍赐汤、07/08 各写一遍发作）。词法判据实测全失效，
+            # 这里用一次轻模型调用判衔接；每轮都判（重写后仍重演的会被再拦一次）。
+            if prev_body:
+                _rp = _sec_replay(resolve_llm(cfg, llm, "light"), prev_body, body)
+                if _rp.get("replay"):
+                    print(f"[replay] 小节{no:02d} 开头疑似重演上一节：{_rp.get('why')}")
+                    problems = problems + [
+                        f"这一节开头在重演上一节已经写完的戏（{_rp.get('why') or '同一场戏又写一遍'}）"
+                        f"——{_rp.get('hint') or '从上一节结束之后的那一刻写起，不要再交代一遍'}"
+                        "。时间线只能往前走，不许原地倒退"]
             # 语言病在节级只给**一次**修正机会。实测：整节盲改三轮压不住 AI 口癖
             # （「嘴角勾起一抹」三轮全在），白烧 token 还照样带病交付。真正的去处是
             # 整稿 `_ai_deflavor`——它把命中词与所在句一起喂给模型。这里第二次起放行，
@@ -2808,6 +2940,7 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
         prev_body = best
         prev_carry = carry_out
         body_list.append(best)
+        facts = _extract_facts(resolve_llm(cfg, llm, "light"), best, facts)
         stats.append({"no": no, "words": count_words_zh(best), "target": tgt,
                       "pass": not best_pb, "problems": best_pb or [],
                       "lang_deferred": lang_deferred})
