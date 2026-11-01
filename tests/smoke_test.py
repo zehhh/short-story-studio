@@ -454,6 +454,7 @@ def main() -> int:
     _test_deterministic_recheck_disabled()
     _test_draft_prune_keeps_latest()
     _test_join_sections_keeps_preamble()
+    _test_full_ai_hits_excludes_global_labels()
 
     print("\n全部冒烟测试通过 ✔")
     return 0
@@ -541,6 +542,26 @@ def _test_join_sections_keeps_preamble():
     assert "字数：10174" in out, "序言里的元信息行被丢掉了（find 命中了编号）"
     assert "第一节的正文" in out and "第二节的正文" in out, "正文被丢了"
     print("[ok] 逐节回写保住序言（书名行 + 导语），且不被书名行里的裸编号误定位")
+
+
+def _test_full_ai_hits_excludes_global_labels():
+    """整稿 AI 腔判据必须是**逐节扫描的并集**，不能把整稿级判据混进来。
+
+    历史缺陷：`_ai_deflavor` 直接 `_section_ai_hits(full, cfg)` 扫全文，
+    langqa 里「节长失衡」这类只有整稿才成立的判据被当成 AI 腔标签写进
+    `report["langqa_ai_repair"]["labels"]`，看板上会显示成「AI 腔：节长失衡」。
+    """
+    from studio.config import load_config
+    from studio.pipeline import _full_ai_hits, _split_full_sections
+
+    cfg = load_config(None)
+    sec1 = "她推门进来，把伞往墙角一搁。\n\n「你回来了。」我说。\n\n她没应声，径直走到桌边坐下。\n"
+    sec2 = "我给她倒了杯水，她没接。\n\n「钱的事，你想怎么办。」她终于开口。\n"
+    full = f"# 测试书名\n\n01\n\n{sec1}\n02\n\n{sec2}"
+    assert len(_split_full_sections(full)) == 2, "样例应切成 2 节"
+    labels = _full_ai_hits(full, cfg)
+    assert "节长失衡" not in labels, f"整稿级判据混进了 AI 腔标签：{labels}"
+    print("[ok] 整稿 AI 腔判据逐节取并集，不混入整稿级判据")
 
 
 if __name__ == "__main__":

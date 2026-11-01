@@ -3650,6 +3650,34 @@ def _section_ai_hits(text: str, cfg: dict) -> list[str]:
     return out
 
 
+def _section_ai_detail(text: str, cfg: dict) -> list[str]:
+    """单节的 AI 腔命中明细（带原文所在句与替换建议），供提示词直接用。
+
+    只给标签（「AI口癖·时间过渡词」）模型不知道该改哪一句，实测两轮下来
+    命中数纹丝不动；langqa 的 hit 本来就带 `note`（命中词 + 所在句）和
+    `suggest`（替换方向），直接喂给写手才有可操作性。
+    """
+    try:
+        rep = langqa.scan(text, langqa.load_rules(cfg))
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[str] = []
+    for h in rep.get("hits") or []:
+        if h.get("severity") not in ("high", "mid"):
+            continue
+        lab = (h.get("label") or h.get("kind") or "").strip()
+        if not lab:
+            continue
+        note = (h.get("note") or "").strip()
+        sug = (h.get("suggest") or "").strip()
+        line = f"{lab}｜{note}" if note else lab
+        if sug:
+            line += f"｜改法：{sug}"
+        if line not in out:
+            out.append(line)
+    return out
+
+
 def _full_ai_hits(full: str, cfg: dict) -> list[str]:
     """整稿层面的 AI 腔判据集合（**逐节扫描后并集**，不是整稿一把扫）。
 
@@ -3684,7 +3712,8 @@ def _ai_deflavor(cfg: dict, llm: BaseLLM, project: Project, full: str,
             print(f"[lang] AI 腔去味第 {rounds} 轮：命中 {len(hits)} 类"
                   f"（{'、'.join(hits[:5])}）")
             before = full
-            full = _rewrite_density_sections(cfg, llm, project, full, style_sample, max_secs=3)
+            full = _rewrite_density_sections(cfg, llm, project, full, style_sample,
+                                             max_secs=3, prefer_ai=True)
             if full == before:
                 print("[lang] AI 腔去味无节可比（或全部未达标），停止")
                 break
@@ -3696,7 +3725,8 @@ def _ai_deflavor(cfg: dict, llm: BaseLLM, project: Project, full: str,
 
 
 def _rewrite_density_sections(cfg: dict, llm: BaseLLM, project: Project, full: str,
-                              style_sample: str, max_secs: int = 3) -> str:
+                              style_sample: str, max_secs: int = 3,
+                              prefer_ai: bool = False) -> str:
     """对数量词密度 / AI 腔命中最高的几节做"只改表达、不改情节"的定向重写。
 
     比整稿重写安全（只动问题节，其余零改动），比定点补丁有效（整节重写能
@@ -3712,6 +3742,11 @@ def _rewrite_density_sections(cfg: dict, llm: BaseLLM, project: Project, full: s
 
     def _pen(s) -> int:
         # 数量词碎拍 1 分/处；AI 腔命中按 3 分/条加权——它们直接决定投稿判定
+        if prefer_ai:
+            # AI 去味场景必须让「有 AI 腔的节」排在前面：密度分动辄十几分，
+            # 按密度优先排序会把真正带 AI 口癖的短小节挤到 max_secs 之外，
+            # 结果连跑 2 轮 one-shot 都改不到它（实测 hits 2 → 仍是 2）。
+            return 100 * len(ai_map.get(s["no"]) or []) + min(_section_quant_score(s["text"]), 99)
         return _section_quant_score(s["text"]) + 3 * len(ai_map.get(s["no"]) or [])
 
     # 阈值 8：只改明显严重的节；分数 5-7 的节重写反而帮倒忙（实测第二轮改这些节
@@ -3734,8 +3769,10 @@ def _rewrite_density_sections(cfg: dict, llm: BaseLLM, project: Project, full: s
         now = count_words_zh(target["text"])
         before_score = _section_quant_score(target["text"])
         before_ai = ai_map.get(no) or []
-        hits_txt = ("；".join(before_ai) if before_ai
-                    else "（本节无 AI 腔命中，只处理数量词）")
+        _detail = _section_ai_detail(target["text"], cfg) if before_ai else []
+        hits_txt = ("；".join(_detail) if _detail
+                    else ("；".join(before_ai) if before_ai
+                          else "（本节无 AI 腔命中，只处理数量词）"))
         body = _body_of(target)
         sents = [s for s in re.split(r"(?<=[。！？])", body) if s.strip()]
         sec_end = sents[-1] if sents else body[-30:]
@@ -3762,8 +3799,12 @@ def _rewrite_density_sections(cfg: dict, llm: BaseLLM, project: Project, full: s
         new_w = count_words_zh(new_text)
         new_score = _section_quant_score(new_text)
         new_ai = _section_ai_hits(new_text, cfg)
-        # 校验：字数不缩水超 15%，且至少一项问题指标真的下降了
+        # 校验：字数不缩水超 15%，且至少一项问题指标真的下降了。
+        # prefer_ai 时 AI 腔条数**不许增加**——实测按密度判断是否改进，
+        # 会把「密度 6→2 但 AI 腔 1→2」的稿子收下，一轮下来 AI 腔反而更多。
         improved = new_score < before_score or len(new_ai) < len(before_ai)
+        if prefer_ai and len(new_ai) > len(before_ai):
+            improved = False
         if new_w >= now * 0.85 and improved:
             # 保证节头统一
             hl = new_text.splitlines()
