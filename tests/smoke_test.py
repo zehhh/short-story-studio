@@ -461,7 +461,7 @@ def main() -> int:
     _test_continuity_pov_and_tail()
     _test_patch_verified_rejects_bad_patch()
     _test_audit_lead_detection()
-    _test_score_from_issues_consistent()
+    _test_score_cap_by_high()
     _test_state_causeless_and_time_hint()
 
     print("\n全部冒烟测试通过 ✔")
@@ -552,39 +552,26 @@ def _test_join_sections_keeps_preamble():
     print("[ok] 逐节回写保住序言（书名行 + 导语），且不被书名行里的裸编号误定位")
 
 
-def _test_score_from_issues_consistent():
-    """终审分必须能由问题清单确定性折算出来（可复核、可回归）。
+def _test_score_cap_by_high():
+    """终审分按 high 级硬伤条数封顶（判官分保留相对次序，硬伤多就压天花板）。
 
-    历史缺陷：终审分是判官随口给的印象分，与它自己给的问题清单背向走——
-    v11 实测同一稿「high 从 4 处涨到 6 处」，分数却从 58 涨到 68。
-    分数是印象、清单是证据，两者打架时写手无从下手。
+    历史缺陷：先用「按清单逐条扣分」折算，v12 三轮 5/6/5 处 high → 40/46/40，
+    v13 更抖成 24/32/15/43 —— 清单条数本身是噪声（一处问题常被拆成两三条），
+    折算出的分数跟着抖，修复循环既看不出改进，也没法拿来做验收阈值。
     """
-    from studio.pipeline import score_from_issues
+    from studio.pipeline import score_cap_by_high
 
-    assert score_from_issues([]) is None, "空清单应返回 None（表示没有可折算的依据）"
-    assert score_from_issues(None) is None
-    # high −9 / mid −3 / low −1：6×9 + 5×3 + 2×1 = 71 → 未触上限 → 29
-    mixed = ([{"severity": "high"}] * 6 + [{"severity": "mid"}] * 5
-             + [{"severity": "low"}] * 2)
-    assert score_from_issues(mixed) == 29.0, score_from_issues(mixed)
-    # 同一份清单必须给同一个分（不许受调用顺序/随机影响）
-    assert score_from_issues(mixed) == score_from_issues(mixed)
-    assert score_from_issues([{"severity": "high"}] * 2) == 82.0
-    # 校准点：2 high + 3 mid = 73（可发）；3 high + 2 mid = 67（差一口气）
-    assert score_from_issues([{"severity": "high"}] * 2
-                             + [{"severity": "mid"}] * 3) == 73.0
-    assert score_from_issues([{"severity": "high"}] * 3
-                             + [{"severity": "mid"}] * 2) == 67.0
-    # v12 实测配比：5 high + 7 mid = 34（人工判「不可发」）
-    assert score_from_issues([{"severity": "high"}] * 5
-                             + [{"severity": "mid"}] * 7) == 34.0
-    # 缺 severity 的按 mid 计（模型偶尔漏字段，不能因此白送分）
-    assert score_from_issues([{"note": "没写严重度"}]) == 97.0
-    assert score_from_issues([{"severity": "high"}] * 20) == 15.0, "扣分封顶 85，保底 15"
-    # 轮次之间必须保持区分度（不能一律封底 40，那样看不出改进）
-    assert (score_from_issues([{"severity": "high"}] * 5)
-            != score_from_issues([{"severity": "high"}] * 6)), "5 处与 6 处不许同分"
-    print("[ok] 终审分可由问题清单确定性折算（high−9 / mid−3 / low−1，保底 15 且保持区分度）")
+    assert score_cap_by_high(0) is None, "没有硬伤就不许封顶"
+    # 3 处起逐级压下：55 / 50 / 45，5 处以上一律不及格
+    assert [score_cap_by_high(n) for n in (1, 2, 3, 4, 5)] == [68.0, 62.0, 55.0, 50.0, 45.0]
+    assert score_cap_by_high(9) == 45.0, "硬伤再多也不越过 45"
+    # 单调不增：硬伤越多，天花板越低
+    caps = [score_cap_by_high(n) for n in range(6)]
+    vals = [c for c in caps if c is not None]
+    assert vals == sorted(vals, reverse=True), f"封顶必须单调：{caps}"
+    # 真实配比校准：v13 终审 3 处 high 时，判官 66 分被压到 55（不可发）
+    assert min(66.0, score_cap_by_high(3)) == 55.0
+    print("[ok] 终审分按硬伤条数封顶（0 不封顶 / 3→55 / 5→45，单调）")
 
 
 def _test_audit_lead_detection():

@@ -4466,39 +4466,29 @@ def assemble(project: Project) -> tuple[str, list[dict]]:
     return "\n".join(parts).strip(), stats
 
 
-# 权重由来：high = 硬伤（读者会当场看出错），一处就该压下一个档；
-# mid = 表达问题，三处才抵一处硬伤。v12 实测 5 high + 7 mid 落在 34 分，
-# 与人工判「不可发」一致；2 high + 3 mid 落在 73 分，与人工判「可发」一致。
-_SEV_PENALTY = {"high": 9.0, "mid": 3.0, "low": 1.0}
-# 扣分上限 85（保底 15）。原先封底 40 分，问题在于**失去区分度**：v12 三轮
-# 分别 5/6/5 处 high，折算出来 40/46/40，修复循环看不出自己有没有改进。
-# 上限放宽后差稿仍明确不及格，但轮次之间可比。
-_SEV_PENALTY_CAP = 85.0
+# 硬伤条数 → 分数上限。0–2 处保留判官原分（这一档它有分辨力），3 处起每多
+# 一处压一个档次，5 处以上一律不及格：
+#   3 处 → 55（不可发，但要改的清单很短）
+#   4 处 → 50
+#   5 处 → 45
+# 每条硬伤都是「读者会当场看出错」的东西，判官给到 66 分说明它没把硬伤当回事。
+_SCORE_CAP_BY_HIGH = {5: 45.0, 4: 50.0, 3: 55.0, 2: 62.0, 1: 68.0}
 
 
-def score_from_issues(issues, base: float = 100.0) -> float | None:
-    """把终审的问题清单**确定性折算**成分数（百分制），清单为空返回 None。
+def score_cap_by_high(n_high: int) -> float | None:
+    """按 high 级硬伤条数给终审分封顶；0 处返回 None（不封顶）。
 
-    为什么不能只用判官随口给的分：v11 实测同一稿「high 从 4 处涨到 6 处」，
-    分数却从 58 涨到 68 —— 两个指标背向走，说明分数是印象、清单才是证据。
-    写手照着高分去改，改的是印象；照着清单去改，改的才是病。
-
-    折算口径（与 prompts/review.md 的判据定义一致）：
-      high −9 / mid −3 / low −1，从 100 分扣起，**最多扣 85 分**（保底 15）。
-    校准点：2 处 high + 3 处 mid = 73 分（可发）；3 处 high + 2 处 mid = 67 分
-    （差一口气）；5 处 high + 7 处 mid = 34 分（不可发）；不封顶到「全 40 分」，
-    所以轮次之间能量出改进。
-    换谁判、判几次都一样，可复核、可比较、可回归。
+    为什么不用「按清单逐条扣分」：试过 high−9/mid−3 从 100 扣起，v12 三轮
+    分别 5/6/5 处 high 折算成 40/46/40，v13 更是 24/32/15/43 —— 清单条数本身
+    是噪声（一处问题常被拆成两三条），折算出来的分数跟着抖，修复循环既看不出
+    改进、也没法拿它做验收阈值。改用「封顶」：判官分的相对次序保留下来，
+    只在硬伤过多时把天花板压下去，稳定、可解释、和人工判稿顺序一致。
     """
-    if not isinstance(issues, list) or not issues:
-        return None
-    pen = 0.0
-    for i in issues:
-        if not isinstance(i, dict):
-            continue
-        pen += _SEV_PENALTY.get(str(i.get("severity") or "mid").strip(), 3.0)
-    pen = min(pen, _SEV_PENALTY_CAP)
-    return max(0.0, min(base, base - pen))
+    n = int(n_high or 0)
+    for k in (5, 4, 3, 2, 1):
+        if n >= k:
+            return _SCORE_CAP_BY_HIGH[k]
+    return None
 
 
 def _det_hits_count(cfg: dict, text: str) -> int:
@@ -4924,21 +4914,28 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
             reps.sort(key=lambda x: float(x.get("score") or 0))
             best = reps[len(reps) // 2]
             # 分数与清单必须自洽：模型给的 score 是印象分，issues 是可核验的证据。
-            # 两者差 >10 分时以清单为准（并在日志里明说改了多少），否则保留模型分。
-            _rub = score_from_issues(best.get("issues"))
-            if _rub is not None:
-                try:
-                    _raw = float(best.get("score") or 0)
-                except (TypeError, ValueError):
-                    _raw = 0.0
+            # 口径不是「用清单重算一个分」（试过：清单条数一多就把分压到 15–45，
+            # 轮次之间全是噪声，看不出改进），而是**按硬伤条数给分数封顶**——
+            # 0–2 处硬伤保留判官原分（它在这一段有分辨力），3 处起依次压到
+            # 55/50/45，5 处以上一律不及格。硬伤是「读者会当场看出错」的东西，
+            # 有一处就该压一个档次，这个阶梯和人工判稿的顺序一致。
+            _hi = sum(1 for _i in (best.get("issues") or [])
+                      if str((_i or {}).get("severity") or "mid").strip() == "high")
+            _cap = score_cap_by_high(_hi)
+            try:
+                _raw = float(best.get("score") or 0)
+            except (TypeError, ValueError):
+                _raw = 0.0
+            if _cap is not None and _raw > _cap:
                 best["score_judge"] = best.get("score")
-                if abs(_raw - _rub) > 10:
-                    best["score"] = round(_rub, 1)
-                    best["score_src"] = "issues"
-                    print(f"[stage] 终审分按问题清单折算：{_raw:g} → {_rub:g}"
-                          f"（与清单差 {abs(_raw - _rub):g} 分，清单可核验优先）")
-                else:
-                    best["score_src"] = "judge"
+                best["score"] = _cap
+                best["score_src"] = "capped_high"
+                best["high_count"] = _hi
+                print(f"[stage] 终审分按硬伤封顶：{_raw:g} → {_cap:g}"
+                      f"（{_hi} 处 high 硬伤，多给的分不可信）")
+            else:
+                best["score_src"] = "judge"
+                best["high_count"] = _hi
             return best
 
         def _pad_words(text: str, floor_w: int) -> str:
