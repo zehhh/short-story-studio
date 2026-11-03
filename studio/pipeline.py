@@ -15,6 +15,7 @@ from pathlib import Path
 NL = chr(10)
 from . import agents, continuity as _contin, drafts as _drafts, foreshadow as _foreshadow
 from . import hotspots, knowledge, langqa
+from . import state as _state
 from . import title_gate as _TG
 from . import review as review_mod
 from .config import data_path, load_config
@@ -2610,10 +2611,14 @@ def _extract_facts(llm: BaseLLM, text: str, keep: list[str]) -> list[str]:
 
 
 _REPLAY_SYS = (
-    "你是长篇连载的衔接校对。只判断一件事：这一节的开头，是不是在**重演**上一节"
-    "已经写完的事件。重演指：同一场戏、同一个动作、同一个信息再来一遍（哪怕换了"
-    "说法），时间线因此原地倒退。正常的「接着往下写」不算重演——上一节停在半途，"
-    "这一节把它顺势写完，是正常承接。"
+    "你是长篇连载的衔接校对。只看两件事：\n"
+    "① 这一节的开头，是不是在**重演**上一节已经写完的事件。重演指：同一场戏、"
+    "同一个动作、同一个信息再来一遍（哪怕换了说法），时间线因此原地倒退。"
+    "正常的「接着往下写」不算重演——上一节停在半途，这一节把它顺势写完，是正常承接。\n"
+    "② 这一节里有没有**无因之果**：人物突然使出一种前文从没交代过的本事"
+    "（会改脉、会易容、会点穴），或者凭空拿出一件前文没出现过的东西"
+    "（银针、令牌、密信）。必须在本节或上一节里都找不到来历才算，"
+    "只要有一处交代过（谁给的、什么时候备下的、跟谁学的）就不算。"
 )
 
 _REPLAY_USER = """上一节正文（结尾部分）：
@@ -2622,42 +2627,52 @@ _REPLAY_USER = """上一节正文（结尾部分）：
 这一节开头：
 {cur}
 
-只输出 JSON：{{"replay": true 或 false, "why": "不超过 40 字的理由", "rewrite_hint": "若 replay=true，给出这一节开头应该从哪一刻写起（不超过 40 字）"}}"""
+只输出 JSON：{{"replay": true 或 false, "why": "不超过 40 字的理由", "rewrite_hint": "若 replay=true，给出这一节开头应该从哪一刻写起（不超过 40 字）", "causeless": [{{"item": "凭空出现的本事或东西", "why": "为什么算凭空（不超过 30 字）"}}]}}"""
 
 
-def _sec_replay(llm: BaseLLM, prev_text: str, cur_text: str) -> dict:
-    """判「这一节开头有没有重演上一节」。
+def _sec_boundary(llm: BaseLLM, prev_text: str, cur_text: str) -> dict:
+    """判「这一节开头有没有重演上一节」+「本节有没有无因之果」。
 
     为什么要用 LLM 判而不是词法判：实测过三种确定性做法——
     最长公共子串（重演时句子是改写的，抓不到）、句级 bigram Jaccard
     （「碗沿贴上嘴唇」与「碗沿磕在唇齿间」只共享「碗沿」）、
-    时间词表（中文叙事里时间关系不靠词标）。终审 4 轮里这条硬伤每轮都出现，
-    是当前唯一的稳定失分项，值得花 9 次轻模型调用换来。
+    时间词表（中文叙事里时间关系不靠词标，全库 35 篇误报 47 次，
+    见 `studio/state.py` 顶部结论）。终审 4 轮里这条硬伤每轮都出现，
+    是当前唯一的稳定失分项，值得花每节 1 次轻模型调用换来。
 
-    成本：每节 1 次、输入约 800 token、输出约 60 token。
+    无因之果的**确定性可证那一半**（前文没提过 + 首次出现 + 当场就用 + 没交代
+    来历）由 `studio.state.causeless()` 零成本先筛一遍，这里只兜语义层面
+    （「这个东西不属于这个人」）。
+
+    成本：每节 1 次、输入约 900 token、输出约 80 token。
     """
     prev_text = (prev_text or "").strip()
     cur_text = (cur_text or "").strip()
     if len(prev_text) < 200 or len(cur_text) < 200:
-        return {"replay": False}
+        return {"replay": False, "causeless": []}
     try:
         raw = llm.chat(_REPLAY_SYS,
                        _REPLAY_USER.format(prev=prev_text[-900:], cur=cur_text[:1300]),
                        json_mode=True)
-    except Exception as e:  # noqa: BLE001 —— 判不了就当没重演，不影响写作
-        print(f"[replay] ⚠ 衔接判重演失败（{type(e).__name__}），本节跳过")
-        return {"replay": False}
+    except Exception as e:  # noqa: BLE001 —— 判不了就当没问题，不影响写作
+        print(f"[boundary] ⚠ 衔接判据失败（{type(e).__name__}），本节跳过")
+        return {"replay": False, "causeless": []}
     from .util import extract_json
 
     try:
         d = extract_json(raw or "")
     except Exception:  # noqa: BLE001
-        return {"replay": False}
+        return {"replay": False, "causeless": []}
     if not isinstance(d, dict):
-        return {"replay": False}
+        return {"replay": False, "causeless": []}
+    cl = []
+    for c in (d.get("causeless") or [])[:2]:
+        if isinstance(c, dict) and c.get("item"):
+            cl.append({"item": str(c["item"])[:20], "why": str(c.get("why") or "")[:40]})
     return {"replay": bool(d.get("replay")),
             "why": str(d.get("why") or "")[:60],
-            "hint": str(d.get("rewrite_hint") or "")[:60]}
+            "hint": str(d.get("rewrite_hint") or "")[:60],
+            "causeless": cl}
 
 
 def _facts_block(facts: list[str]) -> str:
@@ -2843,10 +2858,10 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             BAN_PROPS=_ban_props_text(cfg),
             SEC_LO=lo_i, SEC_HI=hi_i,
             SEC_LO_MIN=int(tgt * 0.75), SEC_HI_MAX=int(tgt * 1.25),
-            PER_WORDS=tgt,
             CAST=_cast_block(cast, sec_cast),
             CARRY_IN=prev_carry or "（本节是第一节，无交接项）",
             CARRY_OUT=carry_out or "（计划未给本节交接项）",
+            PREV_TIME=_state.prev_time_hint(prev_body) or "（上一节没有明确时点，正常往下写）",
         )
 
         best, best_pb, best_off = "", None, 10 ** 9
@@ -2884,17 +2899,39 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
                 problems = problems + [
                     f"节尾把前文又讲了一遍：「{_tr[:24]}」——最后一段只许用动作或"
                     "台词把 end_hook 落下，不许复述本节已写过的场景或台词"]
-            # 相邻小节重演上一节的戏：终审 4 轮里每轮都报，是当前唯一稳定失分项
-            # （06/07 各写一遍赐汤、07/08 各写一遍发作）。词法判据实测全失效，
+            # 整节内心独白：v12 第 05 节对白占比 0.045，其余八节 0.16–0.50，
+            # 终审判词是「整节几乎全是内心独白与背景交代，无对话无动作推进，
+            # 节奏塌陷」。阈值 0.10 在真实成稿上区分度干净（只有那一节被拦）。
+            from .language import dialog_ratio as _dialog_ratio
+            _dr = _dialog_ratio(body)
+            if _dr < 0.10:
+                problems = problems + [
+                    f"整节几乎没有对话（对白占比 {_dr:.2f}）：这一节全是内心活动或"
+                    "背景交代，读者会觉得停在原地。把要交代的信息换成人物对话或"
+                    "具体动作，至少让两个人真正说上几句话"]
+            # 相邻小节重演上一节的戏 / 无因之果：终审 4 轮里每轮都报，是当前唯一
+            # 稳定失分项（06/07 各写一遍赐汤、07/08 各写一遍发作；「袖中银针
+            # 弹出」前文从没提过银针）。词法判据实测全失效（见 state.py 顶部），
             # 这里用一次轻模型调用判衔接；每轮都判（重写后仍重演的会被再拦一次）。
             if prev_body:
-                _rp = _sec_replay(resolve_llm(cfg, llm, "light"), prev_body, body)
-                if _rp.get("replay"):
-                    print(f"[replay] 小节{no:02d} 开头疑似重演上一节：{_rp.get('why')}")
+                _bp = _sec_boundary(resolve_llm(cfg, llm, "light"), prev_body, body)
+                if _bp.get("replay"):
+                    print(f"[boundary] 小节{no:02d} 开头疑似重演上一节：{_bp.get('why')}")
                     problems = problems + [
-                        f"这一节开头在重演上一节已经写完的戏（{_rp.get('why') or '同一场戏又写一遍'}）"
-                        f"——{_rp.get('hint') or '从上一节结束之后的那一刻写起，不要再交代一遍'}"
+                        f"这一节开头在重演上一节已经写完的戏（{_bp.get('why') or '同一场戏又写一遍'}）"
+                        f"——{_bp.get('hint') or '从上一节结束之后的那一刻写起，不要再交代一遍'}"
                         "。时间线只能往前走，不许原地倒退"]
+                for _cl in _bp.get("causeless") or []:
+                    print(f"[boundary] 小节{no:02d} 疑似无因之果：{_cl.get('item')}（{_cl.get('why')}）")
+                    problems = problems + [
+                        f"「{_cl.get('item')}」凭空出现（{_cl.get('why') or '前文没有交代过'}）"
+                        "——新本事、新东西第一次露面，必须在本节里用一句话交代来历"
+                        "（谁教的、谁给的、什么时候备下的），不能直接拿来用"]
+            # 无因之果的确定性那一半：前文没提过 + 本节首次出现 + 当场就用 +
+            # 这句没交代来历。全库 35 篇只命中 3 处，其中真阳性明确。
+            if prev_body:
+                for _hit in _state.causeless(prev_body, body)[:2]:
+                    problems = problems + [_state.hint_causeless(_hit)]
             # 语言病在节级只给**一次**修正机会。实测：整节盲改三轮压不住 AI 口癖
             # （「嘴角勾起一抹」三轮全在），白烧 token 还照样带病交付。真正的去处是
             # 整稿 `_ai_deflavor`——它把命中词与所在句一起喂给模型。这里第二次起放行，
@@ -4225,6 +4262,19 @@ def _rewrite_density_sections(cfg: dict, llm: BaseLLM, project: Project, full: s
         improved = new_score < before_score or len(new_ai) < len(before_ai)
         if prefer_ai and len(new_ai) > len(before_ai):
             improved = False
+        # 去味改写必须过衔接复检。实测：v12 第 02 节**写的时候衔接判据是通过的**，
+        # 是这一层去味改写把开头改回了「碗里的黑汁还在微微晃动」，重演了第 01 节
+        # 整场戏——终审随即报「02 整节是 01 的重复」。写完之后的任何重写都可能
+        # 破坏衔接，所以验收条件里必须有这一条（同决策 37：改动必须过外部验证）。
+        if improved and new_w >= now * 0.85:
+            _prev = next((s for s in secs if s["no"] == no - 1), None)
+            if _prev is not None:
+                _bp = _sec_boundary(resolve_llm(cfg, llm, "light"),
+                                    _body_of(_prev), new_text)
+                if _bp.get("replay"):
+                    improved = False
+                    print(f"[density] 小节{no:02d} 去味后重演上一节"
+                          f"（{_bp.get('why') or '开头倒回上一节'}），保留原文")
         if new_w >= now * 0.85 and improved:
             # 保证节头统一
             hl = new_text.splitlines()
@@ -4416,11 +4466,14 @@ def assemble(project: Project) -> tuple[str, list[dict]]:
     return "\n".join(parts).strip(), stats
 
 
-_SEV_PENALTY = {"high": 8.0, "mid": 3.0, "low": 1.0}
-# 扣分上限：60 分（即最低 40 分）。判官爱把同一处问题拆成几条报（v11 一份稿报了
-# 10 处 high，其中两处说的是同一个「指节敲桌面」），线性扣到 0 会让差稿看起来
-# 像「数学坏了」（14 分），而 40 分既明确不及格、又保留稿子之间的区分度。
-_SEV_PENALTY_CAP = 60.0
+# 权重由来：high = 硬伤（读者会当场看出错），一处就该压下一个档；
+# mid = 表达问题，三处才抵一处硬伤。v12 实测 5 high + 7 mid 落在 34 分，
+# 与人工判「不可发」一致；2 high + 3 mid 落在 73 分，与人工判「可发」一致。
+_SEV_PENALTY = {"high": 9.0, "mid": 3.0, "low": 1.0}
+# 扣分上限 85（保底 15）。原先封底 40 分，问题在于**失去区分度**：v12 三轮
+# 分别 5/6/5 处 high，折算出来 40/46/40，修复循环看不出自己有没有改进。
+# 上限放宽后差稿仍明确不及格，但轮次之间可比。
+_SEV_PENALTY_CAP = 85.0
 
 
 def score_from_issues(issues, base: float = 100.0) -> float | None:
@@ -4431,9 +4484,10 @@ def score_from_issues(issues, base: float = 100.0) -> float | None:
     写手照着高分去改，改的是印象；照着清单去改，改的才是病。
 
     折算口径（与 prompts/review.md 的判据定义一致）：
-      high −8 / mid −3 / low −1，从 100 分扣起，**最多扣 60 分**（保底 40）。
-    校准点：2 处 high + 3 处 mid = 75 分（过 72 门槛的最高配）；
-    3 处 high + 2 处 mid = 70 分（差一口气）；6 处 high = 52 分。
+      high −9 / mid −3 / low −1，从 100 分扣起，**最多扣 85 分**（保底 15）。
+    校准点：2 处 high + 3 处 mid = 73 分（可发）；3 处 high + 2 处 mid = 67 分
+    （差一口气）；5 处 high + 7 处 mid = 34 分（不可发）；不封顶到「全 40 分」，
+    所以轮次之间能量出改进。
     换谁判、判几次都一样，可复核、可比较、可回归。
     """
     if not isinstance(issues, list) or not issues:

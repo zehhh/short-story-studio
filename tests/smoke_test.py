@@ -462,6 +462,7 @@ def main() -> int:
     _test_patch_verified_rejects_bad_patch()
     _test_audit_lead_detection()
     _test_score_from_issues_consistent()
+    _test_state_causeless_and_time_hint()
 
     print("\n全部冒烟测试通过 ✔")
     return 0
@@ -562,22 +563,28 @@ def _test_score_from_issues_consistent():
 
     assert score_from_issues([]) is None, "空清单应返回 None（表示没有可折算的依据）"
     assert score_from_issues(None) is None
-    # high −8 / mid −3 / low −1：6×8 + 5×3 + 2×1 = 65 → 超过 60 的扣分上限 → 保底 40
+    # high −9 / mid −3 / low −1：6×9 + 5×3 + 2×1 = 71 → 未触上限 → 29
     mixed = ([{"severity": "high"}] * 6 + [{"severity": "mid"}] * 5
              + [{"severity": "low"}] * 2)
-    assert score_from_issues(mixed) == 40.0, score_from_issues(mixed)
+    assert score_from_issues(mixed) == 29.0, score_from_issues(mixed)
     # 同一份清单必须给同一个分（不许受调用顺序/随机影响）
     assert score_from_issues(mixed) == score_from_issues(mixed)
-    assert score_from_issues([{"severity": "high"}] * 2) == 84.0
-    # 校准点：2 high + 3 mid = 75（刚好过 72）；3 high + 2 mid = 70（差一口气）
+    assert score_from_issues([{"severity": "high"}] * 2) == 82.0
+    # 校准点：2 high + 3 mid = 73（可发）；3 high + 2 mid = 67（差一口气）
     assert score_from_issues([{"severity": "high"}] * 2
-                             + [{"severity": "mid"}] * 3) == 75.0
+                             + [{"severity": "mid"}] * 3) == 73.0
     assert score_from_issues([{"severity": "high"}] * 3
-                             + [{"severity": "mid"}] * 2) == 70.0
+                             + [{"severity": "mid"}] * 2) == 67.0
+    # v12 实测配比：5 high + 7 mid = 34（人工判「不可发」）
+    assert score_from_issues([{"severity": "high"}] * 5
+                             + [{"severity": "mid"}] * 7) == 34.0
     # 缺 severity 的按 mid 计（模型偶尔漏字段，不能因此白送分）
     assert score_from_issues([{"note": "没写严重度"}]) == 97.0
-    assert score_from_issues([{"severity": "high"}] * 20) == 40.0, "扣分封顶 60，保底 40"
-    print("[ok] 终审分可由问题清单确定性折算（high−8 / mid−3 / low−1，封底 40）")
+    assert score_from_issues([{"severity": "high"}] * 20) == 15.0, "扣分封顶 85，保底 15"
+    # 轮次之间必须保持区分度（不能一律封底 40，那样看不出改进）
+    assert (score_from_issues([{"severity": "high"}] * 5)
+            != score_from_issues([{"severity": "high"}] * 6)), "5 处与 6 处不许同分"
+    print("[ok] 终审分可由问题清单确定性折算（high−9 / mid−3 / low−1，保底 15 且保持区分度）")
 
 
 def _test_audit_lead_detection():
@@ -765,6 +772,36 @@ def _test_patch_verified_rejects_bad_patch():
     assert P._det_hits_count(cfg, clean) == 0
     assert P._det_hits_count(cfg, "就在这时，空气凝固了，嘴角勾起一抹冷笑。") > 0
     print("[ok] 补丁逐条局部体检：坏补丁拒绝留痕 / 好补丁应用 / 确定性缺陷计数")
+
+
+def _test_state_causeless_and_time_hint():
+    """无因之果判定 + 时间锚注入。
+
+    实测背景：v11 终审剩下的 high 硬伤里，「袖中银针弹出击碎瓷壶」是前文从没
+    提过银针（无因之果），「小节04又回到天刚亮」是时间线重铺。前者可以确定性判
+    （全库 35 篇只命中 3 处，真阳性明确），后者不能——纯词法比较在全库误报 47 次，
+    只能做上下文注入，判定交给轻模型（见 studio/state.py 顶部）。
+    """
+    from studio import state
+
+    prev = "我把门带上，屋里只剩一盏灯。"
+    # 前文没提过 + 首次出现 + 当场就用 + 没交代来历 → 报
+    hits = state.causeless(prev, "我猛地起身，袖中银针顺势弹出，击碎了那青花瓷壶。")
+    assert [h["item"] for h in hits] == ["银针"], f"银针必须报出来，实测 {hits}"
+
+    # 同一句里交代了来历 → 不报
+    assert state.causeless(prev, "我取出母亲留下的那枚银针，将它弹出。") == [], "有来历不许报"
+    # 前文出现过 → 不报
+    assert state.causeless("他把银针收进袖中。", "银针弹出，击中瓷壶。") == []
+    # 只是出现在描写里、没被当工具用 → 不报
+    assert state.causeless(prev, "月光照在焦土上，像毒药的痕迹。") == []
+    # 假设句 → 不报
+    assert state.causeless(prev, "若是有人提前备下解药，或者这根本就不是毒。") == []
+
+    hint = state.prev_time_hint("他一直坐到入夜，灯芯爆了个花。")
+    assert "入夜" in hint and "次日" in hint, f"时间锚必须带上收尾时点，实测 {hint!r}"
+    assert state.prev_time_hint("他推门进来。") == "", "没有时点词时不许编一个出来"
+    print("[ok] 无因之果判定（真阳性/有来历/前文已见/仅描写/假设句）+ 时间锚注入")
 
 
 if __name__ == "__main__":
