@@ -381,6 +381,17 @@
       "label": "作者解说·比喻上价值",
       "severity": "mid",
       "suggest": "把比喻换成具体动作或环境细节"
+    },
+    {
+      "pattern": "[A-Za-z][A-Za-z'’]{2,}",
+      "label": "古言·英文单词混入",
+      "severity": "high",
+      "suggest": "换成中文说法；英文单词出现在古装正文里读者会立刻出戏",
+      "genre": [
+        "guyan",
+        "xianxia",
+        "wuxia"
+      ]
     }
   ],
   "freq": {
