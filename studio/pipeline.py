@@ -4416,6 +4416,37 @@ def assemble(project: Project) -> tuple[str, list[dict]]:
     return "\n".join(parts).strip(), stats
 
 
+_SEV_PENALTY = {"high": 8.0, "mid": 3.0, "low": 1.0}
+# 扣分上限：60 分（即最低 40 分）。判官爱把同一处问题拆成几条报（v11 一份稿报了
+# 10 处 high，其中两处说的是同一个「指节敲桌面」），线性扣到 0 会让差稿看起来
+# 像「数学坏了」（14 分），而 40 分既明确不及格、又保留稿子之间的区分度。
+_SEV_PENALTY_CAP = 60.0
+
+
+def score_from_issues(issues, base: float = 100.0) -> float | None:
+    """把终审的问题清单**确定性折算**成分数（百分制），清单为空返回 None。
+
+    为什么不能只用判官随口给的分：v11 实测同一稿「high 从 4 处涨到 6 处」，
+    分数却从 58 涨到 68 —— 两个指标背向走，说明分数是印象、清单才是证据。
+    写手照着高分去改，改的是印象；照着清单去改，改的才是病。
+
+    折算口径（与 prompts/review.md 的判据定义一致）：
+      high −8 / mid −3 / low −1，从 100 分扣起，**最多扣 60 分**（保底 40）。
+    校准点：2 处 high + 3 处 mid = 75 分（过 72 门槛的最高配）；
+    3 处 high + 2 处 mid = 70 分（差一口气）；6 处 high = 52 分。
+    换谁判、判几次都一样，可复核、可比较、可回归。
+    """
+    if not isinstance(issues, list) or not issues:
+        return None
+    pen = 0.0
+    for i in issues:
+        if not isinstance(i, dict):
+            continue
+        pen += _SEV_PENALTY.get(str(i.get("severity") or "mid").strip(), 3.0)
+    pen = min(pen, _SEV_PENALTY_CAP)
+    return max(0.0, min(base, base - pen))
+
+
 def _det_hits_count(cfg: dict, text: str) -> int:
     """整稿的确定性缺陷**条数**（langqa high/mid 命中总数，不是标签种数）。
 
@@ -4837,7 +4868,24 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
             if not reps:
                 raise ValueError("体检输出非对象")
             reps.sort(key=lambda x: float(x.get("score") or 0))
-            return reps[len(reps) // 2]
+            best = reps[len(reps) // 2]
+            # 分数与清单必须自洽：模型给的 score 是印象分，issues 是可核验的证据。
+            # 两者差 >10 分时以清单为准（并在日志里明说改了多少），否则保留模型分。
+            _rub = score_from_issues(best.get("issues"))
+            if _rub is not None:
+                try:
+                    _raw = float(best.get("score") or 0)
+                except (TypeError, ValueError):
+                    _raw = 0.0
+                best["score_judge"] = best.get("score")
+                if abs(_raw - _rub) > 10:
+                    best["score"] = round(_rub, 1)
+                    best["score_src"] = "issues"
+                    print(f"[stage] 终审分按问题清单折算：{_raw:g} → {_rub:g}"
+                          f"（与清单差 {abs(_raw - _rub):g} 分，清单可核验优先）")
+                else:
+                    best["score_src"] = "judge"
+            return best
 
         def _pad_words(text: str, floor_w: int) -> str:
             """补丁/精炼后字数被压到下限以下时，确定性逐节扩写补回（只加新对话/新动作/

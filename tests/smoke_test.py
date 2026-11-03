@@ -461,6 +461,7 @@ def main() -> int:
     _test_continuity_pov_and_tail()
     _test_patch_verified_rejects_bad_patch()
     _test_audit_lead_detection()
+    _test_score_from_issues_consistent()
 
     print("\n全部冒烟测试通过 ✔")
     return 0
@@ -548,6 +549,35 @@ def _test_join_sections_keeps_preamble():
     assert "字数：10174" in out, "序言里的元信息行被丢掉了（find 命中了编号）"
     assert "第一节的正文" in out and "第二节的正文" in out, "正文被丢了"
     print("[ok] 逐节回写保住序言（书名行 + 导语），且不被书名行里的裸编号误定位")
+
+
+def _test_score_from_issues_consistent():
+    """终审分必须能由问题清单确定性折算出来（可复核、可回归）。
+
+    历史缺陷：终审分是判官随口给的印象分，与它自己给的问题清单背向走——
+    v11 实测同一稿「high 从 4 处涨到 6 处」，分数却从 58 涨到 68。
+    分数是印象、清单是证据，两者打架时写手无从下手。
+    """
+    from studio.pipeline import score_from_issues
+
+    assert score_from_issues([]) is None, "空清单应返回 None（表示没有可折算的依据）"
+    assert score_from_issues(None) is None
+    # high −8 / mid −3 / low −1：6×8 + 5×3 + 2×1 = 65 → 超过 60 的扣分上限 → 保底 40
+    mixed = ([{"severity": "high"}] * 6 + [{"severity": "mid"}] * 5
+             + [{"severity": "low"}] * 2)
+    assert score_from_issues(mixed) == 40.0, score_from_issues(mixed)
+    # 同一份清单必须给同一个分（不许受调用顺序/随机影响）
+    assert score_from_issues(mixed) == score_from_issues(mixed)
+    assert score_from_issues([{"severity": "high"}] * 2) == 84.0
+    # 校准点：2 high + 3 mid = 75（刚好过 72）；3 high + 2 mid = 70（差一口气）
+    assert score_from_issues([{"severity": "high"}] * 2
+                             + [{"severity": "mid"}] * 3) == 75.0
+    assert score_from_issues([{"severity": "high"}] * 3
+                             + [{"severity": "mid"}] * 2) == 70.0
+    # 缺 severity 的按 mid 计（模型偶尔漏字段，不能因此白送分）
+    assert score_from_issues([{"note": "没写严重度"}]) == 97.0
+    assert score_from_issues([{"severity": "high"}] * 20) == 40.0, "扣分封顶 60，保底 40"
+    print("[ok] 终审分可由问题清单确定性折算（high−8 / mid−3 / low−1，封底 40）")
 
 
 def _test_audit_lead_detection():
