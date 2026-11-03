@@ -459,6 +459,8 @@ def main() -> int:
     _test_section_cast_and_words()
     _test_dedup_guard_reverts_mass_deletion()
     _test_continuity_pov_and_tail()
+    _test_patch_verified_rejects_bad_patch()
+    _test_audit_lead_detection()
 
     print("\n全部冒烟测试通过 ✔")
     return 0
@@ -546,6 +548,41 @@ def _test_join_sections_keeps_preamble():
     assert "字数：10174" in out, "序言里的元信息行被丢掉了（find 命中了编号）"
     assert "第一节的正文" in out and "第二节的正文" in out, "正文被丢了"
     print("[ok] 逐节回写保住序言（书名行 + 导语），且不被书名行里的裸编号误定位")
+
+
+def _test_audit_lead_detection():
+    """体检必须认得成稿.md 的真实版式：导语在第 7 行（**导语**：…）。
+
+    历史缺陷：`audit_text` 取固定前 6 行找「导语」，而 成稿.md 是
+    标题 / 空行 / 平台行 / 空行 / 一句话故事 / 空行 / 导语 —— 恰好落在窗口外，
+    于是每篇 B 级稿都被体检判成「A结构/导语 失败」→ C 不可投，
+    与流水线自己的 submission()（B 可投）互相打架。判据应改为「第一个节头之前的全部内容」。
+    """
+    from studio import audit
+
+    full = "\n".join([
+        "# 封妃当日太后赐我一碗避子汤",
+        "",
+        "> 平台：知乎盐选 | 字数：9144 | 题材：宫廷权谋 | 读者团均分：6.4",
+        "",
+        "**一句话故事**：小官之女入宫封妃，太后赐下避子汤。",
+        "",
+        "**导语**：封妃那日，太后亲手端来一碗避子汤。",
+        "她笑吟吟地说，前头两位，都没熬过三年。",
+        "",
+        "01",
+        "",
+        "第一节正文，写得够长以便被识别成节。",
+        "",
+        "02",
+        "",
+        "第二节正文，也要有一定长度。",
+    ]) + "\n"
+    rep = audit.audit_text(full)
+    lead = [c for c in rep["checks"] if c["name"] == "导语"]
+    assert lead, "体检里没有「导语」这一项"
+    assert lead[0]["ok"], f"导语在第 7 行，体检没认出来：{lead[0]}"
+    print("[ok] 体检认得成稿版式：导语在第 7 行也判「有导语」")
 
 
 def _test_full_ai_hits_excludes_global_labels():
@@ -666,6 +703,38 @@ def _test_continuity_pov_and_tail():
     assert C.carry_hit("袖中藏着的银针", "我摸到那根银针，指尖一凉。"), "尾部中心语必须能召回"
     assert not C.carry_hit("半张残缺信笺", "我推开门，屋里没人。"), "没接住就是没接住"
     print("[ok] 连续性：人称断裂/节尾复述/线索接住 三项判据零误报")
+
+
+def _test_patch_verified_rejects_bad_patch():
+    """补丁必须逐条局部体检：改坏的当场丢弃，不许混在好补丁里一起回滚。
+
+    实测背景：终审补丁轮是「6 条意见一次性盲改 → 整稿重判」，改坏的补丁
+    混在改好的里面，整稿分不动就整轮回滚，好补丁跟着扔，四轮 62→68→66→68
+    原地打转。文献结论一致：没有外部 verifier 的自评自改就是空转。
+    """
+    from studio import pipeline as P
+    from studio.config import load_config
+
+    cfg = load_config(None)
+    clean = ("我推开门，屋里没人。桌上放着半碗凉透的粥，粥面结了一层皮。"
+             "我把碗端起来闻了闻，是昨天的。灶膛里还有一点火星，我蹲下去吹了两下，"
+             "火光慢慢爬上来，照亮墙角那口没盖盖子的水缸。")
+    assert P._span_pen(cfg, clean) == 0, "干净文本不许有病分"
+
+    bad_patch = [{"find": "我推开门，屋里没人。",
+                  "replace": "我推开门，屋里没人，嘴角勾起一抹冷笑，就在这时空气凝固了。"}]
+    kept, n_ok, recs = P._apply_patches_verified(cfg, clean, bad_patch)
+    assert kept == clean, "引入 AI 口癖的补丁必须被拒绝"
+    assert n_ok == 0 and recs and recs[0].get("reason"), "拒绝必须留痕说明原因"
+
+    good_patch = [{"find": "我把碗端起来闻了闻，是昨天的。",
+                   "replace": "我把碗端起来闻了闻，酸味顶鼻子，是昨天的。"}]
+    kept2, n_ok2, _ = P._apply_patches_verified(cfg, clean, good_patch)
+    assert n_ok2 == 1 and "酸味顶鼻子" in kept2, "中性改写必须能应用"
+
+    assert P._det_hits_count(cfg, clean) == 0
+    assert P._det_hits_count(cfg, "就在这时，空气凝固了，嘴角勾起一抹冷笑。") > 0
+    print("[ok] 补丁逐条局部体检：坏补丁拒绝留痕 / 好补丁应用 / 确定性缺陷计数")
 
 
 if __name__ == "__main__":

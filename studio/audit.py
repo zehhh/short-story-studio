@@ -125,7 +125,15 @@ def audit_text(text: str, report: dict | None = None, direction: str = "") -> di
     ratio_len = round(max(lens) / max(min(lens), 1), 2)
     add("A结构", "节长极差", ratio_len <= SECTION_RATIO_MAX, ratio_len,
         f"≤{SECTION_RATIO_MAX}×（最短 {min(lens)} / 最长 {max(lens)}）")
-    head_txt = "\n".join(text.split("\n")[:6])
+    # 「节头之前」才可能装标题和导语。原先取固定前 6 行，而 成稿.md 的版式是
+    # 标题 / 空行 / 平台行 / 空行 / 一句话故事 / 空行 / **导语**：… —— 导语恰好
+    # 排在第 7 行，于是每篇都判「无导语」，把 B 级稿判成 C 不可投（v11 实测）。
+    head_lines: list[str] = []
+    for _line in text.split("\n"):
+        if sec_head_no(_line.strip()):
+            break
+        head_lines.append(_line)
+    head_txt = "\n".join(head_lines)
     add("A结构", "导语", "导语" in head_txt, "有" if "导语" in head_txt else "无", "开头有「导语：」")
 
     # B 语言

@@ -4416,6 +4416,118 @@ def assemble(project: Project) -> tuple[str, list[dict]]:
     return "\n".join(parts).strip(), stats
 
 
+def _det_hits_count(cfg: dict, text: str) -> int:
+    """整稿的确定性缺陷**条数**（langqa high/mid 命中总数，不是标签种数）。
+
+    这是与判官分数**互相独立**的信号：判官有 ±6 分的抖动，确定性命中数没有。
+    修复循环用它判断「这一轮到底有没有把病改少」，避免因为判官不肯涨分
+    就把改好的版本回滚掉（v9/v10 实测有一批回滚属于这种误杀）。
+
+    注意：`_full_ai_hits` 走的是「逐节扫描取并集」，遇到**没有任何节头**的
+    片段会一节都切不出来、直接返回空——用它数条数会得出「很干净」的假象。
+    所以这里自己切节并在切不出来时退化为整段扫描。
+    """
+    try:
+        rules = langqa.load_rules(cfg)
+    except Exception:  # noqa: BLE001
+        return 0
+    try:
+        secs = _split_full_sections(text)
+    except Exception:  # noqa: BLE001
+        secs = []
+    texts = [s.get("text") or "" for s in secs] if secs else [text]
+    n = 0
+    for t in texts:
+        if not t:
+            continue
+        try:
+            rep = langqa.scan(t, rules)
+        except Exception:  # noqa: BLE001
+            continue
+        n += sum(1 for h in (rep.get("hits") or [])
+                 if h.get("severity") in ("high", "mid"))
+    return n
+
+
+def _span_pen(cfg: dict, text: str) -> int:
+    """局部语言缺陷量化：缺陷分 + 3 倍 AI 口癖条数。
+
+    只用确定性判据（零 token），所以可以在每个补丁上做「改前 vs 改后」比较。
+    """
+    try:
+        d = _L.defect_score(text, cfg.get("lang_rules") or {})
+        sc = int(d.get("score", 0))
+    except Exception:  # noqa: BLE001
+        sc = 0
+    try:
+        ai = len((langqa.scan(text) or {}).get("hits") or [])
+    except Exception:  # noqa: BLE001
+        ai = 0
+    return sc + 3 * ai
+
+
+def _apply_patches_verified(cfg: dict, full: str, patches: list[dict],
+                            window: int = 700) -> tuple[str, int, list[dict]]:
+    """逐条应用补丁，**每条都做局部体检**：改完这一处，前后 ±700 字的缺陷只许降不许升。
+
+    为什么要逐条验：终审的补丁轮实测是「盲改」——判官给 6 条意见，模型一次性
+    改 6 处，然后整稿重判。改坏的补丁混在改好的里面，整稿分不动，于是整轮回滚，
+    好补丁也跟着扔了，下一轮再盲改一遍。四轮下来分数 62→68→66→68 原地打转。
+
+    逐条验之后每轮都有**可归因的净收益**：改坏的当场丢掉并留痕，改好的留下。
+    这条设计对应文献里一致的结论（intrinsic self-correction 没有外部信号就是空转，
+    要有 verifier 才行）——我们的 verifier 就是自己的确定性判据。
+
+    window 取 700：足够覆盖一个补丁的上下文语义（一段对话/一个动作序列），
+    又不会把全稿的噪声拉进来。
+    """
+    cur = full
+    kept = 0
+    dropped: list[dict] = []
+
+    def _norm(pp):
+        if isinstance(pp, str):
+            for sep in ("→", "->", "=>"):
+                if sep in pp:
+                    a, b = pp.split(sep, 1)
+                    return a.strip(), b.strip()
+            return None, None
+        if not isinstance(pp, dict):
+            return None, None
+        f = pp.get("find") or ""
+        r = pp.get("replace")
+        if not isinstance(f, str):
+            f = str(f)
+        if r is not None and not isinstance(r, str):
+            r = str(r)
+        return (f, r) if (f and r is not None) else (None, None)
+
+    for p in patches:
+        find, repl = _norm(p)
+        if not find:
+            dropped.append({"find": str(p)[:30], "reason": "字段不完整/格式不对"})
+            continue
+        cand_find = find if cur.count(find) == 1 else None
+        if cand_find is None and cur.count(find.strip()) == 1:
+            cand_find = find.strip()
+        if cand_find is None:
+            dropped.append({"find": find.strip()[:30],
+                            "reason": f"count={cur.count(find.strip())}"})
+            continue
+        idx = cur.find(cand_find)
+        lo, hi = max(0, idx - window), min(len(cur), idx + len(cand_find) + window)
+        cand = cur[:idx] + repl + cur[idx + len(cand_find):]
+        lo2, hi2 = max(0, idx - window), min(len(cand), idx + len(repl) + window)
+        before, after = _span_pen(cfg, cur[lo:hi]), _span_pen(cfg, cand[lo2:hi2])
+        if after <= before:
+            cur = cand
+            kept += 1
+        else:
+            dropped.append({"find": cand_find[:30],
+                            "reason": f"局部缺陷 {before}→{after}，改坏了"})
+    return cur, kept, dropped
+
+
 def _apply_patches(full: str, patches: list[dict]) -> tuple[str, int, list[dict]]:
     """在 full 上确定性应用 search/replace 补丁（未涉及的文字零改动）。
 
@@ -4800,7 +4912,10 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
         # 于是一次女主后宫向实测跑到第 5 轮仍未到 72 分，累计烧掉 15 万 output token。
         # ①绝对轮次上限 6（与 fix_rounds 取小）；②相对起点的累计增益 <3 分即判定为
         # 抖动式微涨，收敛终止（保证"明显在改好"的稿子仍然修得下去）。
-        ABS_FIX_ROUNDS = 6
+        # 修正轮数不设硬上限（用户要求）：真正的止损靠「可归因净收益」——
+        # 每轮补丁逐条验过、改坏的丢掉，没有净收益就收敛终止（见下方守卫）。
+        # 留一个很高的保险丝，防止判官抖动导致无限续命。
+        ABS_FIX_ROUNDS = 20
         MIN_TOTAL_GAIN = 3.0
         _gain_start = best_score
         _abs_n = 0
@@ -4843,8 +4958,11 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
             if report.get("verdict") == "need_fix":
                 _hi_f = sum(1 for i in (issues or []) if str(i.get("severity")) == "high")
                 _why_f.append(f"判官判 need_fix（high 级硬伤 {_hi_f} 处）")
+            # 日志里必须印**真实上限**：fix_rounds<0 表示「配置没定上限」，
+            # 但循环实际还受 ABS_FIX_ROUNDS 约束，印成「∞」会让人以为真的无限轮。
+            _cap_f = ABS_FIX_ROUNDS if fix_rounds < 0 else fix_rounds
             print(f"[stage] 终审不通过：{'；'.join(_why_f) or '未达门槛'}，"
-                  f"第 {rnd_f}/{'∞' if fix_rounds < 0 else fix_rounds} 轮修复（本批 {len(issues)} 处）…")
+                  f"第 {rnd_f}/{_cap_f} 轮修复（本批 {len(issues)} 处）…")
             # ---- 修复方式：补丁优先（reviewer 输出定点 search/replace，确定性应用），
             # 补丁无法生成/无改动/坍缩时降级为整稿重写（writer，polish_final）----
             _concept = project.load_json("concept.json") or {}
@@ -4899,9 +5017,15 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
                     plist = pout.get("patches", []) if isinstance(pout, dict) else []
                     plist = plist[:8]  # 硬限制每轮最多 8 补丁
                     if plist:
-                        patched, n_applied, n_skip = _apply_patches(full, plist)
+                        # 逐条验：每改一处都做局部体检，改坏的当场丢掉
+                        # （见 _apply_patches_verified 的说明——盲改是本轮最大的浪费源）
+                        patched, n_applied, n_skip = _apply_patches_verified(
+                            cfg, full, plist)
+                        _bad = [k for k in n_skip if "改坏了" in k.get("reason", "")]
                         print(f"[patch] 生成 {len(plist)} 个补丁，应用 {n_applied} 个"
-                              f"（跳过 {len(n_skip)}）")
+                              f"（跳过 {len(n_skip)}，其中改坏 {len(_bad)}）")
+                        for k in n_skip[:6]:
+                            print(f"[patch]   跳过：{k.get('find')}｜{k.get('reason')}")
                         if n_applied > 0:
                             new_full = patched.strip()
                 except Exception as e:  # noqa: BLE001
@@ -4927,6 +5051,10 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
             if not _polish_intact(new_full, full) or len(new_full) < 0.85 * len(full):
                 print("[guard] 修复残缺（小节头缺失/结尾不成句/篇幅大幅缩短），停止循环")
                 break
+            if new_full == full:
+                print("[guard] 本轮没有一处补丁通过局部体检，判定无净收益，停止循环")
+                break
+            prev_full = full
             full = new_full
             try:
                 report = _do_check(full)
@@ -4956,6 +5084,11 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
                         print(f"[guard] {_abs_n} 轮累计只涨 {best_score - _gain_start:.1f} 分"
                               f"（<{MIN_TOTAL_GAIN}），判定为抖动式微涨，收敛终止")
                         break
+                elif _det_hits_count(cfg, full) < _det_hits_count(cfg, prev_full):
+                    _db, _da = _det_hits_count(cfg, prev_full), _det_hits_count(cfg, full)
+                    fail_streak = 0
+                    print(f"[stage] 复评 {cur} 分未涨，但确定性缺陷 {_db}→{_da} 条，"
+                          f"保留本轮改动继续（不因判官抖动回滚已改好的稿子）")
                 else:
                     fail_streak += 1
                     print(f"[stage] 复评 {cur} 分未提升（best {best_score}），回滚；"
