@@ -463,6 +463,7 @@ def main() -> int:
     _test_audit_lead_detection()
     _test_score_cap_by_high()
     _test_state_causeless_and_time_hint()
+    _test_grade_issue_evidence()
 
     print("\n全部冒烟测试通过 ✔")
     return 0
@@ -727,6 +728,36 @@ def _test_continuity_pov_and_tail():
     assert C.carry_hit("袖中藏着的银针", "我摸到那根银针，指尖一凉。"), "尾部中心语必须能召回"
     assert not C.carry_hit("半张残缺信笺", "我推开门，屋里没人。"), "没接住就是没接住"
     print("[ok] 连续性：人称断裂/节尾复述/线索接住 三项判据零误报")
+
+
+def _test_grade_issue_evidence():
+    """判官的硬伤必须能落回原文，否则不许参与压档。
+
+    实测背景（v15）：判官把「上一节手滑溅出几点 → 本节碗脱手砸碎装疯」判成
+    high 级「重演」，而那是升级；按「硬伤条数封顶」把 68 分的稿子压到 43 分，
+    四轮修复全在追一个不存在的缺陷。判分可以有主观，但硬伤必须可核验。
+    """
+    from studio.pipeline import grade_issue_evidence
+
+    text = ("我端起碗，指尖触到滚烫的碗壁，眉头轻蹙装作被烫到的样子，手腕顺势抖动。"
+            "汤汁溅出几点落在袖口上。")
+    issues = [
+        # 只有印象、没有引文 → 降级
+        {"severity": "high", "note": "开头重演上节结尾已写的泼汤、手抖、身子歪倒"},
+        # 完整引了原句（哪怕结论仍然可疑，但「可核验」这一关它过了）→ 保留
+        {"severity": "high", "note": "上节「手腕顺势抖动，汤汁溅出几点」在本节又写了一遍"},
+        # 正文里根本没有提到的物件 → 降级
+        {"severity": "high", "note": "第二节提到银针击碎瓷壶，前文从未交代"},
+        # 非 high 不动
+        {"severity": "mid", "note": "口癖偏多"},
+    ]
+    out, n_down = grade_issue_evidence(issues, text)
+    assert n_down == 2, f"应降级 2 条，实际 {n_down}"
+    sev = [i["severity"] for i in out]
+    assert sev == ["mid", "high", "mid", "mid"], f"级别不对：{sev}"
+    assert out[0].get("evidence_checked") is False, "降级必须留痕"
+    assert out[1].get("evidence_checked") is not False
+    print("[ok] 硬伤可核验：引不出原文的 high 降为 mid（不参与压档）")
 
 
 def _test_patch_verified_rejects_bad_patch():

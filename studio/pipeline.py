@@ -2493,6 +2493,55 @@ _CAST_ROLE_HINT = {
 _SEC_DUP_MIN = 14
 
 
+_GOAL_STOP = ("这一节", "本节", "的", "了", "着", "在", "和", "与", "被", "把", "让", "他", "她")
+
+
+def _goal_grams(goal: str) -> set:
+    """把 goal 切成 3 字片段（去掉标点与高频虚词），用于相邻节撞车判定。"""
+    import re as _re
+    s = _re.sub(r"[^\u4e00-\u9fa5A-Za-z0-9]", "", goal or "")
+    for w in _GOAL_STOP:
+        s = s.replace(w, "")
+    if len(s) < 3:
+        return set()
+    return {s[i:i + 3] for i in range(len(s) - 2)}
+
+
+def plan_replay_risk(plan: dict) -> list[dict]:
+    """相邻两节是不是在写同一场戏（分节阶段就该拦住的重演根源）。
+
+    实测（v13/v14/v15 三版对照）重演打回 2-8 次，根子在计划阶段：相邻两节的
+    goal 落在同一场戏上，写手怎么接都会把上一节再演一遍。两条判据：
+      ① 两节声明了同一个 scene（地点·对手）——同一场戏没切开；
+      ② goal 的 3 字片段 Jaccard ≥ 0.34——换了个说法讲同一件事。
+    返回需要重规划的具体理由（空表 = 没有风险）。
+    """
+    secs = plan.get("sections") or []
+    out: list[dict] = []
+    for i in range(len(secs) - 1):
+        a, b = secs[i], secs[i + 1]
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            continue
+        why = []
+        sa = (a.get("scene") or "").strip()
+        sb = (b.get("scene") or "").strip()
+        if sa and sb and sa == sb:
+            why.append(f"两节同一场戏「{sa}」")
+        ga, gb = _goal_grams(a.get("goal") or ""), _goal_grams(b.get("goal") or "")
+        if ga and gb:
+            jac = len(ga & gb) / len(ga | gb)
+            if jac >= 0.34:
+                why.append(f"核心事件重复（相似度 {jac:.2f}）")
+        if why:
+            out.append({
+                "at": [a.get("no"), b.get("no")],
+                "why": "；".join(why),
+                "goal_a": (a.get("goal") or "")[:40],
+                "goal_b": (b.get("goal") or "")[:40],
+            })
+    return out
+
+
 def _plan_cast(plan: dict) -> list[dict]:
     """分节计划里声明的人物名册（计划没写就返回空表，不做猜测）。"""
     out: list[dict] = []
@@ -2612,9 +2661,16 @@ def _extract_facts(llm: BaseLLM, text: str, keep: list[str]) -> list[str]:
 
 _REPLAY_SYS = (
     "你是长篇连载的衔接校对。只看两件事：\n"
-    "① 这一节的开头，是不是在**重演**上一节已经写完的事件。重演指：同一场戏、"
-    "同一个动作、同一个信息再来一遍（哪怕换了说法），时间线因此原地倒退。"
-    "正常的「接着往下写」不算重演——上一节停在半途，这一节把它顺势写完，是正常承接。\n"
+    "① 这一节的开头，是不是在**重演**上一节已经写完的事件。\n"
+    "判 true 必须同时给出两处引文：上一节里被重演的那句话（8～30 字原文）、"
+    "本节里重演它的那句话（8～30 字原文）。引不出这两处原文，一律判 false。\n"
+    "以下都**不算**重演：接着往下写；把上一节停在半途的动作写完；同一场戏里"
+    "**升级**（上一节只是汤汁溅出几点，这一节碗脱手砸碎、把事情闹大）；"
+    "换了对手、换了地点、换了信息；时间往后跳。\n"
+    "反例（这种情况必须判 false）：上一节「手腕顺势抖动，汤汁溅出几点落在袖口」"
+    "→ 本节「描金瓷碗脱手飞出，砸在青砖上四分五裂，我捂着胸口往下滑」——"
+    "动作更大、结果不同、有新信息，是升级，不是重演。\n"
+    "拿不准就判 false：误判成重演会逼写手把正常的推进删掉，比漏判代价大得多。\n"
     "② 这一节里有没有**无因之果**：人物突然使出一种前文从没交代过的本事"
     "（会改脉、会易容、会点穴），或者凭空拿出一件前文没出现过的东西"
     "（银针、令牌、密信）。必须在本节或上一节里都找不到来历才算，"
@@ -2627,7 +2683,46 @@ _REPLAY_USER = """上一节正文（结尾部分）：
 这一节开头：
 {cur}
 
-只输出 JSON：{{"replay": true 或 false, "why": "不超过 40 字的理由", "rewrite_hint": "若 replay=true，给出这一节开头应该从哪一刻写起（不超过 40 字）", "causeless": [{{"item": "凭空出现的本事或东西", "why": "为什么算凭空（不超过 30 字）"}}]}}"""
+只输出 JSON：{{"replay": true 或 false, "why": "不超过 40 字的理由", "ev_prev": "上一节里被重演的那句话（8～30 字原文，判 false 时留空）", "ev_cur": "本节里重演它的那句话（8～30 字原文，判 false 时留空）", "rewrite_hint": "若 replay=true，给出这一节开头应该从哪一刻写起（不超过 40 字）", "causeless": [{{"item": "凭空出现的本事或东西", "why": "为什么算凭空（不超过 30 字）"}}]}}"""
+
+
+def grade_issue_evidence(issues: list, text: str, min_len: int = 8) -> tuple:
+    """判官报的硬伤必须能落回原文：把不能核验的 high 降级为 mid。
+
+    为什么要这一步：v15 实测判官把「上一节手滑溅出几点 → 本节碗脱手砸碎装疯」
+    判成 high 级「重演」，而那是升级不是重演；「按硬伤条数封顶」的规则据此把
+    一篇 68 分的稿子压到 43 分，四轮修复全在追一个不存在的缺陷。
+    判分可以有主观，但**硬伤必须可核验**——note 里引不出一段能在正文逐字找到的
+    原文，就只能算印象，不能压档。降到 mid 而不是删掉：信息留着，权重降下来。
+    返回 (新 issues, 被降级条数)。
+    """
+    def _bare(s):
+        return "".join(ch for ch in str(s or "") if ch not in _contin._CARRY_PUNCT)
+
+    body = _bare(text)
+    out, n_down = [], 0
+    for iss in (issues or []):
+        if not isinstance(iss, dict):
+            continue
+        sev = str(iss.get("severity") or "mid").strip().lower()
+        if sev != "high":
+            out.append(iss)
+            continue
+        note = _bare(iss.get("note") or "")
+        # 滑动窗口找 ≥8 字的重合片段，而不是按标点切块再比：
+        # 「上节「手腕顺势抖动，汤汁溅出几点」又写了一遍」按逗号切出来只有两段 6 字，
+        # 会被误判成引不出原文——而它其实完整引了原句。判据是「有没有 8 字连续重合」。
+        ok = any(note[i:i + min_len] in body
+                 for i in range(max(0, len(note) - min_len + 1)))
+        if ok:
+            out.append(iss)
+        else:
+            item = dict(iss)
+            item["severity"] = "mid"
+            item["evidence_checked"] = False
+            out.append(item)
+            n_down += 1
+    return out, n_down
 
 
 def _sec_boundary(llm: BaseLLM, prev_text: str, cur_text: str) -> dict:
@@ -2669,8 +2764,23 @@ def _sec_boundary(llm: BaseLLM, prev_text: str, cur_text: str) -> dict:
     for c in (d.get("causeless") or [])[:2]:
         if isinstance(c, dict) and c.get("item"):
             cl.append({"item": str(c["item"])[:20], "why": str(c.get("why") or "")[:40]})
-    return {"replay": bool(d.get("replay")),
-            "why": str(d.get("why") or "")[:60],
+    # 「重演」必须可核验：判官要同时引用上一节和本节的原句，且这两句必须真的
+    # 出现在各自正文里（去标点后逐字比对）。引不出来 → 判 false。
+    # 为什么加这道机械校验：v15 实测它把「上一节手滑溅出几点 → 本节碗脱手砸碎
+    # 装疯」判成重演，那是升级不是重演；判官一句「重演」就能逼写手删掉正常的推进，
+    # 而删掉好推进的代价远高于漏判一次（决策 35：宁可少判不可误判）。
+    _bare = lambda s: "".join(ch for ch in str(s or "")
+                              if ch not in _contin._CARRY_PUNCT)
+    _ev_p, _ev_c = _bare(d.get("ev_prev")), _bare(d.get("ev_cur"))
+    _replay = bool(d.get("replay"))
+    _why = str(d.get("why") or "")[:60]
+    if _replay:
+        if (len(_ev_p) < 6 or len(_ev_c) < 6
+                or _ev_p not in _bare(prev_text) or _ev_c not in _bare(cur_text)):
+            _replay = False
+            _why = "判官未给出可核验引文，按不重演处理"
+    return {"replay": _replay,
+            "why": _why,
             "hint": str(d.get("rewrite_hint") or "")[:60],
             "causeless": cl}
 
@@ -2772,6 +2882,25 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             N=n_sections, GENRE_GUIDE=genre_guide, BAN_PROPS=_ban_props_text(cfg),
             SEC_LO=sec_lo, SEC_HI=sec_hi)
         plan = writer_llm.chat_json(psys, puser)
+        # 相邻两节写同一场戏，是重演的源头：写手怎么接都会把上一节再演一遍。
+        # 在计划阶段拦一次（带上具体冲突让它改），比写完再重写便宜两个数量级。
+        _risk = plan_replay_risk(plan)
+        if _risk:
+            _lines = "\n".join(
+                f"- 第 {r['at'][0]} 节与第 {r['at'][1]} 节：{r['why']}"
+                f"（前者「{r['goal_a']}」，后者「{r['goal_b']}」）" for r in _risk)
+            print(f"[plan] ⚠ 相邻小节有 {len(_risk)} 处写了同一场戏，要求重新拆分")
+            for r in _risk:
+                print(f"[plan]    第 {r['at'][0]}/{r['at'][1]} 节：{r['why']}")
+            _fix = (puser + "\n\n【上一次的计划有冲突，必须改】\n" + _lines
+                    + "\n每节只能写一场戏；上一节写完的场面，下一节从它结束后的"
+                      "那一刻接着写，不许再演一遍。请重新输出一份完整 JSON。")
+            _p2 = writer_llm.chat_json(psys, _fix)
+            if (_p2.get("sections") or []) and not plan_replay_risk(_p2):
+                plan = _p2
+                print("[plan] 重新拆分后相邻小节不再撞车")
+            else:
+                print("[plan] 重新拆分后仍有冲突，保留第一版（不无限重试）")
         project.save_json("section_plan.json", plan)
     secs = plan.get("sections") or []
     if not secs:
@@ -4913,6 +5042,13 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
                 raise ValueError("体检输出非对象")
             reps.sort(key=lambda x: float(x.get("score") or 0))
             best = reps[len(reps) // 2]
+            # 硬伤必须可核验（见 grade_issue_evidence）：引不出原文的高危降为 mid，
+            # 不让一句「重演了」把整篇压掉一档（v15 实测判官把升级判成重演，
+            # 按硬伤封顶把 68 分的稿子压到 43 分，四轮修复全在追不存在的缺陷）。
+            best["issues"], _n_down = grade_issue_evidence(best.get("issues") or [], text)
+            if _n_down:
+                print(f"[stage] 判官 {_n_down} 处 high 硬伤引不出原文，降为 mid"
+                      f"（不可核验的印象不参与压档）")
             # 分数与清单必须自洽：模型给的 score 是印象分，issues 是可核验的证据。
             # 口径不是「用清单重算一个分」（试过：清单条数一多就把分压到 15–45，
             # 轮次之间全是噪声，看不出改进），而是**按硬伤条数给分数封顶**——
