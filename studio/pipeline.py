@@ -2673,8 +2673,13 @@ _REPLAY_SYS = (
     "拿不准就判 false：误判成重演会逼写手把正常的推进删掉，比漏判代价大得多。\n"
     "② 这一节里有没有**无因之果**：人物突然使出一种前文从没交代过的本事"
     "（会改脉、会易容、会点穴），或者凭空拿出一件前文没出现过的东西"
-    "（银针、令牌、密信）。必须在本节或上一节里都找不到来历才算，"
-    "只要有一处交代过（谁给的、什么时候备下的、跟谁学的）就不算。"
+    "（银针、令牌、密信）。\n"
+    "判据是「**来历找不到**」，不是「东西头一次出现」。只要在本节或上一节里有"
+    "一句话交代过（谁给的、什么时候备下的、跟谁学的、从哪儿翻出来的），就算有来历，"
+    "**必须整条不要写进 causeless**。\n"
+    "特别注意这几种**不算**：上一节已交代配方的药引/解药；当场有人递过来的东西；"
+    "前文提过名字、本节只是拿出来用；只是被提及而没被使用。\n"
+    "causeless 只收「找不到来历」的那几条，宁可留空。"
 )
 
 _REPLAY_USER = """上一节正文（结尾部分）：
@@ -2684,6 +2689,13 @@ _REPLAY_USER = """上一节正文（结尾部分）：
 {cur}
 
 只输出 JSON：{{"replay": true 或 false, "why": "不超过 40 字的理由", "ev_prev": "上一节里被重演的那句话（8～30 字原文，判 false 时留空）", "ev_cur": "本节里重演它的那句话（8～30 字原文，判 false 时留空）", "rewrite_hint": "若 replay=true，给出这一节开头应该从哪一刻写起（不超过 40 字）", "causeless": [{{"item": "凭空出现的本事或东西", "why": "为什么算凭空（不超过 30 字）"}}]}}"""
+
+
+# 判词里出现这些词，说明模型自己认为「来历是有的」——这种不许当无因之果报。
+# 刻意用**短语**而不是「前文/上节」这类裸词：真无因之果的判词通常是
+# 「前文从没提过此簪」，含「前文」但意思相反，用裸词会把真阳性一起滤掉。
+_CAUSE_OK_MARKS = ("有来历", "已交代", "交代过", "前文已", "上文已", "已提及",
+                   "当场给", "当场递", "递给", "已说明", "有出处", "先前已", "上节已")
 
 
 def grade_issue_evidence(issues: list, text: str, min_len: int = 8) -> tuple:
@@ -2762,8 +2774,19 @@ def _sec_boundary(llm: BaseLLM, prev_text: str, cur_text: str) -> dict:
         return {"replay": False, "causeless": []}
     cl = []
     for c in (d.get("causeless") or [])[:2]:
-        if isinstance(c, dict) and c.get("item"):
-            cl.append({"item": str(c["item"])[:20], "why": str(c.get("why") or "")[:40]})
+        if not isinstance(c, dict) or not c.get("item"):
+            continue
+        item = str(c["item"])[:20]
+        why = str(c.get("why") or "")[:40]
+        # 模型自己都写了「有来历」的，不许再当无因之果报出来。
+        # 为什么要有这道机械过滤：v16 实测它返回过「假死药引的脉象效果
+        # （上节萧景琰已交代解药配方与假死药引，有来历）」「乌木令牌
+        # （萧景琰当场掷给，有来历）」——判词明说有来历，却被当成「凭空出现」
+        # 打回整节重写，白烧两轮 token 还逼写手删掉正常情节（决策 35）。
+        if any(k in why for k in _CAUSE_OK_MARKS):
+            print(f"[boundary] 略过（判词已说明有来历）：{item}")
+            continue
+        cl.append({"item": item, "why": why})
     # 「重演」必须可核验：判官要同时引用上一节和本节的原句，且这两句必须真的
     # 出现在各自正文里（去标点后逐字比对）。引不出来 → 判 false。
     # 为什么加这道机械校验：v15 实测它把「上一节手滑溅出几点 → 本节碗脱手砸碎
@@ -5381,6 +5404,7 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
                 for i in (report.get("issues") or [])[:12] if isinstance(i, dict)
             ],
             "verdict": report.get("verdict"),
+            "reviewed_words": count_words_zh(full),
             "note": "内部质检分（卡点/连续性/文风/安全），非投稿线；投稿判定见 market_lang",
         }
 
@@ -5765,6 +5789,51 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
     # 生产模式必须落盘：之前 report 里根本没有 mode 字段，看板/复盘读出来永远是 null，
     # 事后无法分辨"这稿是 agent 写的还是 hybrid 拼的"。
     report["mode"] = (cfg.get("pipeline") or {}).get("mode") or "agent"
+    # 终审分必须描述**交付的这一版**。终审之后还有整稿重写（AI 腔去味、节长
+    # 均衡、字数补足、终稿复查），每次都会改正文；旧实现把「终审那一刻的分数」
+    # 原样写进 report 并拿去判投稿，于是 v16 交付的是一篇确定性体检 A 可投的
+    # 稿子，却顶着上一版残留的 55 分被判 B——分数与正文对不上，是这里唯一的
+    # 问题。检测到正文被改过就复评一次，复评不成就诚实标 stale。
+    _fr0 = report.get("final_review") or {}
+    _rw = _fr0.get("reviewed_words")
+    _fw = count_words_zh(full)
+    if isinstance(_rw, int) and _rw > 0 and abs(_fw - _rw) > max(80, int(_rw * 0.015)):
+        try:
+            _rep2 = _do_check(full)
+            _h2 = sum(1 for _i in (_rep2.get("issues") or [])
+                      if str((_i or {}).get("severity") or "mid").strip() == "high")
+            report["final_review"] = {
+                "score": _rep2.get("score"),
+                "score_best": _fr0.get("score_best"),
+                "threshold": _fr0.get("threshold", floor),
+                "reached": bool(float(_rep2.get("score") or 0) >= floor),
+                "rounds": _fr0.get("rounds"),
+                "issues": [
+                    {"severity": i.get("severity"), "type": i.get("type"),
+                     "location": i.get("location"),
+                     "note": str(i.get("note") or "")[:300],
+                     "fix": str(i.get("fix") or "")[:200]}
+                    for i in (_rep2.get("issues") or [])[:12] if isinstance(i, dict)
+                ],
+                "verdict": _rep2.get("verdict"),
+                "score_judge": _rep2.get("score_judge"),
+                "score_src": _rep2.get("score_src"),
+                "high_count": _h2,
+                "reviewed_words": _fw,
+                "rechecked": True,
+                "note": (f"终审后正文被改写（{_rw} → {_fw} 字），"
+                         "本分数是对交付版复评得到的"),
+            }
+            report["score"] = _rep2.get("score")
+            print(f"[stage] 终审后正文已改（{_rw} → {_fw} 字），对交付版复评："
+                  f"{_fr0.get('score')} → {_rep2.get('score')} 分"
+                  f"（high {_h2} 处）")
+        except Exception as e:  # noqa: BLE001 —— 复评失败不许阻断交付
+            _fr0["stale"] = True
+            _fr0["final_words"] = _fw
+            _fr0["note"] = (str(_fr0.get("note") or "")
+                            + f"；正文已改写为 {_fw} 字，本分数对应 {_rw} 字版本，未复评（{type(e).__name__}）")
+            print(f"[warn] 终审后正文已改（{_rw} → {_fw} 字），复评失败（{type(e).__name__}），分数标记为过期")
     # 主编评分的**项目级**汇总：逐章 review_score 只写在 reviews/chNN.json 与
     # meta.reviews[*] 里，report.json 从来没有顶层分数。后果是验收工具/看板
     # 站在项目层读 report 时永远拿到 None（体检报告里那行"主编评分 实测 None"

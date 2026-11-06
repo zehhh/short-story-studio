@@ -464,6 +464,7 @@ def main() -> int:
     _test_score_cap_by_high()
     _test_state_causeless_and_time_hint()
     _test_state_prop_and_exit_ledgers()
+    _test_boundary_drops_explained_items()
     _test_grade_issue_evidence()
 
     print("\n全部冒烟测试通过 ✔")
@@ -855,6 +856,39 @@ def _test_state_prop_and_exit_ledgers():
     assert state.exit_then_present("他转身离去。", "次日萧景琰又来了。", ["萧景琰"]) == []
     assert state.exit_then_present("他转身离去。", "我盯着门口看了很久。", ["萧景琰"]) == []
     print("[ok] 已消耗道具 / 已退场人物台账（跨节 + 节内 + 三类反例）")
+
+
+def _test_boundary_drops_explained_items():
+    """衔接判据：模型自己写了「有来历」的条目不许再当无因之果报。
+
+    实测背景（v16 真跑）：轻模型返回过
+    「假死药引的脉象效果（上节萧景琰已交代解药配方与假死药引，有来历）」
+    「乌木令牌（萧景琰当场掷给，有来历）」——判词明说有来历，却被当成
+    「凭空出现」打回整节重写，白烧两轮 token，还逼写手删掉正常情节。
+    """
+    from studio import pipeline
+
+    class _StubLLM:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def chat(self, system, user, json_mode=False):
+            return self.payload
+
+    prev = "他把药方念了一遍。" + "字" * 260
+    cur = "我照着方子配药。" + "字" * 260
+
+    explained = ('{"replay": false, "why": "", '
+                 '"causeless": [{"item": "乌木令牌", "why": "萧景琰当场掷给，有来历"}, '
+                 '{"item": "袖中明黄绢帛", "why": "上节已交代是从密室取的"}]}')
+    d = pipeline._sec_boundary(_StubLLM(explained), prev, cur)
+    assert d["causeless"] == [], f"判词说有来历的不许报，实测 {d['causeless']}"
+
+    genuine = ('{"replay": false, "why": "", '
+               '"causeless": [{"item": "枕下的银簪", "why": "前文从没提过此簪，凭空出现"}]}')
+    d = pipeline._sec_boundary(_StubLLM(genuine), prev, cur)
+    assert [c["item"] for c in d["causeless"]] == ["枕下的银簪"], f"真无因之果必须留，实测 {d}"
+    print("[ok] 衔接判据：判词自述有来历的条目被丢弃，真无因之果保留")
 
 
 if __name__ == "__main__":
