@@ -1944,6 +1944,24 @@ def _join_sections(secs: list[dict], full: str = "") -> str:
     return body
 
 
+def _strip_body_preamble(full: str) -> str:
+    """砍掉正文里自带的「书名：/导语：」序言，只留第一个节头开始的部分。
+
+    为什么需要：`final_md` 已经在抬头印了书名、在分隔线上方印了导语，而 `full`
+    的开头还留着写手自己写的「书名：… 导语：…」序言（`_join_sections` 为保住
+    导语刻意保留的）。两者一起落盘，成稿里就出现**两个不同的书名、两段不同的
+    导语**——v18 实测：抬头《入宫封妃那晚太后赐我一碗药…》，正文序言
+    《入宫封妃那天，太后赏了我一碗药…》，读者第一眼就是自相矛盾。
+    """
+    if not full:
+        return full
+    lines = full.splitlines()
+    for i, ln in enumerate(lines):
+        if sec_head_no(ln.strip()):
+            return "\n".join(lines[i:]).lstrip()
+    return full
+
+
 def _dedup_section_boundaries(full: str) -> str:
     """删除相邻小节边界上的重复句（扩写越界导致同一句在两节都出现）。
 
@@ -5787,7 +5805,9 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
         f"# {title}\n\n"
         f"> 平台：{plat['name']} | 字数：{total_words} | 题材：{direction}"
         + (f" | 读者团均分：{full_review['reader_avg']}" if full_review else "")
-        + f"\n\n**一句话故事**：{pitch.get('logline', '')}\n\n{lead_block}---\n\n{full}\n"
+        + f"\n\n**一句话故事**：{pitch.get('logline', '')}\n\n{lead_block}---\n\n"
+        + _strip_body_preamble(full)
+        + "\n"
     )
     # 导语来自 lead.json、正文来自 full，两段分别拼装；统一在这里收口，
     # 保证 md/txt 全文（含导语）引号一致，不再出现"导语「」、正文 “”"。

@@ -469,6 +469,7 @@ def main() -> int:
     _test_style_high_needs_scanner_backing()
     _test_sec_overreach_detector()
     _test_recheck_rejects_rewrite_that_adds_hits()
+    _test_strip_body_preamble_removes_duplicate_lead()
 
     print("\n全部冒烟测试通过 ✔")
     return 0
@@ -974,6 +975,26 @@ def _test_recheck_rejects_rewrite_that_adds_hits():
     assert n_clean == 0, f"干净文本不许有硬命中，实测 {n_clean}"
     assert n_dirty > n_clean, f"脏文本必须多算，实测 {n_dirty} vs {n_clean}"
     print(f"[ok] 复查回归守卫的判据（干净 {n_clean} 条 / 脏文本 {n_dirty} 条）")
+
+
+def _test_strip_body_preamble_removes_duplicate_lead():
+    """正文自带的「书名：/导语：」必须砍掉，否则成稿里出现两个书名两段导语。
+
+    v18 实测：抬头《入宫封妃那晚太后赐我一碗药…》，正文序言《入宫封妃那天，
+    太后赏了我一碗药…》，读者第一眼就是自相矛盾。
+    """
+    from studio.pipeline import _strip_body_preamble
+
+    body = ("书名：入宫封妃那天，太后赏了我一碗药\n\n导语：\n我入宫封妃那天，太后赐了一碗汤。\n\n"
+            "01\n\n凤冠压在脖颈上。\n\n02\n\n她抬眼看我。\n")
+    out = _strip_body_preamble(body)
+    assert out.startswith("01"), f"应从第一个节头开始，实测 {out[:30]!r}"
+    assert "书名：" not in out[:80] and "导语：" not in out[:200], f"序言没砍干净：{out[:120]!r}"
+    assert "凤冠压在脖颈上" in out
+    # 没有节头（比如直写模式的散稿）→ 原样返回，不许把正文整段砍掉
+    plain = "第一段。\n\n第二段。"
+    assert _strip_body_preamble(plain) == plain, "无节头时必须原样返回"
+    print("[ok] 成稿抬头去重（砍正文序言 / 无节头原样返回）")
 
 
 if __name__ == "__main__":

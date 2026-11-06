@@ -160,6 +160,14 @@ class OpenAICompatLLM(BaseLLM):
         self.max_tokens = int(cfg.get("max_tokens", 8192))
         self.timeout = int(cfg.get("timeout", 300))
         self.retries = int(cfg.get("retries", 5))
+        # 读超时与整次超时分离。`requests` 的 timeout 实为**单次 socket 读的空闲
+        # 上限**，不是「整次调用最长多久」。历史配置 timeout=1800 意味着网关挂死时
+        # 白等 30 分钟，再乘 retries=5 就是两个半小时——v18 实测就卡在这里（日志
+        # 17 分钟没有任何新行）。所以：连接给 15s；流式每次读最多等 `stall` 秒
+        # （生成时 token 是连续来的，静默超过它一定是挂死）；非流式用整次超时。
+        self.stall = int(cfg.get("stall_timeout", 120) or 120)
+        self._t_stream = (15, min(self.timeout, self.stall))
+        self._t_post = (15, self.timeout)
         # 思考型模型（Qwen3.5/3.8、GLM、DeepSeek-R1 等）：本地引擎默认请求关闭思考，
         # 防止正文为空（思考进 reasoning/reasoning_content 字段）。云端默认不注入，
         # 需要时事态各异：用 config llm.extra_body 透传厂商参数（如智谱 thinking.disabled）。
@@ -271,7 +279,7 @@ class OpenAICompatLLM(BaseLLM):
                 if self._is_opencode:
                     import uuid as _uuid
                     extra_headers["x-opencode-session"] = str(_uuid.uuid4())
-                resp = self.session.post(url, json=payload, timeout=self.timeout, headers=extra_headers)
+                resp = self.session.post(url, json=payload, timeout=self._t_post, headers=extra_headers)
                 # 不可恢复的 4xx：认证/额度/权限错了，重试永远不可能成功。
                 # 历史行为：401/402/403 也走 retries 次指数退避（4+8+16+32 秒 ≈ 60 秒），
                 # 把"配置错了"变成一分钟静默挂起，日志里还只看到"重试中"。
@@ -376,7 +384,7 @@ class OpenAICompatLLM(BaseLLM):
         if self._is_opencode:
             import uuid as _uuid
             extra_headers["x-opencode-session"] = str(_uuid.uuid4())
-        resp = self.session.post(url, json=sp, timeout=self.timeout, stream=True, headers=extra_headers)
+        resp = self.session.post(url, json=sp, timeout=self._t_stream, stream=True, headers=extra_headers)
         resp.raise_for_status()
         resp.encoding = "utf-8"  # SSE 无 charset 时 requests 会误判为 ISO-8859-1，中文变乱码
         chunks: list[str] = []
@@ -717,7 +725,7 @@ class AnthropicCompatLLM(BaseLLM):
                 if self._is_opencode:
                     import uuid as _uuid
                     extra_headers["x-opencode-session"] = str(_uuid.uuid4())
-                resp = self.session.post(url, json=payload, timeout=self.timeout, headers=extra_headers)
+                resp = self.session.post(url, json=payload, timeout=self._t_post, headers=extra_headers)
                 if resp.status_code in (400, 404, 422):
                     body = resp.text[:500]
                     raise LLMError(f"HTTP {resp.status_code}: {body}")
