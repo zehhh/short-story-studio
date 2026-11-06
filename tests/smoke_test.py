@@ -463,6 +463,7 @@ def main() -> int:
     _test_audit_lead_detection()
     _test_score_cap_by_high()
     _test_state_causeless_and_time_hint()
+    _test_state_prop_and_exit_ledgers()
     _test_grade_issue_evidence()
 
     print("\n全部冒烟测试通过 ✔")
@@ -820,6 +821,40 @@ def _test_state_causeless_and_time_hint():
     assert "入夜" in hint and "次日" in hint, f"时间锚必须带上收尾时点，实测 {hint!r}"
     assert state.prev_time_hint("他推门进来。") == "", "没有时点词时不许编一个出来"
     print("[ok] 无因之果判定（真阳性/有来历/前文已见/仅描写/假设句）+ 时间锚注入")
+
+
+def _test_state_prop_and_exit_ledgers():
+    """已消耗道具 / 已退场人物两类台账。
+
+    实测背景（v15 成稿，6 处 high 硬伤里的 2 处）：
+    - 第 08 节「我将蜜丸放入口中…」之后紧接着「从发髻中取出另一粒早已藏好的
+      蜜丸吞下」——同一节内把已经吃掉的东西又拿出来；
+    - 第 04 节结尾「萧景琰…转身离去」，第 05 节开头「萧景琰的手指离开下颌」——
+      人已经退场了又在场。
+    这两类写手记不住是因为逐节写时每节都是一次全新对话，必须由代码逐节累加。
+    """
+    from studio import state
+
+    prior = ("他从袖中取出一个紫檀木盒，掀开盖子，里头躺着一颗金黄的蜜丸。"
+             "「吃了它。」他把蜜丸递到我嘴边，我张口吞下那颗蜜丸。"
+             "萧景琰松开手，没有回答我的问题，只是深深看了我，转身离去。")
+    body = "我取出另一颗蜜丸，放在掌心看了看。萧景琰坐在一旁，端起茶盏。"
+
+    assert [c["obj"] for c in state.consumed_props(prior)] == ["蜜丸"]
+    assert [h["obj"] for h in state.prop_reuse(prior, body)] == ["蜜丸"], "已吞下的蜜丸又被取出，必须报"
+    exits = state.exit_then_present(prior, body, ["萧景琰", "苏清婉"])
+    assert [h["name"] for h in exits] == ["萧景琰"], f"已转身离去的萧景琰又在场，必须报，实测 {exits}"
+
+    # 节内复用：同一节里先吃下、后取出
+    intra = "我将蜜丸放入口中，轻轻一咬。药香化开。我又从发髻里取出一粒蜜丸吞下。"
+    assert [h["obj"] for h in state.prop_reuse("", intra)] == ["蜜丸"], "节内复用必须报"
+
+    # 反例：泛称当道具 / 取回后重新获得 / 次日重新到场
+    assert state.prop_reuse("我把话交代了。", "我取出那封信。") == []
+    assert state.prop_reuse("我把银针收回袖中。", "我又取出银针。") == []
+    assert state.exit_then_present("他转身离去。", "次日萧景琰又来了。", ["萧景琰"]) == []
+    assert state.exit_then_present("他转身离去。", "我盯着门口看了很久。", ["萧景琰"]) == []
+    print("[ok] 已消耗道具 / 已退场人物台账（跨节 + 节内 + 三类反例）")
 
 
 if __name__ == "__main__":

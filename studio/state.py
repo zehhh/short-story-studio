@@ -109,17 +109,6 @@ def prev_time_hint(prev_text: str) -> str:
             "除非明写「次日」「三日后」这类推进，否则开头第一句就要比它晚")
 
 
-def hint_causeless(hit: dict) -> str:
-    return (f"「{hit['item']}」在上一节里没有出现过，本节第一次出现就拿来用了"
-            f"（「{hit['sentence']}」）——新手段/新道具第一次露面必须当场交代来源："
-            "谁给的、什么时候备下的、跟谁学的，一句话带过")
-
-
-def summary(prev_text: str, body: str) -> list[str]:
-    """把本节的问题压成能直接塞进「上一次输出不合格」列表的字符串。"""
-    return [hint_causeless(h) for h in causeless(prev_text, body)[:2]]
-
-
 # ------------------------------------------------------- 道具 / 手段
 
 # 需要「来源」的东西：有明确物理形态、能凭空出现也会被读者抓到。
@@ -220,3 +209,162 @@ def hint_causeless(hit: dict) -> str:
 def summary(prev_text: str, body: str) -> list[str]:
     """把本节的问题压成能直接塞进「上一次输出不合格」列表的字符串。"""
     return [hint_causeless(h) for h in causeless(prev_text, body)[:2]]
+
+
+# ------------------------------------------------- 台账：已消耗的道具 / 已退场的人
+#
+# 这两类跟「无因之果」是同一件事的反面：前面记「凭空出现」，这里记「已经用过/已经
+# 走了，却又拿出来/又开口」。v15 成稿的 6 条 high 硬伤里，有 2 条正是这一类
+# （08 蜜丸已服下毒已解，紧接着「取出另一颗」；04 结尾萧景琰已转身离去，
+# 05 开头他还在场）。判官能引原文说明它抓得准，写手记不住是因为逐节写时每节
+# 都是一次新对话——所以这一类必须由代码记，不能指望模型记得。
+
+# 消耗类动词：动作完成后，这个东西在故事里就没了。
+_CONSUME_RE = re.compile(
+    "吞下|服下|吃下|喝下|咽下|饮尽|喝完|吃完|"
+    "放入口中|送入口中|含入口中|含进嘴里|"
+    "用掉|用完|耗尽|烧掉|烧了|焚了|撕碎|撕了|摔碎|砸碎|碾碎|捏碎|"
+    "交给|交给|递给|塞给|送给了|给了|赏了|丢了|扔了|扔进|撒了|泼了"
+)
+# 取用类动词：又在手上用它了。只认「拿到手/拿在手里」这一类，避免把
+# 「那颗蜜丸的药力还在」这种追述也算成复用。
+_PICKUP_RE = re.compile(
+    "取出|拿出|掏出|摸出|抽出|翻出|捏出|拈出|捡起|拾起|端起|托起|接过|"
+    "又取|再取|又拿|再拿|又摸|又掏"
+)
+# 宾语抽取要吃两种语序：把字句（「把那颗蜜丸吞下」）与动宾句（「吞下那颗蜜丸」）。
+# 只按「动词前 2~4 字」抽会抽到紧贴动词的状语（「我张口吞下」→ 抽成「张口」，
+# 实测就是这么错的），所以把字句必须锚在 把/将 上，动宾句必须锚在量词上。
+_MEASURE = "颗枚片张块包封瓶盒只条根支把碗杯壶袋卷册粒服帖"
+_OBJ_BEFORE = re.compile(
+    r"(?:把那|将那|把这|将这|把|将)([\u4e00-\u9fa5]{2,4})"
+    r"(?:" + _CONSUME_RE.pattern + ")"
+)
+_OBJ_AFTER = re.compile(
+    r"(?:" + _CONSUME_RE.pattern + r")(?:了)?"
+    r"(?:那|这|一)?[" + _MEASURE + r"]([\u4e00-\u9fa5]{2,3})"
+)
+
+
+def _objs_in_sentence(sent: str) -> list[str]:
+    """一句话里被消耗掉的物件（把字句 + 动宾句两种语序都认）。"""
+    out: list[str] = []
+    for rx in (_OBJ_BEFORE, _OBJ_AFTER):
+        for m in rx.finditer(sent):
+            obj = m.group(1)
+            if len(obj) < 2 or obj in _GENERIC_OBJ:
+                continue
+            if obj not in out:
+                out.append(obj)
+    return out
+# 代词与泛称不能当道具（「把那件事说出去」「把话交代了」）。
+_GENERIC_OBJ = frozenset("""
+东西 事情 问题 话 话说 消息 银子 银钱 钱 命 气息 力气 心思 念头 人 他们 我们
+自己 什么 这个 那个 一个 这些 那些 众人 众人面 众人面面
+""".split())
+
+
+def _sentences(text: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[。！？])", text or "") if s.strip()]
+
+
+def consumed_props(text: str) -> list[dict]:
+    """正文里「用掉了/交出去了/毁掉了」的东西（按出现顺序，同物取最后一次）。"""
+    out: list[dict] = []
+    for sent in _sentences(text):
+        for obj in _objs_in_sentence(sent):
+            out.append({"obj": obj, "sentence": sent.strip()[:60]})
+    return out
+
+
+def prop_reuse(prior_text: str, body: str) -> list[dict]:
+    """前文已经用掉的东西，本节又「取出/拿出」了。
+
+    只在三种条件同时成立时报：①前文有明确的消耗句；②消耗之后前文**再没有**
+    把同一个东西取用回来（再取用就算重新获得，不报）；③本节出现了「取用动词 +
+    这个东西」的句子。宁可漏判：误报会逼写手删掉正常的情节。
+
+    `body` 里的**节内**复用也一起查：v15 第 08 节就是「我将蜜丸放入口中…吞下」
+    之后紧接着「我从发髻中取出另一粒早已藏好的蜜丸吞下」，两处都在同一节里，
+    跨节判据抓不到。
+    """
+    out: list[dict] = []
+    prior_sents = _sentences(prior_text) if prior_text else []
+    consumed: dict[str, int] = {}
+    for i, sent in enumerate(prior_sents):
+        for obj in _objs_in_sentence(sent):
+            consumed[obj] = i          # 同物多次消耗以最后一次为准
+    body_sents = _sentences(body) if body else []
+    # ① 跨节：前文消耗过、且消耗后没再取用 → 本节若取用就算矛盾
+    for obj, at in consumed.items():
+        if any(obj in s and _PICKUP_RE.search(s) for s in prior_sents[at + 1:]):
+            continue                   # 重新获得过，不算
+        for sent in body_sents[:12]:
+            if obj in sent and _PICKUP_RE.search(sent):
+                out.append({"obj": obj,
+                            "consumed": prior_sents[at].strip()[:60],
+                            "sentence": sent.strip()[:60]})
+                break
+    # ② 节内：本节自己的消耗句之后又取用
+    for i, sent in enumerate(body_sents):
+        for obj in _objs_in_sentence(sent):
+            for later in body_sents[i + 1:]:
+                if obj in later and _PICKUP_RE.search(later):
+                    out.append({"obj": obj,
+                                "consumed": sent.strip()[:60],
+                                "sentence": later.strip()[:60]})
+                    break
+    return out
+
+
+# 明确的退场动作：写完这句，这个人就不在这个场面里了。
+_EXIT_RE = re.compile(
+    "转身离去|转身离开|转身走了|转身出去|拂袖而去|拂袖离开|"
+    "退了出去|退了下去|退到门外|退出门外|告退|告辞|"
+    "走了出去|站起身走了|起身离开|背影消失|离了殿|送出了?殿"
+)
+
+
+def exit_then_present(prev_text: str, body: str, names: list[str]) -> list[dict]:
+    """上一节结尾已经退场的人，本节开头又在场。
+
+    判据收得很紧：①退场句必须是上一节**最后两句**之一；②名字要出现在同一句；
+    ③本节**前两句**里又出现这个名字（并且不是「想起他」「他留下的」这类追述）。
+    这样「他转身离去，我盯着门」→「次日他来了」不会被误报（次日来了是重新到场），
+    因为名字得落在本节开头两句且本节没有重新到场的动作也不行——所以再加一条：
+    本节开头若含「又/回到/回来/再来/进门/入殿」就不算，那是正常的重新到场。
+    """
+    if not prev_text or not body or not names:
+        return []
+    tails = _sentences(prev_text)[-2:]
+    if not tails:
+        return []
+    exits: list[tuple[str, str]] = []
+    for sent in tails:
+        if _EXIT_RE.search(sent):
+            for n in names:
+                if n and n in sent:
+                    exits.append((n, sent.strip()[:60]))
+    if not exits:
+        return []
+    heads = _sentences(body)[:2]
+    head = "".join(heads)
+    if re.search("又回到|回到|回来|再来|重又|进门|入殿|进来|返回", head):
+        return []
+    out = []
+    for n, sent in exits:
+        if n in head:
+            out.append({"name": n, "exit": sent, "sentence": head.strip()[:60]})
+    return out
+
+
+def hint_prop_reuse(hit: dict) -> str:
+    return (f"「{hit['obj']}」前面已经用掉了（「{hit['consumed']}」），这一节又"
+            f"「{hit['sentence']}」把它取了出来——已经消耗/交出去的东西不能再原样"
+            "拿出来；要它再出现，必须先写明怎么重新拿到的")
+
+
+def hint_exit_present(hit: dict) -> str:
+    return (f"{hit['name']}在上一节结尾已经退场（「{hit['exit']}」），这一节开头"
+            f"又在场（「{hit['sentence']}」）——要么把他不在场的这段写清楚"
+            "（他什么时候回来的），要么本节开头从他的不在场写起")

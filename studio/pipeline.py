@@ -3061,6 +3061,17 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             if prev_body:
                 for _hit in _state.causeless(prev_body, body)[:2]:
                     problems = problems + [_state.hint_causeless(_hit)]
+            # 台账的另一半：已经用掉的东西又拿出来 / 已经退场的人又在场。
+            # 这两类判官能引原文说明它抓得准（v15 第 08 节「蜜丸已吞下又取出
+            # 另一粒」、第 05 节「萧景琰上一节转身离去、本节开场就在」），而写手
+            # 记不住是因为逐节写时每节都是一次全新的对话——只能由代码逐节累加。
+            _prior_all = "\n".join(b for b in body_list if b)
+            for _hit in _state.prop_reuse(_prior_all, body)[:2]:
+                print(f"[state] 小节{no:02d} 已消耗道具复用：{_hit['obj']}")
+                problems = problems + [_state.hint_prop_reuse(_hit)]
+            for _hit in _state.exit_then_present(prev_body or "", body, plan_cast_all)[:2]:
+                print(f"[state] 小节{no:02d} 已退场人物又在场：{_hit['name']}")
+                problems = problems + [_state.hint_exit_present(_hit)]
             # 语言病在节级只给**一次**修正机会。实测：整节盲改三轮压不住 AI 口癖
             # （「嘴角勾起一抹」三轮全在），白烧 token 还照样带病交付。真正的去处是
             # 整稿 `_ai_deflavor`——它把命中词与所在句一起喂给模型。这里第二次起放行，
