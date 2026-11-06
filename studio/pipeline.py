@@ -2600,8 +2600,11 @@ def _sec_words(sec: dict, total_words: int, n: int, lo: int, hi: int) -> int:
 
 _FACTS_SYS = (
     "你是长篇小说连续性校对。给你一节正文，请提取其中**已经写死、后面不许改**的硬事实。"
-    "硬事实指：道具从哪来/到哪去、药或伤的具体成分与效果、人物的位份与称呼、"
-    "死了谁/怎么死的/死了几个、时间过了多久、谁在场谁不在场、关键数字。"
+    "硬事实分三类："
+    "①物件与规则：道具从哪来/到哪去、药或伤的具体成分与效果、关键数字；"
+    "②人物与时间：位份与称呼、死了谁/怎么死的/死了几个、时间过了多久、谁在场谁不在场；"
+    "③**身份与知情（最容易漏、也最容易崩）**：谁用了化名/替身/假死、对外是什么身份、"
+    "谁认得出她真身、谁以为她已经死了、谁被蒙在鼓里、某件事谁知道了/谁还不知道。"
     "只提取正文里**确实写了**的，不许推测、不许补充。"
 )
 
@@ -2611,7 +2614,8 @@ _FACTS_USER = """正文：
 输出 JSON（只输出 JSON，不要解释）：
 {{"facts": [{{"quote": "正文里逐字出现的一段原句（10-40 字）", "fact": "这条原句锁定了什么（不超过 30 字）"}}]}}
 
-最多 4 条。至少要有一条，且 quote 必须能在正文里逐字找到，否则不许输出。"""
+最多 5 条。三类各至少一条（若正文里确实没有某类内容，该类可缺）。至少要有 1 条，
+且 quote 必须能在正文里逐字找到，否则不许输出。"""
 
 
 def _extract_facts(llm: BaseLLM, text: str, keep: list[str]) -> list[str]:
@@ -2620,6 +2624,11 @@ def _extract_facts(llm: BaseLLM, text: str, keep: list[str]) -> list[str]:
     为什么要这一步：终审 5 处 high 硬伤里有 4 处是「上一节写过的设定，这一节换了
     个说法」——药是安神汤还是断肠草、前两位妃子是怎么死的、停灵几天、信物从哪来。
     写手看不到这些，只能自己编，于是相邻小节互相打架。
+
+    为什么加第三类「身份与知情」：v17 真跑的 6 处 high 里有 2 处是它——女主假死出宫、
+    以「太后娘家表亲遗孤」身份回宫，下一节太后却当面喊她闺名「秋儿」、还提她母亲，
+    假死设定当节作废；另一处是皇帝「忍了你二十年」与前文「早知有毒」互相打架。
+    物件类事实抽得再好，也兜不住「谁知道什么」这条线。
 
     为什么不让模型自报摘要：实测 `[本章摘要]` 会写正文里根本没发生的情节，注入
     下一节只会把错误放大。所以这里要求**给出正文原句**，并用 `quote in text` 硬校验：
@@ -2640,7 +2649,7 @@ def _extract_facts(llm: BaseLLM, text: str, keep: list[str]) -> list[str]:
     except Exception:  # noqa: BLE001
         return keep
     got = []
-    for item in (data.get("facts") or [])[:4]:
+    for item in (data.get("facts") or [])[:5]:
         if isinstance(item, str):
             continue
         quote = str(item.get("quote") or "").strip()
@@ -2735,6 +2744,112 @@ def grade_issue_evidence(issues: list, text: str, min_len: int = 8) -> tuple:
             out.append(item)
             n_down += 1
     return out, n_down
+
+
+def demote_unverified_style(issues: list, text: str) -> tuple:
+    """文风/AI 腔类 high 必须由本项目自己的确定性扫描器背书。
+
+    为什么要有这一步：v16 实测判官报了一处 high「AI腔与句式黑名单密集」，
+    还逐条引了原文（「她指一掀就把那碗药打翻了」「只这株红参就被摸出了三道深痕」），
+    `grade_issue_evidence` 核验通过（引文确实在正文里）。但同一个 `langqa.scan`
+    在那份 9546 字成稿上命中 **0** 条（`high_mid_blacklist: 0`、`frag: 0`、
+    `euro: 0`）——也就是说「密集」是判官按自己的口味说的，不是按本项目的
+    判据清单说的。按 review.md 通用规则①「只按清单判」，这种印象不该把整篇
+    压掉一个档（3 处 high 就会封顶到 55）。
+    口径：跑确定性扫描；该稿 high/mid 命中为 0 时，文风类 high 一律降 mid。
+    扫描器命中 ≥1 条时保持原判（那时是清单内的真违规，判官说得对）。
+    降到 mid 而不是删掉：信息留着，权重降下来——同 `grade_issue_evidence`。
+    """
+    out, n_down = [], 0
+    if not issues or not text:
+        return list(issues or []), 0
+    try:
+        _r = langqa.scan(text)
+        _stats = _r.get("stats") or {}
+        _n_scan = int(_stats.get("high_mid_blacklist") or 0) + int(_stats.get("frag") or 0) \
+            + int(_stats.get("euro") or 0)
+    except Exception:  # noqa: BLE001 —— 扫不了就不降，宁可保留判官原判
+        return list(issues), 0
+    if _n_scan > 0:
+        return list(issues), 0
+    for iss in issues:
+        if not isinstance(iss, dict):
+            continue
+        sev = str(iss.get("severity") or "mid").strip().lower()
+        _blob = f"{iss.get('type') or ''} {iss.get('note') or ''}".lower()
+        _is_style = any(k in _blob for k in _STYLE_ISSUE_KEYS)
+        if sev == "high" and _is_style:
+            item = dict(iss)
+            item["severity"] = "mid"
+            item["style_checked"] = False
+            out.append(item)
+            n_down += 1
+        else:
+            out.append(iss)
+    return out, n_down
+
+
+_STYLE_ISSUE_KEYS = ("文风", "ai腔", "ai 腔", "ai味", "口癖", "句式黑名单", "笔法")
+
+
+_OVERREACH_SYS = """你只回答一个问题：这一节正文有没有把「下一节该做的事」提前写掉。
+只判这一件事，不评价文笔、不评价节奏、不评价好坏、不写建议。
+
+判 yes（越界）的三种情形：
+1) 下一节的核心事件在本节已经**当场演出来**（不是提及、不是派人去办、不是预告）；
+2) 本节的结尾已经推进到下一节结束之后的位置（下一节再写就只剩重复）；
+3) 本节把下一节的关键揭晓提前揭了（谁死、谁认罪、谁被废、东西被谁拿走）。
+
+判 no（不算越界）的四种情形：
+- 本节只是**提到**下一节的事（「明日还要去谢恩」）；
+- 本节停在下一节事件**即将发生**的门口（「门外传来脚步」「有人叩门」）；
+- 本节在为下一节埋钩子、递话头、制造悬念；
+- 本节写的是同一事件的前半段，下一节写后半段。
+
+只输出 JSON：{"overreach": true/false, "why": "一句话，指出越界的那句原文（≤40字）；判 false 时给空串"}"""
+
+_OVERREACH_USER = """【下一节的核心事件（这一节不许写完它）】
+{next_goal}
+
+【下一节的节末钩子（这一节也不许写到这里）】
+{next_hook}
+
+【本节正文】
+{cur}
+
+这一节有没有把上面那件事提前写掉？"""
+
+
+def _sec_overreach(llm: BaseLLM, cur_text: str, next_goal: str, next_hook: str) -> dict:
+    """判「本节有没有把下一节的戏提前写掉」（反方向越界）。
+
+    为什么要加这一条：`_sec_boundary` 判的是「本节开头重演上一节」，方向只有一个。
+    实测 v16 第 08 节把第 09 节的戏提前演完，第 09 节只能退回重演，终审报的是
+    「08 结尾 → 09 开头 时间线倒退 + 重演」——**症状出现在 09，病根在 08**。
+    在 09 重写三轮都修不好（它没有东西可写，只能重复），必须在上游拦。
+    判据用一次轻模型调用：输入约 1200 token、输出约 60 token。
+    """
+    cur_text = (cur_text or "").strip()
+    next_goal = (next_goal or "").strip()
+    if len(cur_text) < 200 or not next_goal:
+        return {"overreach": False, "why": ""}
+    try:
+        raw = llm.chat(_OVERREACH_SYS,
+                       _OVERREACH_USER.format(next_goal=next_goal,
+                                              next_hook=next_hook or "（未给）",
+                                              cur=cur_text[-1800:]),
+                       json_mode=True)
+        from .util import extract_json
+        out = extract_json(raw)
+    except Exception as e:  # noqa: BLE001 —— 判不了就当没越界，不影响写作
+        print(f"[overreach] ⚠ 判定失败（{type(e).__name__}），本节按未越界处理")
+        return {"overreach": False, "why": ""}
+    if not isinstance(out, dict):
+        return {"overreach": False, "why": ""}
+    ok = out.get("overreach")
+    if isinstance(ok, str):
+        ok = ok.strip().lower() in ("true", "yes", "是", "1")
+    return {"overreach": bool(ok), "why": str(out.get("why") or "").strip()}
 
 
 def _sec_boundary(llm: BaseLLM, prev_text: str, cur_text: str) -> dict:
@@ -2980,6 +3095,12 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
         lo_i, hi_i = int(tgt * 0.7), int(tgt * 1.45)
         sec_cast = [str(x).strip() for x in (sec.get("cast") or []) if str(x).strip()]
         carry_out = (sec.get("carry_out") or "").strip()
+        # 下一节的任务：既要写进提示词（让写手知道边界在哪），也要拿来做越界判定。
+        # 只给「不许提前写」而不给「下一节到底要写什么」，写手没有边界感——
+        # 实测 v16 第 08 节把 09 的戏写完，09 只能退回重演。
+        _nxt = secs[i] if i < len(secs) else {}
+        next_goal = str(_nxt.get("goal") or "").strip()
+        next_hook = str(_nxt.get("end_hook") or "").strip()
 
         # 摘要只用「计划里的 goal + 上一节正文首句」，不用模型自报的 [本章摘要]
         # （实测模型会把没写的情节写进摘要，污染下一节的衔接）。
@@ -3013,6 +3134,8 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             CAST=_cast_block(cast, sec_cast),
             CARRY_IN=prev_carry or "（本节是第一节，无交接项）",
             CARRY_OUT=carry_out or "（计划未给本节交接项）",
+            NEXT_GOAL=next_goal or "（本节是最后一节，没有下一节）",
+            NEXT_HOOK=next_hook or "（本节是最后一节，没有下一节）",
             PREV_TIME=_state.prev_time_hint(prev_body) or "（上一节没有明确时点，正常往下写）",
         )
 
@@ -3095,6 +3218,17 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             for _hit in _state.exit_then_present(prev_body or "", body, plan_cast_all)[:2]:
                 print(f"[state] 小节{no:02d} 已退场人物又在场：{_hit['name']}")
                 problems = problems + [_state.hint_exit_present(_hit)]
+            # 反方向越界：本节把下一节的戏提前写掉 → 下一节只能退回重演。
+            # 症状总在下一节爆（终审报「时间线倒退」），病根在本节，所以要在这里拦。
+            # 只在前面几项都过了才判（省调用：字数不够/重演的稿子先改再说）。
+            if next_goal and not problems:
+                _or = _sec_overreach(resolve_llm(cfg, llm, "light"), body, next_goal, next_hook)
+                if _or.get("overreach"):
+                    print(f"[overreach] 小节{no:02d} 把下一节的戏提前写完了：{_or.get('why')}")
+                    problems = problems + [
+                        f"这一节越界把下一节的事写掉了（{_or.get('why') or '下一节的核心事件已经演完'}）"
+                        f"——下一节要写的是「{next_goal}」，本节必须停在它发生之前，"
+                        "删掉已经演完的那部分，把结尾收在本节的 end_hook 上"]
             # 语言病在节级只给**一次**修正机会。实测：整节盲改三轮压不住 AI 口癖
             # （「嘴角勾起一抹」三轮全在），白烧 token 还照样带病交付。真正的去处是
             # 整稿 `_ai_deflavor`——它把命中词与所在句一起喂给模型。这里第二次起放行，
@@ -5083,14 +5217,28 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
             if _n_down:
                 print(f"[stage] 判官 {_n_down} 处 high 硬伤引不出原文，降为 mid"
                       f"（不可核验的印象不参与压档）")
+            # 第二道核验：文风/AI 腔类 high 要有本项目扫描器背书（见函数文档）。
+            best["issues"], _n_style = demote_unverified_style(
+                best.get("issues") or [], text)
+            if _n_style:
+                print(f"[stage] 判官 {_n_style} 处 high「文风/AI 腔」与扫描器不符"
+                      f"（本稿扫描命中 0 条），降为 mid（印象不压档）")
             # 分数与清单必须自洽：模型给的 score 是印象分，issues 是可核验的证据。
             # 口径不是「用清单重算一个分」（试过：清单条数一多就把分压到 15–45，
             # 轮次之间全是噪声，看不出改进），而是**按硬伤条数给分数封顶**——
             # 0–2 处硬伤保留判官原分（它在这一段有分辨力），3 处起依次压到
             # 55/50/45，5 处以上一律不及格。硬伤是「读者会当场看出错」的东西，
             # 有一处就该压一个档次，这个阶梯和人工判稿的顺序一致。
+            # 封顶只数「硬伤」，文风类的 high 不进这个计数（仍然进 issues、仍然
+            # 进交付体检）。理由：封顶的语义是「读者会当场看出这是个错」，连续性
+            # /逻辑/时间线属于这一类；而「AI 腔密集」是通篇风格判断，不是某一处
+            # 的错误，把它和「死人复活」算同一档会把一篇干净的稿子压到 45 分
+            # （v17 实测 10 处 high 里 4 处是文风）。文风的去处是 langqa 与
+            # `language.defect_score`，交付等级判它，不在这里重复扣一次。
             _hi = sum(1 for _i in (best.get("issues") or [])
-                      if str((_i or {}).get("severity") or "mid").strip() == "high")
+                      if str((_i or {}).get("severity") or "mid").strip() == "high"
+                      and not any(k in f"{(_i or {}).get('type') or ''} {(_i or {}).get('note') or ''}".lower()
+                                  for k in _STYLE_ISSUE_KEYS))
             _cap = score_cap_by_high(_hi)
             try:
                 _raw = float(best.get("score") or 0)

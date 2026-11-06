@@ -893,6 +893,32 @@ def _split_body(text: str) -> str:
 _DETERMINISTIC_MAX_ROUNDS = 3
 
 
+def _hard_hit_count(cfg: dict, ctx: dict, body: str) -> int:
+    """数「硬命中」条数：思考泄漏 + 禁用道具 + 语言质检 high 级命中。
+
+    为什么要单开这个计数：终稿复查的重写本身会犯病。v17 实测 recheck 重写
+    把「不是……而是……」这类翻译腔黑名单写进了正文——它修的是上一类问题，
+    写坏的是这一轮没人看的那一类。原来的重写只做长度守卫（`_guard_rewrite`），
+    长度够就照单全收，于是「修好一处、写坏一处」，最后体检判 C 不可投。
+
+    只统计**单点硬伤**（可以逐条数出来的），不数 mid 级措辞瑕疵——mid 在重写里
+    来回抖属正常，拿它当回归判据会把好的重写也拒掉。
+    """
+    n = 0
+    if think_leak(body):
+        n += 10  # 整篇不是正文：任何带泄漏的重写都该被拒
+    if banned_regex(cfg) is not None:
+        brep = scan_banned(body, cfg)
+        n += len(brep.get("hits") or [])
+    try:
+        lqrep = lang_scan(body, genres=_gt(ctx.get("DIRECTION")))
+        n += sum(1 for h in (lqrep.get("hits") or [])
+                 if str(h.get("level") or h.get("severity") or "") == "high")
+    except Exception as e:  # 引擎不可用不该让复查整段失效
+        print(f"    [recheck] 语言质检不可用（{e}），本轮只查思考泄漏与禁用道具")
+    return n
+
+
 def deterministic_recheck(
     cfg: dict,
     writer: WriterAgent,
@@ -967,10 +993,22 @@ def deterministic_recheck(
             + "\n\n重写铁律：只修上面点名的东西，情节/人物/对话/节末钩子一律不动；"
               "全中文输出，不得出现英文分析、提纲或自我检查。"
         )
+        _before_hits = _hard_hit_count(cfg, ctx, body)
         if full_scope:
             text = writer.rewrite_full(ctx, prompt, rnd + 1)
         else:
             text = writer.rewrite(ctx, prompt, rnd + 1)
+        # 回归守卫：重写只许把硬命中改少，不许改多。修好点名的病、同时写进新的
+        # 硬伤（v17 实测把「不是…而是…」翻译腔黑名单写进正文），这份改写不能收。
+        _after_hits = _hard_hit_count(cfg, ctx, _split_body(text))
+        if _after_hits > _before_hits:
+            print(f"    [recheck] ⚠ 本轮重写把硬命中从 {_before_hits} 条改成 "
+                  f"{_after_hits} 条，改写被拒（保留原稿，停止复查）")
+            text = body
+            report["pass"] = False
+            report["gate"] = "rewrite_regressed"
+            report["hard_hits"] = {"before": _before_hits, "after": _after_hits}
+            break
         # 无进展即止损：`_guard_rewrite` 会把"只输出修改片段"的回应判为坍缩并
         # 保留原稿，此时 `text` 与 `body` 一模一样——继续下一轮只会再烧一次调用
         # 得到同样的片段。实测 e2e13 终稿复查连打 3 轮（每轮 ~900 token），

@@ -466,6 +466,9 @@ def main() -> int:
     _test_state_prop_and_exit_ledgers()
     _test_boundary_drops_explained_items()
     _test_grade_issue_evidence()
+    _test_style_high_needs_scanner_backing()
+    _test_sec_overreach_detector()
+    _test_recheck_rejects_rewrite_that_adds_hits()
 
     print("\n全部冒烟测试通过 ✔")
     return 0
@@ -889,6 +892,88 @@ def _test_boundary_drops_explained_items():
     d = pipeline._sec_boundary(_StubLLM(genuine), prev, cur)
     assert [c["item"] for c in d["causeless"]] == ["枕下的银簪"], f"真无因之果必须留，实测 {d}"
     print("[ok] 衔接判据：判词自述有来历的条目被丢弃，真无因之果保留")
+
+
+def _test_style_high_needs_scanner_backing():
+    """文风/AI 腔类 high 必须由本项目扫描器背书，否则降 mid（不压档）。
+
+    实测背景（v16 真跑）：判官报了一处 high「AI腔与句式黑名单密集」并引了原文，
+    `grade_issue_evidence` 核验通过，但同一个 `langqa.scan` 在那份 9546 字成稿上
+    命中 0 条（high_mid_blacklist/frag/euro 全 0）。这类「按自己口味说的话」
+    会让 3 处 high 封顶到 55 分，压掉一整档。
+    """
+    from studio import pipeline
+
+    clean = "我端起碗，喝了半口。" * 40
+    iss = [
+        {"severity": "high", "type": "文风", "note": "AI腔与句式黑名单密集：嘴角勾起一抹"},
+        {"severity": "high", "type": "连续性", "note": "两节重演同一场戏"},
+        {"severity": "mid", "type": "文风", "note": "口癖多"},
+    ]
+    out, n = pipeline.demote_unverified_style(iss, clean)
+    sev = [i["severity"] for i in out]
+    assert n == 1, f"只该降那一条 high 文风，实测降了 {n} 条"
+    assert sev == ["mid", "high", "mid"], f"连续性 high 不许动，实测 {sev}"
+
+    # 扫描器真有命中时，判官说的就是清单内的违规 → 保持 high 不降
+    dirty = ("他嘴角勾起一抹冷笑，空气凝固了。就在这时，眼底闪过一丝狠厉。"
+             "他伸手拿起桌上的茶盏，缓缓开口，声音不大，却带着不容置疑的寒意。") * 12
+    out2, n2 = pipeline.demote_unverified_style(iss, dirty)
+    assert n2 == 0, f"扫描器命中 ≥1 条时不许降级，实测降了 {n2} 条"
+    assert [i["severity"] for i in out2] == ["high", "high", "mid"]
+    print("[ok] 文风类 high 需扫描器背书（0 命中降 mid / 有命中保持 high）")
+
+
+def _test_sec_overreach_detector():
+    """反方向越界判定：本节把下一节的戏提前写完 → 报；只是提一句 → 不报。"""
+    from studio import pipeline
+
+    class _StubLLM:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def chat(self, system, user, json_mode=False):
+            return self.payload
+
+    cur = "我把药吞了下去。" + "字" * 260
+    goal = "太后当场翻脸，当众废后"
+    d = pipeline._sec_overreach(_StubLLM('{"overreach": true, "why": "太后已经当众宣了废后旨意"}'),
+                                cur, goal, "门外传来脚步")
+    assert d["overreach"] is True and d["why"], f"越界必须报，实测 {d}"
+
+    d = pipeline._sec_overreach(_StubLLM('{"overreach": false, "why": ""}'),
+                                cur, goal, "门外传来脚步")
+    assert d["overreach"] is False, f"未越界不许报，实测 {d}"
+
+    # 没有下一节（goal 为空）或正文太短 → 零成本跳过，不调模型
+    class _Boom:
+        def chat(self, *a, **k):
+            raise AssertionError("不该调用模型")
+
+    assert pipeline._sec_overreach(_Boom(), cur, "", "")["overreach"] is False
+    assert pipeline._sec_overreach(_Boom(), "短", goal, "")["overreach"] is False
+    print("[ok] 反方向越界判定（越界报 / 未越界不报 / 无下一节零调用）")
+
+
+def _test_recheck_rejects_rewrite_that_adds_hits():
+    """终稿复查的重写只许把硬命中改少，不许改多。
+
+    历史 bug（v17 真跑）：recheck 重写把「不是……而是……」翻译腔黑名单写进正文，
+    它修的是上一类问题、写坏的是这一轮没人看的那一类，最后体检判 C 不可投。
+    """
+    from studio import agents
+    from studio.config import load_config
+
+    cfg = load_config(None)
+    ctx = {"DIRECTION": "古言"}
+    clean = "她把碗搁下，走到窗边，看了一会儿院子里的槐树。风把叶子翻过来，白花花一片。"
+    dirty = ("她把碗搁下，走到窗边。这不是害怕，而是一种近乎麻木的平静。"
+             "她看了一会儿院子里的槐树。空气仿佛凝固了一般。嘴角勾起一抹冷笑。")
+    n_clean = agents._hard_hit_count(cfg, ctx, clean)
+    n_dirty = agents._hard_hit_count(cfg, ctx, dirty)
+    assert n_clean == 0, f"干净文本不许有硬命中，实测 {n_clean}"
+    assert n_dirty > n_clean, f"脏文本必须多算，实测 {n_dirty} vs {n_clean}"
+    print(f"[ok] 复查回归守卫的判据（干净 {n_clean} 条 / 脏文本 {n_dirty} 条）")
 
 
 if __name__ == "__main__":
