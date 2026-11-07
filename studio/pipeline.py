@@ -2986,6 +2986,28 @@ def plan_causal_check(llm: BaseLLM, plan: dict, idea: str = "",
         return plan, []
     merged = dict(plan)
     merged["sections"] = news
+    # 改完再核一遍：v34 实测第一轮改了 5 处，改法本身又引入一条新的
+    # （第 6 节补的「三日自醒」让第 9 节把女主写成已死，第 9 节又要她出场）。
+    # 修计划时会犯修计划自己的错，所以必须复诊一次；仍报矛盾就采用复诊改版，
+    # 不再无限追（两轮足够，追多了会把计划改成另一部小说）。
+    try:
+        d2 = llm.chat_json(_CAUSAL_SYS,
+                           _CAUSAL_USER.format(idea=idea or "（未提供）",
+                                               n=len(merged.get("sections") or []),
+                                               lo=lo, hi=hi,
+                                               plan=_plan_digest(merged)))
+    except Exception:  # noqa: BLE001
+        return merged, changes
+    if isinstance(d2, dict):
+        _ch2 = [c for c in (d2.get("changes") or []) if isinstance(c, dict)][:5]
+        _n2 = d2.get("sections") or []
+        if _ch2 and len(_n2) == len(merged.get("sections") or []):
+            print(f"[plan] 复诊又发现 {len(_ch2)} 处（第一轮的改法自己带出来的）：")
+            for c in _ch2:
+                print(f"[plan]    第{c.get('sections')}节 · {str(c.get('what'))[:60]}")
+            merged = dict(merged)
+            merged["sections"] = _n2
+            changes = changes + _ch2
     return merged, changes
 
 
