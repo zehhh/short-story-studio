@@ -1257,7 +1257,27 @@ def stage_lead(cfg: dict, llm: BaseLLM, project: Project) -> dict:
         _last["text"], _last["words"] = text, count_words_zh(text)
         return {"text": text, "words": _last["words"], "created_at": now_ts()}
 
-    lead, gate = stage_quality_gate(cfg, llm, project, "导语", _gen)
+    try:
+        lead, gate = stage_quality_gate(cfg, llm, project, "导语", _gen)
+    except Exception as e:  # noqa: BLE001
+        # 导语是**结构性硬项**：体检「A结构/导语」缺失直接判 C 不可投。
+        # 实测 v19 网关 429 重试 6 次仍失败 → 整条链路继续往下跑，
+        # 最后交一篇没有导语的稿子，投稿判定 C，前面 2000 秒全白烧。
+        # 模型不可用时必须降级出一个**确定性的**导语（用已定的 logline/
+        # 冲突/钩子拼），并且明确标记 degraded，不许假装合格。
+        print(f"[stage] ⚠ 导语模型生成失败（{type(e).__name__}: {e}），改用确定性兜底导语")
+        _parts = [
+            str(pitch.get("logline") or "").strip(),
+            str(concept.get("conflict") or pitch.get("core_conflict") or "").strip(),
+            str(concept.get("hook") or "").strip(),
+        ]
+        _txt = "".join(p for p in _parts if p)
+        if not _txt:
+            _txt = str(concept.get("core_trope") or "").strip() or "（导语生成失败，本节暂缺）"
+        if len(_txt) > hi:
+            _txt = _txt[:hi]
+        lead = {"text": _txt, "words": count_words_zh(_txt), "created_at": now_ts()}
+        gate = {"gate": "degraded_fallback", "degraded": True, "error": f"{type(e).__name__}: {e}"[:200]}
     lead["gate"] = gate["gate"]
     # 禁用道具只能定点替换，不能整稿重做（决策 7 / e2e9 实测 3 稿同一处「欠条」）
     _fixed, _ban_rep = _fix_banned_text(cfg, llm, lead["text"], "导语")
@@ -4308,13 +4328,17 @@ def word_gate(cfg: dict, llm, project: Project, full: str) -> tuple[str, dict]:
             new_full = writer.chat(sys_p, user_p).strip()
             new_w = count_words_zh(new_full)
             n_heads = sum(1 for ln in new_full.splitlines() if _SEC_HEAD.match(ln.strip()))
-            if new_w >= total * 1.1 and n_heads >= 3:
+            _ok_e, _why_e = _rewrite_regress(cfg, full, new_full, "整稿扩写", min_keep=1.0,
+                                             pen_slack=1.6, hit_slack=2.0)
+            if new_w >= total * 1.1 and n_heads >= 3 and _ok_e:
                 _old_total = total            # 先留旧值，否则日志把同一个数打两遍
                 full = new_full
                 total = new_w
                 print(f"[gate] 整稿扩写 {new_w} 字（{_old_total} → {new_w}）")
-            else:
+            elif _ok_e:
                 print(f"[guard] 整稿扩写异常（{total}→{new_w} 字，{n_heads} 个小节头），保留原文")
+            else:
+                print(f"[guard] 整稿扩写被语言守卫拒绝（{_why_e}），保留原文")
             rounds += 1
             continue
         secs = _split_full_sections(full)
@@ -4361,11 +4385,15 @@ def word_gate(cfg: dict, llm, project: Project, full: str) -> tuple[str, dict]:
                 new_full = writer.chat(sys_p, user_p).strip()
                 new_w = count_words_zh(new_full)
                 n_heads = sum(1 for ln in new_full.splitlines() if _SEC_HEAD.match(ln.strip()))
-                if new_w >= total * 1.05 and n_heads >= 3:
+                _ok_e, _why_e = _rewrite_regress(cfg, full, new_full, "整稿扩写兜底", min_keep=1.0,
+                                                 pen_slack=1.6, hit_slack=2.0)
+                if new_w >= total * 1.05 and n_heads >= 3 and _ok_e:
                     full = new_full
                     total = new_w
-                else:
+                elif _ok_e:
                     print(f"[guard] 整稿扩写异常（{total}→{new_w} 字，{n_heads} 个小节头），保留原文")
+                else:
+                    print(f"[guard] 整稿扩写兜底被语言守卫拒绝（{_why_e}），保留原文")
         else:
             # 严重超标（> 上限 1.2 倍）时"每轮只压最长一节"杯水车薪（实测 193851 字
             # 靠 8 轮单节压缩绝无可能回到 12000），改走整稿压缩兜底——与不足时的
@@ -4387,12 +4415,17 @@ def word_gate(cfg: dict, llm, project: Project, full: str) -> tuple[str, dict]:
                 new_full = writer.chat(sys_p, user_p).strip()
                 new_w = count_words_zh(new_full)
                 n_heads = sum(1 for _ln in new_full.splitlines() if _SEC_HEAD.match(_ln.strip()))
-                if new_w < total and n_heads >= 3:
+                _ok_c, _why_c = _rewrite_regress(cfg, full, new_full, "整稿压缩", min_keep=0.4,
+                                                 pen_slack=1.6, hit_slack=2.0)
+                if new_w < total and n_heads >= 3 and _ok_c:
                     _old_total = total        # 同上：先留旧值再赋值
                     full, total = new_full, new_w
                     print(f"[gate] 整稿压缩 {_old_total} → {new_w} 字（目标 {int(ceil * 0.95)}）")
-                else:
+                elif _ok_c:
                     print(f"[guard] 整稿压缩异常（{total}→{new_w} 字，{n_heads} 个小节头），保留原文")
+                    break
+                else:
+                    print(f"[guard] 整稿压缩被语言守卫拒绝（{_why_c}），保留原文")
                     break
             else:
                 target = max(secs, key=lambda s: count_words_zh(s["text"]))
@@ -4946,6 +4979,66 @@ def _span_pen(cfg: dict, text: str) -> int:
     except Exception:  # noqa: BLE001
         ai = 0
     return sc + 3 * ai
+
+
+def _lang_rate(cfg: dict, text: str) -> tuple[float, float]:
+    """(缺陷分/千字, 确定性命中条数/千字)。
+
+    **必须按千字折算**：整稿扩写的目的是把稿子写长，直接比绝对值等于
+    「改长就判退稿」，守卫会反过来挡住字数门；而按千字比，扩写后语言
+    质量真的变差（长句暴增、口癖密度上升）才判退化。
+    """
+    w = max(1, count_words_zh(text))
+    try:
+        pen = float(_L.defect_score(text, cfg.get("lang_rules") or {}).get("score", 0) or 0)
+    except Exception:  # noqa: BLE001
+        pen = 0.0
+    try:
+        hits = float(_det_hits_count(cfg, text))
+    except Exception:  # noqa: BLE001
+        hits = 0.0
+    return pen * 1000.0 / w, hits * 1000.0 / w
+
+
+def _rewrite_regress(cfg: dict, old: str, new: str, kind: str,
+                     min_keep: float = 0.9,
+                     pen_slack: float = 1.15,
+                     hit_slack: float = 1.0) -> tuple[bool, str]:
+    """整稿改写的回归守卫：改完必须「不更差」，否则保留原稿。
+
+    为什么需要：每一次整稿重写（读者团打回、字数门扩写/压缩、润色重写）
+    都是把整篇交给模型重写一遍，而模型完全可以让情节骨架不变、语言却整体
+    变坏。实测 v19：读者均分 6.97 差 0.03 触发整稿重写，重写后
+    `longsen 3.89/千字 > 0.6`、缺陷总分 4.32/千字 > 3.0，稿子从 B 掉到 C，
+    而当时唯一的守卫只比了「长度够不够」和「小节头还在不在」。
+    同类 bug 此前在终稿复查里出现过一次（改坏了没人拦），已用
+    `_hard_hit_count` 修掉；这里是同一原则的通用化：
+    **长度守卫防坍缩，结构守卫防丢节，语言守卫防「改一份坏一份」。**
+
+    参数按千字折算，所以扩写/压缩本身不会触发误判。
+    """
+    if not new or not new.strip():
+        return False, "重写结果为空"
+    old_w, new_w = count_words_zh(old), count_words_zh(new)
+    if new_w < int(old_w * min_keep):
+        return False, f"长度坍缩 {old_w}→{new_w} 字（不足 {int(min_keep * 100)}%）"
+    try:
+        if not _polish_intact(new, old):
+            return False, "结构缺失（小节头或骨架被改掉）"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        old_pen, old_hit = _lang_rate(cfg, old)
+        new_pen, new_hit = _lang_rate(cfg, new)
+    except Exception:  # noqa: BLE001
+        return True, "语言指标不可用，跳过语言守卫"
+    if new_pen > old_pen * pen_slack + 1.0:
+        return False, (f"语言缺陷变多 {old_pen:.2f}→{new_pen:.2f}/千字"
+                       f"（容差 {pen_slack:.2f} 倍）")
+    if new_hit > old_hit + hit_slack:
+        return False, (f"确定性命中变多 {old_hit:.2f}→{new_hit:.2f} 条/千字"
+                       f"（容差 +{hit_slack:.1f}）")
+    return True, f"{kind}通过：缺陷 {old_pen:.2f}→{new_pen:.2f}/千字"
 
 
 def _apply_patches_verified(cfg: dict, full: str, patches: list[dict],
@@ -5581,6 +5674,14 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
             if new_full == full:
                 print("[guard] 本轮没有一处补丁通过局部体检，判定无净收益，停止循环")
                 break
+            # 语言守卫：结构还在、字数还在，但整篇语言整体变坏（长句暴增、
+            # 口癖密度上升）同样必须拦——judge 分有 ±6 抖动，可能一点不跌，
+            # 而稿子实际已经掉到不可投。按千字折算，所以补丁把稿子改长改短都不误判。
+            _ok_l, _why_l = _rewrite_regress(cfg, full, new_full, "终审补丁")
+            if not _ok_l:
+                print(f"[guard] 本轮整稿改写被语言守卫拒绝（{_why_l}），保留原稿并停止循环")
+                runlog.event("final_fix", f"语言守卫拒绝：{_why_l}", level="warn")
+                break
             prev_full = full
             full = new_full
             try:
@@ -5681,6 +5782,7 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
         scores = panel.score(fctx, full, 1)
         avg = statistics.mean(s["score"] for s in scores)
         rnd = 1
+        _rejected_reader = False
         while avg < threshold and rnd < max_r:
             print(f"[stage] 读者均分 {avg:.2f} < {threshold}，整稿打回重写（{rnd}/{max_r}）…")
             writer_llm2 = resolve_llm(cfg, llm, "writer")
@@ -5694,11 +5796,21 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
                 STYLE_SAMPLE=_style_sample_f,
             )
             new_full = writer_llm2.chat(sys_f, user_f).strip()
-            if count_words_zh(new_full) < 0.9 * count_words_zh(full) or not _polish_intact(new_full, full):
-                print("[guard] 整稿重写长度不足原稿 90%，疑似坍缩，保留原稿")
+            # 长度/结构/语言三道守卫一起过（见 _rewrite_regress 的注释：v19 就是
+            # 只比了长度，整稿重写后长句密度 0.34→3.89/千字，B 直接掉 C）
+            _ok_r, _why_r = _rewrite_regress(cfg, full, new_full, "读者团重写")
+            if not _ok_r:
+                print(f"[guard] 读者团整稿重写被拒（{_why_r}），保留原稿")
+                runlog.event("reader_rewrite", f"整稿重写被拒：{_why_r}", level="warn")
+                # 拒稿后继续重写没有意义（同一提示词再跑一遍大概率同样跑偏），
+                # 直接结束读者循环，避免把剩下的轮次烧在必然被拒的重写上。
+                _rejected_reader = True
             else:
                 full = new_full
+                _rejected_reader = False
             rnd += 1
+            if _rejected_reader:
+                break
             scores = panel.score(fctx, full, rnd)
             avg = statistics.mean(s["score"] for s in scores)
         full_review = {
@@ -5902,6 +6014,25 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
     # 与补对白还会整稿改写。用旧值会让成稿头部印的字数、report.final_words、
     # word_flow.lost_in_clean、set_stage("final") 全部对不上正文。final_md 因此也
     # 挪到这里拼装（原来在改写之前拼，正文与字数两项都是旧的）。
+    # 最后一道机械返修：上面所有整稿改写（读者团打回、字数门、节长均衡、补对白）
+    # 都在**上一次** deterministic_repair 之后发生，也就是说没人再机械扫过一遍。
+    # 实测 v19：读者团重写把长句密度从 0.34 拉到 3.89/千字，而这道返修跑在
+    # 重写之前，成稿打包时早已超标 → 体检 C 不可投。零 token、只拆超长句/
+    # 合并碎句链，永远不会把稿子改差，所以放在这里兜底。
+    _last_repair = None
+    if (cfg.get("review") or {}).get("lang_repair_enabled", True):
+        try:
+            from .language import deterministic_repair as _lang_repair3
+            _w_before_final = count_words_zh(full)
+            full, _lr3 = _lang_repair3(full)
+            _lr3["words_before"] = _w_before_final
+            _lr3["words_after"] = count_words_zh(full)
+            _last_repair = _lr3
+            _n_fix = sum(int(_lr3.get(k) or 0) for k in ("long", "chain", "dup_para", "aa", "redundancy"))
+            if _n_fix:
+                print(f"[stage] 交付前机械返修：{_n_fix} 处（长句/碎句链/重复段）")
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] 交付前机械返修失败（{type(e).__name__}: {e}），按原稿交付")
     _new_total = count_words_zh(full)
     if _new_total != total_words:
         print(f"[words] 交付前整稿改写使字数 {total_words} → {_new_total}，按新值收口")
@@ -5977,6 +6108,8 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
         report["lang_repair"] = _repair_rep
     if _repair_final is not None:
         report["lang_repair_final"] = _repair_final
+    if _last_repair is not None:
+        report["lang_repair_last"] = _last_repair
     if _conv_rep is not None:
         report["lang_converge"] = _conv_rep
     if _bal_rep is not None:

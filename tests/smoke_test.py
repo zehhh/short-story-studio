@@ -471,6 +471,8 @@ def main() -> int:
     _test_recheck_rejects_rewrite_that_adds_hits()
     _test_strip_body_preamble_removes_duplicate_lead()
     _test_summary_jump_detector()
+    _test_rewrite_regress_guard()
+    _test_direction_keys_fuzzy()
 
     print("\n全部冒烟测试通过 ✔")
     return 0
@@ -1014,6 +1016,53 @@ def _test_summary_jump_detector():
     ok2 = "三日后，我在偏殿见了他。\n\n他手里捏着一封信。"
     assert _summary_jump(ok2) == "", "只跳时间不概括不许报"
     print("[ok] 概述跳跃检测（跳时间+概括报 / 单纯场景切换不报）")
+
+def _test_rewrite_regress_guard():
+    """整稿改写的语言回归守卫：改长改短不误判，语言变差必须拦。"""
+    from studio.pipeline import _rewrite_regress
+
+    NL = chr(10)
+
+    clean = ("01" + NL + NL + "她端着药进来，手一抖，药洒了。我没说话。" * 8 + NL
+             + NL + "02" + NL + NL + "他把碗放在桌上，没抬头。" * 8)
+    ok, why = _rewrite_regress({}, clean, clean, "自检")
+    assert ok, f"同稿应放行，实际 {why}"
+    bad = clean + "就在这时，空气凝固了，嘴角勾起一抹冷笑，眼底闪过一丝阴狠。" * 8
+    ok, why = _rewrite_regress({}, clean, bad, "自检")
+    assert not ok, f"语言变坏稿应被拒，实际 ok={ok}"
+    ok, why = _rewrite_regress({}, clean, clean[: len(clean) // 2], "自检")
+    assert not ok and "坍缩" in why, f"坍缩应被拒，实际 {why}"
+    grow = ("01" + NL + NL + "她端着药进来，手一抖，药洒了。我没说话。" * 16 + NL
+            + NL + "02" + NL + NL + "他把碗放在桌上，没抬头。" * 16)
+    ok, why = _rewrite_regress({}, clean, grow, "自检", min_keep=1.0, pen_slack=1.6, hit_slack=2.0)
+    assert ok, f"等密度扩写应放行，实际 {why}"
+    print("[ok] 整稿改写语言守卫：同稿放行 / 语言变坏拦 / 坍缩拦 / 等密度扩写放行")
+
+
+def _test_direction_keys_fuzzy():
+    """题材名不是梗库原名时也必须解析出 id，且读者画像要覆盖全部梗库方向。"""
+    import json
+    import pathlib
+
+    from studio.agents import _direction_keys
+
+    keys = _direction_keys("婆媳矛盾")
+    assert "poxi" in keys, f"「婆媳矛盾」应解析到 poxi，实际 {sorted(keys)}"
+    keys2 = _direction_keys("宫廷权谋")
+    assert "gongting" in keys2, f"「宫廷权谋」应解析到 gongting，实际 {sorted(keys2)}"
+    assert _direction_keys("完全编造的题材九十九") == {"完全编造的题材九十九"}
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    readers = json.loads((root / "data" / "readers.json").read_text(encoding="utf-8"))["readers"]
+    tropes = json.loads((root / "data" / "tropes.json").read_text(encoding="utf-8"))
+    dirs = tropes.get("directions") or []
+    cov = set()
+    for r in readers:
+        cov |= set(str(x) for x in (r.get("affinity") or []))
+    missing = [str(d.get("id")) for d in dirs if d.get("id") and str(d.get("id")) not in cov]
+    assert not missing, f"这些梗库方向没有任何读者画像覆盖（会退化成默认取样）：{missing}"
+    print("[ok] 题材键模糊解析（婆媳矛盾→poxi）+ 读者画像 42/42 全覆盖")
+
 
 
 if __name__ == "__main__":

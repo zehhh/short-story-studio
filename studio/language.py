@@ -1239,20 +1239,34 @@ def split_long_sentences(text: str, max_len: int | None = None,
 
     def _pick_cut(s: str) -> int:
         depth = 0
-        cands: list[int] = []
+        strong: list[int] = []
+        weak: list[int] = []
         for k, ch in enumerate(s):
             if ch in "「“『":
                 depth += 1
             elif ch in "」”』":
                 depth -= 1
             elif ch == "，" and depth == 0:
+                if not (10 <= k <= len(s) - 12):
+                    continue
                 rest = s[k + 1:]
-                if _SUBJ_SPLIT.match(rest) and 12 <= k <= len(s) - 14:
-                    cands.append(k)
-        if not cands:
-            return -1
-        half = len(s) / 2.0
-        return min(cands, key=lambda k: abs(k - half))
+                # 强断点：逗号后面接的是新主语/新时间，本来就是句子边界。
+                if _SUBJ_SPLIT.match(rest):
+                    strong.append(k)
+                # 弱断点：逗号两侧都够长，断成句也读得通。
+                # 为什么需要它：`_SUBJ_SPLIT` 只认 30 来个起头词，古言/书面语里
+                # 「若是承认这是太后的药，那就是抗旨不遵」这类「，那就…」它认不出，
+                # 实测 9692 字的稿子 34 个超长句只能拆掉 3 个，长句密度 3.89/千字
+                # 死活下不来（体检直接判 C）。中文里「逗号当句号用」是合法断句，
+                # 取中点附近的逗号断开，语义不会被切断。
+                weak.append(k)
+        if strong:
+            half = len(s) / 2.0
+            return min(strong, key=lambda k: abs(k - half))
+        if weak:
+            half = len(s) / 2.0
+            return min(weak, key=lambda k: abs(k - half))
+        return -1
 
     n = 0
     for _ in range(budget * 3 + 40):

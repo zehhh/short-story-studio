@@ -49,8 +49,32 @@ def _direction_keys(direction: str) -> set[str]:
         if not p:
             continue
         out.add(p)
+        exact = False
         for d in dirs:
             if p in (d.get("id"), d.get("name")):
+                exact = True
+                if d.get("id"):
+                    out.add(str(d["id"]))
+                if d.get("name"):
+                    out.add(str(d["name"]))
+        if exact:
+            continue
+        # 精确匹配失败 → 按字面重合度找最近的梗库方向。
+        # 模型给的题材名常常不是梗库原名（实测 v19 传「宫廷权谋」能命中，
+        # 但「婆媳矛盾」命不中「婆媳大战」」，结果读者团悄悄退化成默认前 N 个）。
+        scored = []
+        pc = set(p)
+        for d in dirs:
+            name = str(d.get("name") or "")
+            if not name:
+                continue
+            nc = set(name)
+            if not nc:
+                continue
+            scored.append((len(pc & nc) / len(nc), d))
+        scored.sort(key=lambda x: -x[0])
+        for score, d in scored[:2]:
+            if score >= 0.5:
                 if d.get("id"):
                     out.add(str(d["id"]))
                 if d.get("name"):
