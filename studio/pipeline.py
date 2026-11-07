@@ -6774,10 +6774,16 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
         _cd = _aud.get("cross_dup") or {}
         if _cd.get("hits"):
             report["cross_dup"] = _cd
-            if int(_cd.get("max_len") or 0) < _au.CDUP_FAIL_LEN:
-                _soft.append(f"跨章逐字重复 {len(_cd['hits'])} 处"
-                             f"（最长 {_cd['max_len']} 字，如第{_cd['hits'][0]['ch']}章"
-                             f"复用第{_cd['hits'][0]['prev']}章「{_cd['hits'][0]['text'][:16]}」）")
+            # 只有够到文档阈值（`CDUP_WARN_LEN`）的重复才进理由。`cross_dup` 内部
+            # 从 12 字起报，而 12—23 字在语言规则里明确判「轻」（这个长度可能是
+            # 正当的固定说法）——v36 就是拿一条 12 字的报进了交付理由，和
+            # `language.py` 里写的口径自相矛盾。
+            _cd_real = [h for h in _cd["hits"]
+                        if int(h.get("len") or len(h.get("text") or "")) >= _au.CDUP_WARN_LEN]
+            if _cd_real and int(_cd.get("max_len") or 0) < _au.CDUP_FAIL_LEN:
+                _soft.append(f"跨章逐字重复 {len(_cd_real)} 处"
+                             f"（最长 {_cd['max_len']} 字，如第{_cd_real[0]['ch']}章"
+                             f"复用第{_cd_real[0]['prev']}章「{_cd_real[0]['text'][:16]}」）")
         # 书名卖点分：签约第一道门槛，随 report 落盘并进投稿结论。
         _pitch_r = project.load_json("pitch.json") or {}
         _title = str(_pitch_r.get("title") or "")
