@@ -2028,6 +2028,93 @@ def _dedup_section_boundaries(full: str) -> str:
 
 
 
+def _fix_boundary_replay(cfg: dict, llm: BaseLLM, full: str,
+                         max_fix: int = 3) -> tuple[str, list[dict]]:
+    """相邻节「重演上一节」的**定向返修**：只改后一节的开头一段。
+
+    为什么必须在装配后单独做一遍：v28 六轮终审里，唯一稳定失分项是
+    「07 结尾太后已把碗搁回柜上 → 08 开头又灌一遍」，判官每轮都报，补丁每轮
+    都改不掉——补丁是整稿 search/replace，改一句要它自己找出该改哪句；而这条
+    缺陷的位置是**已知的**（第 N 节第一段），完全可以定点改。
+
+    做法：逐边界跑 `_sec_boundary`（它已经会引两处原文），命中才改；改完当场
+    复判，复判仍是重演或引出自我重复就回滚这一处。宁可漏改，不许改坏。
+    """
+    secs = _split_full_sections(full)
+    if len(secs) < 2:
+        return full, []
+
+    def _body_of(t):
+        bl = t["text"].splitlines()
+        if bl and _SEC_HEAD.match(bl[0].strip()):
+            bl = bl[1:]
+        return chr(10).join(bl).strip()
+
+    recs: list[dict] = []
+    fixed = 0
+    for i in range(len(secs) - 1):
+        if fixed >= max_fix:
+            break
+        prev_b, cur_b = _body_of(secs[i]), _body_of(secs[i + 1])
+        if len(prev_b) < 200 or len(cur_b) < 200:
+            continue
+        try:
+            r = _sec_boundary(llm, prev_b, cur_b)
+        except Exception as e:  # noqa: BLE001
+            print(f"[boundary] ⚠ 第{secs[i+1]['no']}节衔接复判失败（{type(e).__name__}），跳过")
+            continue
+        if not r.get("replay"):
+            continue
+        why = (r.get("why") or "开头重演了上一节已经写完的事").strip()
+        head = cur_b[:260]
+        print(f"[boundary] 第{secs[i+1]['no']}节开头重演上一节：{why[:60]} —— 定点改写开头")
+        sys_p = (
+            "你在给连载小说改一处衔接硬伤。只改给定的「本节开头」，其余内容一个字都不许动。"
+            "硬伤：这一节开头把上一节已经演完的事又演了一遍。\n"
+            "要求：从上一节最后那个动作**之后**接着写，第一句就进新动作或新信息；"
+            "不许重复上一节已经写过的动作、台词、神态；保持原人称与口吻；"
+            "字数与原来大致相当（可浮动两成）；只输出改写后的这段开头正文，不要解释。"
+        )
+        _nl = chr(10)
+        usr_p = _nl.join([
+            "【上一节结尾】", prev_b[-400:], "",
+            "【本节开头（要改的就是这一整段）】", head, "",
+            "【本节后面已经写好的内容（只用于保持连贯，不许重复输出）】",
+            cur_b[260:520], "",
+            f"【判官指出重演的地方】{why}",
+        ])
+        try:
+            new_head = (llm.chat(sys_p, usr_p) or "").strip()
+        except Exception as e:  # noqa: BLE001
+            recs.append({"no": secs[i + 1]["no"], "ok": False, "why": f"改写失败 {type(e).__name__}"})
+            continue
+        if len(new_head) < 60 or len(new_head) > len(head) * 2.2:
+            recs.append({"no": secs[i + 1]["no"], "ok": False, "why": "改写长度异常"})
+            continue
+        cand_b = new_head + cur_b[len(head):]
+        # 三条硬约束：不许自我重复、不许把边界重复搬回来、字数不许塌
+        if _self_dup(cand_b):
+            recs.append({"no": secs[i + 1]["no"], "ok": False, "why": "改写后本节出现自我重复"})
+            continue
+        if count_words_zh(cand_b) < count_words_zh(cur_b) * 0.8:
+            recs.append({"no": secs[i + 1]["no"], "ok": False, "why": "改写后本节字数塌陷"})
+            continue
+        try:
+            again = _sec_boundary(llm, prev_b, cand_b)
+        except Exception:  # noqa: BLE001
+            again = {"replay": False}
+        if again.get("replay"):
+            recs.append({"no": secs[i + 1]["no"], "ok": False, "why": "复判仍是重演，回滚"})
+            continue
+        _hl = secs[i + 1]["text"].splitlines()
+        _head = _hl[0].strip() if _hl else f"{secs[i + 1]['no']:02d}"
+        secs[i + 1]["text"] = (_head + chr(10) + chr(10) + cand_b).strip()
+        fixed += 1
+        recs.append({"no": secs[i + 1]["no"], "ok": True, "why": why[:60]})
+        print(f"[boundary] 第{secs[i+1]['no']}节开头已改写，复判不再重演")
+    return (_join_sections(secs, full) if fixed else full), recs
+
+
 def _clean_direct_raw(raw: str) -> str:
     """清洗写手输出的非正文残留：开头的"我将为您创作…"元说明、孤立的 --- 分隔线。
 
@@ -2578,16 +2665,19 @@ def plan_replay_risk(plan: dict) -> list[dict]:
             if not isinstance(a, dict) or not isinstance(b, dict):
                 continue
             why = []
+            ga, gb = _goal_grams(a.get("goal") or ""), _goal_grams(b.get("goal") or "")
+            jac = (len(ga & gb) / len(ga | gb)) if (ga and gb) else 0.0
+            # 同一地点**本身不是问题**：太后在慈宁宫出现三次很正常，v28 的计划里
+            # 1 与 5 都在慈宁宫，但一次是受封赐汤、一次是主动请安——两件不同的事。
+            # 只有「同一场戏 + 核心事件也像」才是重演，所以 scene 相等必须配
+            # goal 相似度才算命中（0.18 是远低于「同一件事换个说法」的下限）。
             sa = (a.get("scene") or "").strip()
             sb = (b.get("scene") or "").strip()
-            if sa and sb and sa == sb:
-                why.append(f"两节同一场戏「{sa}」")
-            ga, gb = _goal_grams(a.get("goal") or ""), _goal_grams(b.get("goal") or "")
+            if sa and sb and sa == sb and jac >= 0.18:
+                why.append(f"两节同一场戏「{sa}」且核心事件相近（相似度 {jac:.2f}）")
             _lim = 0.34 if j == i + 1 else (0.46 if j == i + 2 else 0.58)
-            if ga and gb:
-                jac = len(ga & gb) / len(ga | gb)
-                if jac >= _lim:
-                    why.append(f"核心事件重复（相似度 {jac:.2f}）")
+            if jac >= _lim:
+                why.append(f"核心事件重复（相似度 {jac:.2f}）")
             if not why:
                 continue
             out.append({
@@ -3594,6 +3684,15 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
                                              "dup_fixes": len([d for d in dup_fixes if d.get("applied")]),
                                              "targets": [s["target"] for s in stats]})
     print(f"[stage] 逐节装配完成 {count_words_zh(full)} 字 / {len(stats)} 节")
+    # 相邻节重演是装配后唯一稳定的失分项（v28 六轮终审每轮都报 07→08 灌药重演，
+    # 补丁改不动——补丁要自己找该改哪句，而这条缺陷的位置是已知的）。这里定点改。
+    _bnd_full, _bnd = _fix_boundary_replay(cfg, writer_llm, full, max_fix=3)
+    if _bnd:
+        _n_ok = sum(1 for r in _bnd if r.get("ok"))
+        print(f"[boundary] 相邻节重演定点返修：改好 {_n_ok} 处 / 命中 {len(_bnd)} 处")
+        if _n_ok:
+            full = _bnd_full
+    project.save_json("boundary_fix.json", {"items": _bnd})
 
     # 与整篇写同一套收尾：标题、末节收束、pitch/bible、提交
     raw = _normalize_sections(full)

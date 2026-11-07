@@ -1190,6 +1190,14 @@ def _test_plan_replay_nonadjacent():
         {"no": 3, "goal": "皇帝查太医院旧案", "scene": "御书房·皇帝"},
     ]}
     assert not plan_replay_risk(clean), "不同的戏不许误报"
+    # 同一地点但两件不同的事：不算重演（v28 的 1/5 节都在慈宁宫，一次受封赐汤、
+    # 一次主动请安，判据误报会让计划白白重排一次）
+    same_scene = {"sections": [
+        {"no": 1, "goal": "受封仪式上太后当众赐我一碗安神汤", "scene": "慈宁宫·太后"},
+        {"no": 2, "goal": "我深夜潜入御书房查红花进贡记录", "scene": "御书房·无人"},
+        {"no": 3, "goal": "我每日请安并主动讨要太后的补汤", "scene": "慈宁宫·太后"},
+    ]}
+    assert not plan_replay_risk(same_scene), f"同地点不同事不许误报：{plan_replay_risk(same_scene)}"
     print("[ok] 分节计划重演风险：隔节同场戏报 / 不同戏不误报")
 
 
