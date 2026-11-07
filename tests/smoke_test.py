@@ -1041,6 +1041,17 @@ def _test_body_trope_cluster():
     assert langqa.scan(ok)["stats"]["body_clusters"] == 0, "行为结果不许判堆叠"
     print("[ok] 生理反应堆叠（单个不报 / 密集才报 / 严重度 mid）")
 
+    # 密度判据：阈值来自 onehu 人类语料（中位 0.21/千字、p90 0.73），取 1.2 作红线。
+    # 构造 1000 字里 2 处（2.0/千字）→ 必须报；1000 字里 1 处（1.0/千字）→ 不报。
+    _filler = "她把帕子叠好，放回袖中，又看了一眼门外。" * 40
+    dense = "额角沁出冷汗。" + _filler + "寒意顺着骨头缝往里钻。"
+    r3 = langqa.scan(dense)
+    assert r3["stats"]["body_rate"] >= 1.2, f"密度必须算出来，实测 {r3['stats']['body_rate']}"
+    assert any("密度超标" in h["label"] for h in r3["hits"]), "密度超标必须报"
+    thin = "额角沁出冷汗。" + _filler * 2
+    assert langqa.scan(thin)["stats"]["body_rate"] < 1.2, "单处不许判密度超标"
+    print("[ok] 生理反应密度（人类基准 0.21/千字 · 红线 1.2）")
+
 def _test_rewrite_regress_guard():
     """整稿改写的语言回归守卫：改长改短不误判，语言变差必须拦。"""
     from studio.pipeline import _rewrite_regress

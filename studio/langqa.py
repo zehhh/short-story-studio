@@ -590,6 +590,9 @@ def _rule_not_genres(rule: dict) -> tuple[str, ...]:
     return (g,) if isinstance(g, str) else tuple(g)
 
 
+# 生理反应密度红线（/千字）：人类语料 p90 = 0.73，取 1.2 作节级红线
+_BODY_RATE_FAIL = 1.2
+
 # 身体反应 / 神态套词（只用于判聚集，不做逐词禁令）
 _BODY_TROPE = re.compile(
     r"冷汗|寒意|凉意|骨缝|骨头缝|筛糠|瞳孔|眼底|眸色|指节|喉结|鬓发|鬓角|掌心"
@@ -899,10 +902,33 @@ def scan(text: str, rules: dict | None = None, genres: tuple[str, ...] | list[st
             }
         )
 
+    # 密度判据：优先于「聚集」——聚集只是密度的极端形态。阈值不是拍脑袋定的：
+    # 实测 onehu 语料库 79 篇真实上架短篇（均 11081 字），身体/神态词密度
+    # 中位 0.21/千字、p75 0.40、p90 0.73、最高 1.17。生成稿 v21 是 **2.86/千字**
+    # （人类的 13.6 倍、超过人类最高值的 2.4 倍），所以判官说「测量式细节密集」
+    # 不是口味，是事实。取 1.2 作节级红线（略高于人类 p90，留改进余量）。
+    _bt_rate = (len(_bt_pos) / n_chars * 1000) if n_chars else 0.0
+    if _bt_rate >= _BODY_RATE_FAIL:
+        hits.append(
+            {
+                "kind": "文风",
+                "label": "AI味·生理反应密度超标",
+                "note": (
+                    f"身体/神态词 {len(_bt_pos)} 处，密度 {_bt_rate:.2f}/千字——"
+                    f"真人短篇中位 0.21、p90 0.73（本库 79 篇实测）"
+                ),
+                "suggest": "这场戏只留一处身体反应，其余全换成有后果的动作："
+                           "手抖→「茶盏磕在案沿，泼了半盏」；怕→「她把裙角攥进手心」；"
+                           "惊→「她手里那支笔停在半空，一直没落下来」",
+                "severity": "mid",
+            }
+        )
+
     stats = {
         "chars": n_chars,
         "paras": len(paras),
         "body_trope": len(_bt_pos),
+        "body_rate": round(_bt_rate, 3),
         "body_clusters": len(_bt_clusters),
         # 文风类 high 命中条数：给 pipeline 的「判官文风 high 要不要压档」用。
         # 只要有一条硬红线（high 级）真的命中，就不该把判官的意见降级。
