@@ -2901,6 +2901,65 @@ def _sec_overreach(llm: BaseLLM, cur_text: str, next_goal: str, next_hook: str) 
     return {"overreach": bool(ok), "why": str(out.get("why") or "").strip()}
 
 
+_SEC_STATE_SYS = (
+    "你是连载小说的场记。读完一节正文，只输出它**结尾那一刻**的状态，严格 JSON："
+    '{"here":"地点","when":"时辰或日子","on":["结尾时还在场的人"],'
+    '"done":["本节已经演完的事，最多3条"],"knows":["主角本节新知道的信息，最多3条"]}'
+    "\n规矩：只写正文里明写的；推断不出来就写空字符串或空数组，不许编；"
+    "不许评价文笔，不许给建议，只输出 JSON。"
+)
+
+
+def _sec_state(llm: BaseLLM, body: str) -> dict:
+    """把一节正文压成「结尾状态」：在哪、什么时候、谁在场、演完了什么、知道了什么。
+
+    为什么要有它：逐节写时每节都是一次全新对话，写手只有上一节全文可看，
+    而正文一千多字，真正约束下一节的只有「结尾那一秒的状态」。v24–v26 三版
+    终审的 high 硬伤（时间线倒退、已完成动作重演、信息当新发现再演一遍）
+    全是这一类——把状态显式写出来，比在正文里找线索更可靠。
+    失败一律返回空 dict（拿不到状态就退回旧行为，绝不阻断写作）。
+    """
+    body = (body or "").strip()
+    if len(body) < 200:
+        return {}
+    try:
+        raw = llm.chat(_SEC_STATE_SYS, body[-1400:], json_mode=True)
+        from .util import extract_json
+
+        d = extract_json(raw or "")
+    except Exception as e:  # noqa: BLE001
+        print(f"[state] ⚠ 场记台账抽取失败（{type(e).__name__}），本节不注入状态")
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    out = {"here": str(d.get("here") or "")[:20],
+           "when": str(d.get("when") or "")[:20],
+           "on": [str(x)[:10] for x in (d.get("on") or []) if str(x).strip()][:6],
+           "done": [str(x)[:40] for x in (d.get("done") or []) if str(x).strip()][:3],
+           "knows": [str(x)[:40] for x in (d.get("knows") or []) if str(x).strip()][:3]}
+    if not (out["here"] or out["when"] or out["on"] or out["done"]):
+        return {}
+    return out
+
+
+def _state_block(st: dict) -> str:
+    """把场记台账渲染成提示词里的一段。空台账给一句明确的「无」。"""
+    if not st:
+        return "（本节是第一节，或上一节状态抽取失败——按计划写即可）"
+    lines = []
+    if st.get("here"):
+        lines.append(f"地点：{st['here']}")
+    if st.get("when"):
+        lines.append(f"时辰：{st['when']}")
+    if st.get("on"):
+        lines.append("在场的人：" + "、".join(st["on"]))
+    for d in st.get("done") or []:
+        lines.append(f"已经演完：{d}")
+    for k in st.get("knows") or []:
+        lines.append(f"主角已经知道：{k}")
+    return chr(10).join(lines) if lines else "（无）"
+
+
 def _sec_boundary(llm: BaseLLM, prev_text: str, cur_text: str) -> dict:
     """判「这一节开头有没有重演上一节」+「本节有没有无因之果」。
 
@@ -3207,6 +3266,8 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
     dup_fixes: list[dict] = []
     prev_body = ""
     prev_carry = ""
+    prev_state: dict = {}
+    state_ledger: list[dict] = []
     # 已确立的硬事实（每节抽一次，逐字校验过的才留下），注入下一节防自相矛盾
     facts: list[str] = []
     cast = _plan_cast(plan)
@@ -3287,6 +3348,7 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             NEXT_GOAL=next_goal or "（本节是最后一节，没有下一节）",
             NEXT_HOOK=next_hook or "（本节是最后一节，没有下一节）",
             PREV_TIME=_state.prev_time_hint(prev_body) or "（上一节没有明确时点，正常往下写）",
+            SEC_STATE=_state_block(prev_state),
         )
 
         best, best_pb, best_off = "", None, 10 ** 9
@@ -3460,6 +3522,11 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
         prev_body = best
         prev_carry = carry_out
         body_list.append(best)
+        # 场记台账：把这一节的结尾状态抽成结构化的一段，喂给下一节。
+        # 拿不到就留空，`_state_block` 会给一句「按计划写即可」。
+        prev_state = _sec_state(resolve_llm(cfg, llm, "light"), best)
+        if prev_state:
+            state_ledger.append({"no": no, **prev_state})
         facts = _extract_facts(resolve_llm(cfg, llm, "light"), best, facts)
         stats.append({"no": no, "words": count_words_zh(best), "target": tgt,
                       "pass": not best_pb, "problems": best_pb or [],
@@ -3488,6 +3555,7 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
         print("[stage] 连续性体检：" + _contin.summary(_cont))
     except Exception as e:  # noqa: BLE001
         print(f"[stage] ⚠ 连续性体检异常（{type(e).__name__}: {e}）")
+    project.save_json("event_ledger.json", {"sections": state_ledger})
     project.save_json("section_stats.json", {"sections": stats,
                                              "words": count_words_zh(full),
                                              "dup_fixes": len([d for d in dup_fixes if d.get("applied")]),
