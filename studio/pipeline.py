@@ -2837,6 +2837,9 @@ _REPLAY_SYS = (
     "（转身进了内室、绕过屏风站定、跪下、落座、被人押进殿、把碗放回案上），"
     "这一节开头又把同一个位移走了一遍。哪怕这一节换了对手、换了说的话，"
     "「人已经在内室里了，又走了一遍进内室」就是重演，判 true 并给出两句原文。\n"
+    "**分节计划里本来就有的东西不算凭空出现**：计划自己写明了「提前服下假死药」"
+    "这类安排，本节只写「提前服用」而不写药从哪来，**不判 causeless**——来历是"
+    "计划层的问题，不是这一节的问题。只报计划里没提、本节第一次冒出来、当场就拿去用的。\n"
     "**扩写也是重演**：把上一节已经写完的一个动作/一个细节，换个说法拉长成一段"
     "（同一件事、同一件东西、同一句台词，只是形容更细），判 true 并给出两句原文。"
     "区分：升级 = 有新后果（碗碎了、人倒下了、秘密被第三个人听见）；"
@@ -2857,7 +2860,10 @@ _REPLAY_SYS = (
     "causeless 只收「找不到来历」的那几条，宁可留空。"
 )
 
-_REPLAY_USER = """上一节正文（结尾部分）：
+_REPLAY_USER = """分节计划摘要（计划里已经写明的道具/安排，不算凭空出现）：
+{plan}
+
+上一节正文（结尾部分）：
 {prev}
 
 这一节开头：
@@ -3217,7 +3223,7 @@ def _state_block(st: dict) -> str:
     return chr(10).join(lines) if lines else "（无）"
 
 
-def _sec_boundary(llm: BaseLLM, prev_text: str, cur_text: str) -> dict:
+def _sec_boundary(llm: BaseLLM, prev_text: str, cur_text: str, plan_text: str = "") -> dict:
     """判「这一节开头有没有重演上一节」+「本节有没有无因之果」。
 
     为什么要用 LLM 判而不是词法判：实测过三种确定性做法——
@@ -3239,7 +3245,8 @@ def _sec_boundary(llm: BaseLLM, prev_text: str, cur_text: str) -> dict:
         return {"replay": False, "causeless": []}
     try:
         raw = llm.chat(_REPLAY_SYS,
-                       _REPLAY_USER.format(prev=prev_text[-900:], cur=cur_text[:1300]),
+                       _REPLAY_USER.format(plan=(plan_text or "（未提供）")[:600],
+                                           prev=prev_text[-900:], cur=cur_text[:1300]),
                        json_mode=True)
     except Exception as e:  # noqa: BLE001 —— 判不了就当没问题，不影响写作
         print(f"[boundary] ⚠ 衔接判据失败（{type(e).__name__}），本节跳过")
@@ -3701,7 +3708,10 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             # 弹出」前文从没提过银针）。词法判据实测全失效（见 state.py 顶部），
             # 这里用一次轻模型调用判衔接；每轮都判（重写后仍重演的会被再拦一次）。
             if prev_body:
-                _bp = _sec_boundary(resolve_llm(cfg, llm, "light"), prev_body, body)
+                _plan_txt = "\n".join(
+                    f"{s.get('title') or ''} {s.get('goal') or ''}" for s in secs)
+                _bp = _sec_boundary(resolve_llm(cfg, llm, "light"), prev_body, body,
+                                    _plan_txt)
                 if _bp.get("replay"):
                     print(f"[boundary] 小节{no:02d} 开头疑似重演上一节：{_bp.get('why')}")
                     problems = problems + [
@@ -3717,7 +3727,10 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             # 无因之果的确定性那一半：前文没提过 + 本节首次出现 + 当场就用 +
             # 这句没交代来历。全库 35 篇只命中 3 处，其中真阳性明确。
             if prev_body:
-                for _hit in _state.causeless(prev_body, body)[:2]:
+                _decl = "\n".join(
+                    f"{s.get('title') or ''} {s.get('goal') or ''} {s.get('scene') or ''}"
+                    for s in secs)
+                for _hit in _state.causeless(prev_body, body, _decl)[:2]:
                     problems = problems + [_state.hint_causeless(_hit)]
             # 台账的另一半：已经用掉的东西又拿出来 / 已经退场的人又在场。
             # 这两类判官能引原文说明它抓得准（v15 第 08 节「蜜丸已吞下又取出

@@ -181,7 +181,7 @@ _USE_RE = re.compile(
 _HYPOTHETICAL_RE = re.compile("除非|如果|要是|倘若|若是|难道|或者|并不会|不是")
 
 
-def causeless(prev_text: str, body: str) -> list[dict]:
+def causeless(prev_text: str, body: str, declared: str = "") -> list[dict]:
     """本节首次出现、前文没提过、本句也没交代来源的道具/手段。
 
     只报「前文完全没有 + 本节首次出现的那句没有来源线索 + 那句确实在拿它做事」
@@ -189,10 +189,15 @@ def causeless(prev_text: str, body: str) -> list[dict]:
     `pipeline._sec_boundary` 的轻模型判。
     """
     prev_have = set(items_in(prev_text))
+    # 分节计划里本来就写着的东西不算凭空——「来历」是计划层的问题，
+    # 不是本节的问题。v36 实测：计划只说「提前服下假死药」，写手每节都写
+    # 「提前服用」而不写来源，于是 06/07 连续被判无因之果、各自重写 3 次
+    # 仍不过——门禁把「计划没交代」错算在「这一节没交代」头上。
+    plan_have = set(items_in(declared)) if declared else set()
     out: list[dict] = []
     checked: set[str] = set()
     for item in items_in(body):
-        if item in prev_have or item in checked:
+        if item in prev_have or item in plan_have or item in checked:
             continue
         checked.add(item)
         fm = first_mention(body, item)
