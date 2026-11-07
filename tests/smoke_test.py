@@ -476,6 +476,7 @@ def main() -> int:
     _test_body_trope_cluster()
     _test_self_dup_guard()
     _test_plan_replay_nonadjacent()
+    _test_prop_confusion_names()
     _test_plan_causal_check_keeps_plan_shape()
     _test_rewrite_regress_guard()
     _test_direction_keys_fuzzy()
@@ -1173,6 +1174,15 @@ def _test_self_dup_guard():
     assert not _self_dup("短"), "过短文本直接放过"
     print("[ok] 节内自我重复：复制残句报 / 正常段落不误报")
 
+
+def _test_prop_confusion_names():
+    """只差一个字的道具名要报出来（锦囊/药囊、玉佩/玉牌），其余不报。"""
+    from studio.pipeline import prop_confusion
+    h = prop_confusion(["锦囊", "药囊", "玉佩", "玉牌", "银针", "绢帛"])
+    assert ("锦囊", "药囊") in h and ("玉佩", "玉牌") in h, h
+    assert not any("银针" in p for p in h), "长度不同/不形近的不许报"
+    assert prop_confusion([]) == [] and prop_confusion(["碗"]) == []
+    print("[ok] 道具形近名：锦囊/药囊 与 玉佩/玉牌 报出，不形近的不误报")
 
 def _test_plan_causal_check_keeps_plan_shape():
     """计划级因果校验：节数对得上才采用改版，对不上宁可不动。"""

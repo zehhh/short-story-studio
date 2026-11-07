@@ -3154,10 +3154,39 @@ def _sec_state(llm: BaseLLM, body: str) -> dict:
            "on": [str(x)[:10] for x in (d.get("on") or []) if str(x).strip()][:6],
            "done": [str(x)[:40] for x in (d.get("done") or []) if str(x).strip()][:3],
            "knows": [str(x)[:40] for x in (d.get("knows") or []) if str(x).strip()][:3],
-           "told": [str(x)[:40] for x in (d.get("told") or []) if str(x).strip()][:3]}
+           "told": [str(x)[:40] for x in (d.get("told") or []) if str(x).strip()][:3],
+           "props": [str(x)[:8] for x in (d.get("props") or []) if str(x).strip()][:4]}
     if not (out["here"] or out["when"] or out["on"] or out["done"]):
         return {}
     return out
+
+
+_PROP_STOP = ("的", "了", "一", "那", "这", "只", "个", "把")
+
+def prop_confusion(names: list) -> list:
+    """从已知道具名里找出「只差一个字」的那些对——分节盲写必然写混的那一类。
+
+    为什么要点名：锦囊 / 药囊、玉佩 / 玉牌，写手每节只看得到压缩过的场记，
+    两个只差一个字的东西在它眼里就是一个。v35 判官原文：「锦囊（皇上给的催吐
+    引子）与药囊（被掉包的香药）混用，读者分不清哪个是谁给的」——不是写手笨，
+    是没人告诉它这是两个东西。
+
+    判据：**等长且只差一个字**（同位置 1 处不同）。故意窄——宁可漏报，
+    不制造噪声；同尾虚词、长度不同的不算。
+    """
+    seen, hits = [], []
+    for raw in (names or []):
+        n = str(raw or "").strip()
+        if len(n) < 2 or len(n) > 5:
+            continue
+        if any(ch in n for ch in _PROP_STOP):
+            continue
+        for other in seen:
+            if len(other) == len(n) and sum(a != b for a, b in zip(other, n)) == 1:
+                if (other, n) not in hits:
+                    hits.append((other, n))
+        seen.append(n)
+    return hits[:3]
 
 
 def _state_block(st: dict) -> str:
@@ -3173,6 +3202,12 @@ def _state_block(st: dict) -> str:
         lines.append("在场的人：" + "、".join(st["on"]))
     for d in st.get("done") or []:
         lines.append(f"已经演完：{d}")
+    _pairs = prop_confusion(st.get("props") or [])
+    if _pairs:
+        lines.append("⚠ 这几样东西名字只差一个字，是本项目实测最容易被写混的：")
+        for a, b in _pairs:
+            lines.append(f"  「{a}」和「{b}」是两个不同的东西，写的时候必须说清是谁给的、"
+                         f"在谁手里，不许混着用")
     for k in st.get("knows") or []:
         lines.append(f"主角已经知道：{k}")
     # 摊开的底牌是「对方已经知道」的反向约束：v29 的硬伤里有一条正是
