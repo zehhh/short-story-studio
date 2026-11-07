@@ -470,6 +470,8 @@ def main() -> int:
     _test_sec_overreach_detector()
     _test_recheck_rejects_rewrite_that_adds_hits()
     _test_strip_body_preamble_removes_duplicate_lead()
+    _test_self_ref_consistency()
+    _test_death_ledger_resurrection()
     _test_summary_jump_detector()
     _test_body_trope_cluster()
     _test_rewrite_regress_guard()
@@ -999,6 +1001,62 @@ def _test_strip_body_preamble_removes_duplicate_lead():
     plain = "第一段。\n\n第二段。"
     assert _strip_body_preamble(plain) == plain, "无节头时必须原样返回"
     print("[ok] 成稿抬头去重（砍正文序言 / 无节头原样返回）")
+
+
+def _test_self_ref_consistency():
+    """自称一致性：皇帝一会儿「朕」一会儿「臣妾」要报；单一的「臣妾」「我」不许报。"""
+    from studio import state
+
+    names = ["萧承煜", "沈清秋"]
+    bad = ("萧承煜放下茶盏，淡淡道：「秋儿胆子大，臣妾劝不住。」\n\n"
+           "「朕知道。」萧承煜说。")
+    hits = state.self_ref_breaks(bad, names)
+    assert len(hits) == 1 and hits[0]["name"] == "萧承煜", f"混用必须报，实测 {hits}"
+    assert "朕" in hits[0]["male"] and "臣妾" in hits[0]["female"]
+
+    # 只用一种自称（妃嫔对皇帝称臣妾、对下人称我）→ 不许报
+    ok = ("沈清秋低声道：「臣妾遵旨。」\n\n"
+          "「我这就去。」沈清秋说。")
+    assert state.self_ref_breaks(ok, names) == [], "单一自称不许报"
+    # 「臣妾」不能被再算成「臣」（长词优先遮蔽）
+    assert state._tokens_in("臣妾遵旨") == ["臣妾"], state._tokens_in("臣妾遵旨")
+    # 非名册里的人不参与
+    assert state.self_ref_breaks(bad, ["沈清秋"]) == []
+    print("[ok] 自称一致性（朕/臣妾混用报 / 单一自称不报 / 长词遮蔽）")
+
+
+def _test_death_ledger_resurrection():
+    """生死台账：宣告死亡之后再活着出场要报；死亡词属于别人（我想让他死）不许报。"""
+    from studio import state
+
+    names = ["裴寂", "萧景琰", "太后"]
+    s1 = {"no": 1, "text": "裴寂被短刀捅穿肋下，血淌了一地。"}
+    s2 = {"no": 2, "text": "「三个月前裴寂死在冷宫，」我抬起手臂。"}
+    s3 = {"no": 3, "text": "裴寂扑通跪下，额头重重磕在金砖上。「臣有罪。」"}
+    hits = state.death_audit([s1, s2, s3], names)
+    assert any(h["name"] == "裴寂" and h["dead_at"] == 2 and h["alive_at"] == 3
+               for h in hits), f"死人复活必须报，实测 {hits}"
+
+    # 节级版本只报本节这一处
+    now = state.resurrect_in([s1["text"], s2["text"]], s3["text"], names)
+    assert [h["name"] for h in now] == ["裴寂"], f"节级必须只报裴寂，实测 {now}"
+    # 只宣告、还没复活 → 不报
+    assert state.resurrect_in([s1["text"]], s2["text"], names) == [], "刚宣告死亡不许报"
+
+    # 死亡词属于别人：这些都不算宣告
+    for sent in ("太后想让我死，却不想背罪名。",
+                 "只要我走向萧景琰，便是赴死之路。",
+                 "那是柳如烟拼死塞给我的东西。"):
+        assert state.death_claims(sent, names) == [], f"不许误判：{sent}"
+    # 真宣告的各种写法
+    for sent, who in (("太后已死，宫中大乱。", "太后"),
+                      ("萧景琰死在御书房。", "萧景琰"),
+                      ("裴寂薨了。", "裴寂")):
+        got = [c["name"] for c in state.death_claims(sent, names)]
+        assert got == [who], f"{sent} 应判 {who} 死亡，实测 {got}"
+    # 假设/谎称类有豁免标记
+    assert state.death_claims("倘若裴寂死了，这局就散了。", names) == [], "假设句不许判死"
+    print("[ok] 生死台账（复活报 / 死亡词属他人不报 / 豁免词生效）")
 
 
 def _test_summary_jump_detector():

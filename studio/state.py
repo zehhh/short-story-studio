@@ -368,3 +368,177 @@ def hint_exit_present(hit: dict) -> str:
     return (f"{hit['name']}在上一节结尾已经退场（「{hit['exit']}」），这一节开头"
             f"又在场（「{hit['sentence']}」）——要么把他不在场的这段写清楚"
             "（他什么时候回来的），要么本节开头从他的不在场写起")
+
+
+# ------------------------------------------------------------ 生死台账
+
+# 「X 死了」的判定：名字与死亡词必须落在同一句、且距离不超过 24 字
+# （避免「裴寂说太后死了」这种把两个人串起来的误判——它们同句但主语不同时，
+#  距离会明显更大，而真正的死亡宣告都是「裴寂死在冷宫」「裴寂已死」这种贴身写法）。
+# 宣告死亡必须是**名字自己的谓语**：名字后面紧跟（可带一个虚词/副词）死亡动词。
+# 不能用「名字附近 8 字内有死亡词」——实测误判全是这种：「太后想让我死」（死的是我）、
+# 「走向萧景琰，便是赴死之路」（赴死的是我）、「柳如烟拼死塞给我的东西」（拼死是状语）。
+_CLAIM_HEAD = re.compile(
+    r"^[，,、]?(?:已经|已|都|也|就|便|则|终于|后来|随即|当即|果然|当真)?"
+    # 死亡动词后必须跟标点/助词/空白或断在窗口末尾——「死死盯着我」的「死」后面
+    # 又是「死」，不是宣告死亡（全库实测只有这一种形态造成误判）。
+    r"(?:死|亡|薨|殁|咽了?气|断了?气|丧命|毙命|不治|没了?气息)"
+    r"(?=$|[了在得于，。！？；：、」』…\s])(?!前|后|时|因)"
+)
+_DEATH_RE = re.compile(r"死|亡|薨|殁|咽气|断气|丧命|毙命|不治|气息")
+_CLAIM_WIN = 10
+# 这些词出现时，句子不是在宣告死亡，而是在回忆/假设/否定
+_DEATH_GUARD = re.compile(r"要是|如果|倘若|假装|谎称|诈死|假死|没死|未死|不会死|不想死|"
+                          r"以为.{0,6}死|若非|差点死|险些死")
+# 人物「在场且活着」的动作（不含死亡词时才算复活迹象）
+_ALIVE_ACT = re.compile(
+    r"走进|走入|推门|跪下|磕头|开口|笑道|说道|问道|答|抬头|低头|伸手|接过|递过|"
+    r"站起|坐下|上前|俯身|看着|盯着|望向|转身|抱拳|行礼|作揖|摆手|点头|摇头|"
+    r"喘着|说着|提着|端着|捧着|拔|抽|抽出|按住|抓住|扶住|扶起|走过来|走出来"
+)
+
+
+def death_claims(text: str, names: list[str]) -> list[dict]:
+    """本节里「谁被宣告死了」——只认名字与死亡词贴身同句的写法。"""
+    out: list[dict] = []
+    for sent in _sentences(text or ""):
+        if _DEATH_GUARD.search(sent):
+            continue
+        for nm in names or []:
+            i = sent.find(nm)
+            if i < 0 or len(nm) < 2:
+                continue
+            window = sent[i + len(nm): i + len(nm) + _CLAIM_WIN]
+            if _CLAIM_HEAD.match(window):
+                out.append({"name": nm, "sentence": sent})
+                break
+    return out
+
+
+def death_audit(secs: list[dict], names: list[str]) -> list[dict]:
+    """**跨节**生死台账：宣告死亡之后再像个活人一样出场 = 复活。
+
+    `secs` 是 [{no, text}, ...]（按节序）。返回 [{name, dead_at, alive_at, dead_sent, alive_sent}]。
+    为什么这条必须做成确定性判据：v23 成稿里「05 裴寂被刺重伤 → 06 说『三个月前裴寂
+    死在冷宫』→ 07 裴寂穿着太医官服走出来跪下认罪」——判官能抓到，但只在终审阶段，
+    代价是整篇重写；先在本章内累积台账，第 07 节写到一半就能拦下来重写。
+    """
+    dead: dict[str, dict] = {}
+    hits: list[dict] = []
+    for sec in secs or []:
+        body = sec.get("text") or ""
+        no = sec.get("no") or ""
+        # 先查「已死之人又活了」，再记本节新的死亡宣告（本节内死在本节内活不算）
+        for nm, rec in list(dead.items()):
+            for sent in _sentences(body):
+                if nm not in sent or len(nm) < 2:
+                    continue
+                if _DEATH_RE.search(sent) or _DEATH_GUARD.search(sent):
+                    continue
+                if _ALIVE_ACT.search(sent):
+                    hits.append({"name": nm, "dead_at": rec["no"], "alive_at": no,
+                                 "dead_sent": rec["sentence"], "alive_sent": sent})
+                    break
+        for c in death_claims(body, names):
+            dead.setdefault(c["name"], {"no": no, "sentence": c["sentence"]})
+    return hits
+
+
+def resurrect_in(prior_texts: list[str], body: str, names: list[str]) -> list[dict]:
+    """逐节写时用：前面的节里已宣告死亡，本节又让这个人活着出场。
+
+    与 `death_audit` 的区别是只报「本节」这一处，供节级门禁当场打回重写；
+    `death_audit` 是交付前对全篇扫一遍的版本。
+    """
+    n = len(prior_texts or []) + 1
+    secs = [{"no": k, "text": t} for k, t in enumerate(prior_texts or [], 1)]
+    secs.append({"no": n, "text": body or ""})
+    return [h for h in death_audit(secs, names) if h.get("alive_at") == n]
+
+
+def hint_death(hit: dict) -> str:
+    return (f"{hit['name']}在第 {hit['dead_at']} 节已经被写成死了"
+            f"（「{hit['dead_sent'][:26]}」），这一节又以活人的样子出现"
+            f"（「{hit['alive_sent'][:26]}」）——死人不许复活。三种改法："
+            "①这一节改成别人的视角提到他（回忆、遗物、传闻），不让他出场；"
+            "②前面那处「死」改成「重伤/失踪/生死不明」；"
+            "③若确实是假死，本节必须当场写明是谁安排的、为了骗谁")
+
+
+# ---- 自称一致性台账 -------------------------------------------------------
+# 中文古言里最容易出、也最刺眼的一类错：同一个说话人，对同一个人，自称在
+# 「朕 / 臣妾 / 儿子 / 臣」之间乱跳。v25 终审原文：「皇帝对太后自称臣妾，
+# 称谓彻底错乱」，同一段里还出现「儿子自有分寸」「臣妾打算让她真疯」。
+# 判据只做一件事：同一个名字的台词里，不许同时出现「男性自称」和「女性自称」。
+_SELF_MALE = ("朕", "寡人", "本王", "本侯", "本将军", "臣", "微臣", "在下", "卑职",
+              "为兄", "儿子", "孙儿", "老夫")
+_SELF_FEMALE = ("臣妾", "妾身", "本宫", "哀家", "奴婢", "小女", "女儿", "臣女",
+                "孙女儿", "老身")
+# 这些是通用第一人称，男女都用，不参与性别判定
+_SELF_NEUTRAL = ("我", "咱", "本人")
+
+_SAY_VERB = r"(?:说|道|笑道|低声道|轻声道|开口|答道|回话|喝|喊|问道|冷冷道|急道)"
+_STOP = "".join(["\\u3002\\uff01\\uff1f", "\\n", "\\u300c\\u300d"])  # 。！？ 换行 「」
+_NOSTOP = "[^" + "。！？\n「」" + "]"
+_QUOTE_TAIL = re.compile(
+    _NOSTOP + r"{0,14}?" + _SAY_VERB
+    + _NOSTOP + r"{0,6}?[：:，,]?\s*[「“]([^」”]{2,300})[」”]"
+)
+_QUOTE_HEAD = re.compile(r"[「“]([^」”]{2,300})[」”]" + _NOSTOP + r"{0,10}$")
+_TOKENS = tuple(sorted(_SELF_MALE + _SELF_FEMALE, key=len, reverse=True))
+
+
+def _tokens_in(seg: str) -> list[str]:
+    """段落里出现过哪些自称。长词优先并遮蔽，避免「臣妾」同时算成「臣」。"""
+    work, got = seg, []
+    for tok in _TOKENS:
+        if tok and tok in work:
+            got.append(tok)
+            work = work.replace(tok, "□")
+    return got
+
+
+def self_refs(text: str, names: list[str]) -> dict[str, dict[str, list[str]]]:
+    """抽出「谁在这篇里用过哪些自称」，返回 {名字: {自称: [例句...]}}。
+
+    归属不靠正则猜名字边界（`萧承煜放下茶盏，淡淡道：「…」` 会被贪婪吃成
+    「萧承煜放」），而是先定位名字，再看它前后各 30/320 字内有没有「动词+引号」。
+    """
+    out: dict[str, dict[str, list[str]]] = {}
+    body = text or ""
+    for nm in names or []:
+        if len(nm) < 2:
+            continue
+        for m in re.finditer(re.escape(nm), body):
+            seg = ""
+            mq = _QUOTE_TAIL.match(body[m.end(): m.end() + 40])
+            if mq:
+                seg = mq.group(1)
+            else:
+                mh = _QUOTE_HEAD.search(body[max(0, m.start() - 320): m.start()])
+                if mh:
+                    seg = mh.group(1)
+            if not seg:
+                continue
+            for tok in _tokens_in(seg):
+                out.setdefault(nm, {}).setdefault(tok, []).append(seg[:40])
+    return out
+
+
+def self_ref_breaks(text: str, names: list[str]) -> list[dict]:
+    """同一个人的台词里同时出现男性自称与女性自称 → 称谓错乱。"""
+    out: list[dict] = []
+    for who, toks in self_refs(text, names).items():
+        male = [t for t in toks if t in _SELF_MALE]
+        female = [t for t in toks if t in _SELF_FEMALE]
+        if male and female:
+            out.append({"name": who, "male": male, "female": female,
+                        "sample": (toks[male[0]][0] if toks.get(male[0]) else "")})
+    return out
+
+
+def hint_self_ref(hit: dict) -> str:
+    return (f"{hit['name']}的自称前后矛盾：一处自称「{hit['male'][0]}」，"
+            f"另一处自称「{hit['female'][0]}」（「{hit['sample'][:30]}」）"
+            "——一个人的自称在一章里必须固定（皇帝对臣下称「朕」、对太后称「儿」；"
+            "妃嫔对皇帝称「臣妾」、对下人自称「我」），不许男女自称混用")

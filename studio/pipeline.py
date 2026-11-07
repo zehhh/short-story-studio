@@ -3190,8 +3190,13 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
         title = _pitch.get("title") or ""
     except Exception as e:  # noqa: BLE001
         print(f"[stage] 书名方案生成失败（{type(e).__name__}: {e}），标题退回正文抽取")
+    _lead_txt = ""
     try:
         stage_lead(cfg, llm, project)
+        # 导语是在正文之前发给读者的第一段。写手看不到它，就会在小节01把同一个
+        # 开场场面再演一遍（实测终审把它判成「导语与小节01 是同一场景的重复，
+        # 读者会以为翻错页」）。这里把导语原文带进小节01 的上下文，并对重复做确定性判定。
+        _lead_txt = str((project.load_json("lead.json") or {}).get("text") or "").strip()
     except Exception as e:  # noqa: BLE001
         print(f"[stage] 导语生成失败（{type(e).__name__}: {e}），成稿将缺导语")
 
@@ -3248,6 +3253,11 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             # 做完的入场动作再演一遍（v22 实测 01→02、02→03 连续两处「走进内室」）。
             _pl = [x for x in re.split(r"(?<=[。！？])", prev_body.strip()) if x.strip()]
             prev_last_act = _pl[-1].strip() if _pl else "（无）"
+        elif _lead_txt and i == 0:
+            # 第一节的「上文」就是导语：给全文而不是空串，写手才知道这场面已经写过。
+            prev_tail = ("【开篇导语（已经印在正文之前，读者刚读完）】" + chr(10) + _lead_txt)
+            prev_summary = "（本节是第一节；上面那段导语已经演过开场，不许重演）"
+            prev_last_act = "（本节是第一节；从导语停下的地方接着写）"
         else:
             prev_tail = "（小节01，无）"
             prev_summary = "（小节01，无）"
@@ -3358,6 +3368,33 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             for _hit in _state.exit_then_present(prev_body or "", body, plan_cast_all)[:2]:
                 print(f"[state] 小节{no:02d} 已退场人物又在场：{_hit['name']}")
                 problems = problems + [_state.hint_exit_present(_hit)]
+            # 生死台账：前面的节里已经宣告死亡的人，本节又以活人的样子出现。
+            # v23 的「06 说『三个月前裴寂死在冷宫』→ 07 裴寂走出来跪下认罪」就是这一类，
+            # 判官只在终审抓到，代价是整篇重写；在这里拦，第 07 节当场就能改。
+            # 导语重复：段首那 196 字是读者最先读到的，小节01 把它再写一遍等于
+            # 让读者读两遍同一场戏（终审判 high）。判据用逐字最长公共子串，
+            # 只认 16 字以上——「袖子」「药碗」这类词重合不算，而 16 字连续相同在两百字的导语里已不可能是巧合。
+            if i == 0 and _lead_txt:
+                _dup_lead = _contin._longest_common(_lead_txt, body, 16)
+                if _dup_lead:
+                    print(f"[state] 小节{no:02d} 重演了开篇导语：「{_dup_lead[:24]}」")
+                    problems = problems + [
+                        f"这一节重演了开篇导语已经写过的场面（「{_dup_lead[:24]}」逐字重复）"
+                        "——导语已经演过开场，本节必须从导语结束的那一刻接着往下写，"
+                        "换一个新的动作或新的信息开场"]
+            # 自称一致性：同一个人的台词里不许男女自称混用（v25 终审判 high 的
+            # 「皇帝对太后自称臣妾」）。跨节比对，但只在这一节自己用到了其中一种
+            # 自称时才打回——否则等于让后面每节替前面背锅。
+            for _hit in _state.self_ref_breaks(_prior_all + chr(10) + body, plan_cast_all)[:2]:
+                if not any(t in body for t in _hit["male"] + _hit["female"]):
+                    continue
+                print(f"[state] 小节{no:02d} 自称矛盾：{_hit['name']}"
+                      f"（{_hit['male'][0]} / {_hit['female'][0]}）")
+                problems = problems + [_state.hint_self_ref(_hit)]
+            for _hit in _state.resurrect_in(body_list, body, plan_cast_all)[:2]:
+                print(f"[state] 小节{no:02d} 已死之人又出场：{_hit['name']}"
+                      f"（第 {_hit['dead_at']} 节已宣告死亡）")
+                problems = problems + [_state.hint_death(_hit)]
             # 反方向越界：本节把下一节的戏提前写掉 → 下一节只能退回重演。
             # 症状总在下一节爆（终审报「时间线倒退」），病根在本节，所以要在这里拦。
             # 只在前面几项都过了才判（省调用：字数不够/重演的稿子先改再说）。
@@ -3439,6 +3476,13 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
         _cont = _contin.report(_secs_for_cont, plan_sections=secs,
                                cast=cast or None, min_dup=_SEC_DUP_MIN,
                                pov_name=_pov_name)
+        # 生死台账交付前再扫一遍：节级拦的是「本节让死人复活」，
+        # 但改写/删节之后还可能把死亡宣告本身改没或改出来，所以整篇再对一次账。
+        _deaths = _state.death_audit(_secs_for_cont, plan_cast_all)
+        _cont["deaths"] = _deaths
+        _cont["n"]["deaths"] = len(_deaths)
+        if _deaths:
+            print(f"[stage] 生死台账：发现 {len(_deaths)} 处死人复活")
         project.save_json("continuity.json", {
             **_cont, "dup_fixes": dup_fixes, "cast_roster": plan_cast_all})
         print("[stage] 连续性体检：" + _contin.summary(_cont))
