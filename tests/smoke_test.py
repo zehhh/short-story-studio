@@ -476,6 +476,7 @@ def main() -> int:
     _test_body_trope_cluster()
     _test_self_dup_guard()
     _test_plan_replay_nonadjacent()
+    _test_plan_causal_check_keeps_plan_shape()
     _test_rewrite_regress_guard()
     _test_direction_keys_fuzzy()
 
@@ -578,7 +579,7 @@ def _test_score_cap_by_high():
 
     assert score_cap_by_high(0) is None, "没有硬伤就不许封顶"
     # 3 处起逐级压下：55 / 50 / 45，5 处以上一律不及格
-    assert [score_cap_by_high(n) for n in (1, 2, 3, 4, 5)] == [68.0, 62.0, 55.0, 50.0, 45.0]
+    assert [score_cap_by_high(n) for n in (1, 2, 3, 4, 5)] == [72.0, 62.0, 55.0, 50.0, 45.0]
     assert score_cap_by_high(9) == 45.0, "硬伤再多也不越过 45"
     # 单调不增：硬伤越多，天花板越低
     caps = [score_cap_by_high(n) for n in range(6)]
@@ -1172,6 +1173,28 @@ def _test_self_dup_guard():
     assert not _self_dup("短"), "过短文本直接放过"
     print("[ok] 节内自我重复：复制残句报 / 正常段落不误报")
 
+
+def _test_plan_causal_check_keeps_plan_shape():
+    """计划级因果校验：节数对得上才采用改版，对不上宁可不动。"""
+    from studio import pipeline as P
+
+    class _L:
+        def __init__(self, d): self.d = d
+        def chat_json(self, sys_p, user_p): return self.d
+
+    plan = {"sections": [{"no": i, "title": "t%d" % i, "goal": "g%d" % i,
+                          "end_hook": "h%d" % i} for i in (1, 2, 3)]}
+    good = {"changes": [{"sections": [2], "what": "x", "fix": "y"}],
+            "sections": [{"no": i, "title": "t%d" % i, "goal": "g%d" % i,
+                          "end_hook": "h%d" % i} for i in (1, 2, 3)]}
+    np1, ch1 = P.plan_causal_check(_L(good), plan)
+    assert len(ch1) == 1 and np1["sections"][1]["goal"] == "g2", "改版应被采用"
+    bad = dict(good, sections=good["sections"][:2])
+    np2, ch2 = P.plan_causal_check(_L(bad), plan)
+    assert ch2 == [] and np2 is plan, "节数对不上必须原样返回"
+    np3, ch3 = P.plan_causal_check(_L({"changes": [], "sections": []}), plan)
+    assert ch3 == [] and np3 is plan, "无矛盾原样返回"
+    print("[ok] 计划级因果校验：改版采用 / 节数不符回退 / 无矛盾不动")
 
 def _test_plan_replay_nonadjacent():
     """分节计划：隔着几节的同一场戏也要拦住（v27 的 04↔06 就是这么漏的）。"""

@@ -2914,6 +2914,75 @@ def grade_issue_evidence(issues: list, text: str, min_len: int = 8) -> tuple:
     return out, n_down
 
 
+_CAUSAL_SYS = """你在校一部长篇短篇小说的**分节计划**，只查一件事：整条因果链自洽吗。
+
+必须逐一走这五条，每条都要真的在计划里找过，不许通篇说「没有矛盾」：
+① **时间顺序**：后一节的事变成现在时（「次日」「三日后」）之后，有没有哪一节还停在更早的时刻；
+② **知情状态**：某个人在哪一节才该知道某件事，前面有没有人已经把它说破、或者他已经按知道的方式行动；
+③ **道具来历**：每件关键道具第一次被人使用的那一节，计划里有没有交代它从哪来；一件道具不能在 A 节已用掉、B 节又完好出现；
+④ **生死状态**：人物被宣布死亡之后，还有没有哪一节让他开口或行动（假死必须在计划里明写、且后文要交代）；
+⑤ **身份与称呼**：化名、替身、位份变了之后，后文有没有人无缘无故认得出。
+
+发现矛盾就**改计划**，不是提意见：把有冲突那一节的 goal / end_hook 改成能接上的写法，其余节原样保留。
+输出严格 JSON：{"changes": [{"sections": [3, 8], "what": "第8节说她早就把药换了，与第2节验出西域红花矛盾", "fix": "第8节改为她换的是另一碗，红花仍是太后下的真毒"}], "sections": [原样的完整分节列表，改动后的版本]}
+没有矛盾就给 "changes": []，sections 原样返回。"""
+
+_CAUSAL_USER = """【故事一句话】{idea}
+【分节计划（共 {n} 节，每节 {lo}-{hi} 字）】
+{plan}
+
+按五条逐一走过，然后输出 JSON。"""
+
+
+def _plan_digest(plan: dict) -> str:
+    """把分节计划压成给人看的清单（只留判断因果必需的四项）。"""
+    out = []
+    for s in (plan.get("sections") or []):
+        no = s.get("no") or "?"
+        cast = "、".join(s.get("cast") or []) or "—"
+        out.append(
+            f"第{no}节｜{s.get('title') or ''}｜目标：{s.get('goal') or ''}"
+            f"｜结尾：{s.get('end_hook') or ''}｜人物：{cast}"
+            f"｜留给下一节：{s.get('carry_out') or '—'}")
+    return "\n".join(out)
+
+
+def plan_causal_check(llm: BaseLLM, plan: dict, idea: str = "",
+                      lo: int = 600, hi: int = 1000) -> tuple:
+    """分节计划的**全局因果校验**：在写一个字之前把跨节矛盾改掉。
+
+    为什么要在计划阶段做：v28–v32 五版真跑里，成稿后的硬伤有六成是跨节矛盾
+    （02 验出「西域红花」→ 06 真毒发作 → 08 却说「早把药换了、吐的是鸡血」；
+    05 太后自曝 → 07 又装作不知）。这类问题在成稿阶段要重写两节才能修，
+    在计划阶段改一句话就够——一次调用换掉整条修复循环。
+
+    返回 (新计划, changes)；没查出问题或判据失败时原样返回，绝不因为校验
+    本身出错就弄坏一份本来可用的计划。
+    """
+    secs = plan.get("sections") or []
+    if len(secs) < 3:
+        return plan, []
+    try:
+        d = llm.chat_json(_CAUSAL_SYS,
+                          _CAUSAL_USER.format(idea=idea or "（未提供）", n=len(secs),
+                                              lo=lo, hi=hi, plan=_plan_digest(plan)))
+    except Exception as e:  # noqa: BLE001 —— 校验失败不妨碍写作
+        print(f"[plan] ⚠ 因果校验失败（{type(e).__name__}），沿用原计划")
+        return plan, []
+    if not isinstance(d, dict):
+        return plan, []
+    changes = [c for c in (d.get("changes") or []) if isinstance(c, dict)][:5]
+    news = d.get("sections") or []
+    if not changes or len(news) != len(secs):
+        if changes:
+            print(f"[plan] ⚠ 因果校验报了 {len(changes)} 处矛盾但节数对不上，"
+                  f"不采用改版（宁可漏改，不许把计划弄散）")
+        return plan, []
+    merged = dict(plan)
+    merged["sections"] = news
+    return merged, changes
+
+
 def demote_unverified_style(issues: list, text: str) -> tuple:
     """文风/AI 腔类 high 必须由本项目自己的确定性扫描器背书。
 
@@ -3378,6 +3447,21 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
                 print("[plan] 重新拆分后相邻小节不再撞车")
             else:
                 print("[plan] 重新拆分后仍有冲突，保留第一版（不无限重试）")
+        # 相邻撞车只是一类。真正贵的是跨节矛盾：02 验出真毒、06 真毒发作、
+        # 08 却说「我早就换了」——这种只有把整份计划摆在一起看才查得出来，
+        # 等写完再查就要重写两节。计划阶段改一句话就够。
+        _plan_keep = plan
+        plan, _cl = plan_causal_check(writer_llm, plan, idea=idea,
+                                      lo=sec_lo, hi=sec_hi)
+        if _cl:
+            print(f"[plan] 因果校验改了 {len(_cl)} 处跨节矛盾：")
+            for c in _cl:
+                print(f"[plan]    第{c.get('sections')}节 · {str(c.get('what'))[:60]}")
+                print(f"[plan]       → {str(c.get('fix'))[:80]}")
+            _risk2 = plan_replay_risk(plan)
+            if _risk2:
+                print(f"[plan] ⚠ 改版引入 {len(_risk2)} 处相邻撞车，回退到原计划")
+                plan = _plan_keep
         project.save_json("section_plan.json", plan)
     secs = plan.get("sections") or []
     if not secs:
