@@ -2058,11 +2058,18 @@ def _fix_boundary_replay(cfg: dict, llm: BaseLLM, full: str,
         prev_b, cur_b = _body_of(secs[i]), _body_of(secs[i + 1])
         if len(prev_b) < 200 or len(cur_b) < 200:
             continue
-        try:
-            r = _sec_boundary(llm, prev_b, cur_b)
-        except Exception as e:  # noqa: BLE001
-            print(f"[boundary] ⚠ 第{secs[i+1]['no']}节衔接复判失败（{type(e).__name__}），跳过")
-            continue
+        # 先做一遍零成本的字面复用检查：真重演里有一半是**近逐字重述**
+        # （v31 实测「07 结尾泼茶 → 08 开头『茶水顺着太后下巴滴落』」），
+        # 这种不必问模型，12 字重叠就是铁证；模型只用来兜「改写过」的那种。
+        _lit = _contin._longest_common(prev_b[-400:], cur_b[:400], min_len=12)
+        if _lit:
+            r = {"replay": True, "why": f"字面复用：{_lit[:18]}"}
+        else:
+            try:
+                r = _sec_boundary(llm, prev_b, cur_b)
+            except Exception as e:  # noqa: BLE001
+                print(f"[boundary] ⚠ 第{secs[i+1]['no']}节衔接复判失败（{type(e).__name__}），跳过")
+                continue
         if not r.get("replay"):
             continue
         why = (r.get("why") or "开头重演了上一节已经写完的事").strip()
@@ -2862,8 +2869,10 @@ _REPLAY_USER = """上一节正文（结尾部分）：
 # 判词里出现这些词，说明模型自己认为「来历是有的」——这种不许当无因之果报。
 # 刻意用**短语**而不是「前文/上节」这类裸词：真无因之果的判词通常是
 # 「前文从没提过此簪」，含「前文」但意思相反，用裸词会把真阳性一起滤掉。
-_CAUSE_OK_MARKS = ("有来历", "已交代", "交代过", "前文已", "上文已", "已提及",
-                   "当场给", "当场递", "递给", "已说明", "有出处", "先前已", "上节已")
+_CAUSE_OK_MARKS = ("有来历", "已交代", "交代过", "交代了", "前文已", "上文已",
+                   "已提及", "当场给", "当场递", "递给", "已说明", "有出处",
+                   "先前已", "上节已", "非凭空", "并非凭空", "不是凭空",
+                   "不算凭空", "本节内交代")
 
 
 def grade_issue_evidence(issues: list, text: str, min_len: int = 8) -> tuple:
@@ -5180,7 +5189,12 @@ def assemble(project: Project) -> tuple[str, list[dict]]:
 #   4 处 → 50
 #   5 处 → 45
 # 每条硬伤都是「读者会当场看出错」的东西，判官给到 66 分说明它没把硬伤当回事。
-_SCORE_CAP_BY_HIGH = {5: 45.0, 4: 50.0, 3: 55.0, 2: 62.0, 1: 68.0}
+# 1 处 high 封顶 = 门槛本身（72），2 处以上才拦。
+# 为什么把 68 改成 72：实测同一处硬伤在不同轮次会在 high/mid 之间摆动
+# （v30 四轮里 2 处被判官的「引不出原文」降级），封顶到 68 等于让「只差一处」
+# 的稿子永远过不去门槛，修复循环白跑 20 轮也涨不上去；而 2 处以上仍然拦，
+# 拦截力都在，只是不再把判官的口径抖动当成稿子的死罪。
+_SCORE_CAP_BY_HIGH = {5: 45.0, 4: 50.0, 3: 55.0, 2: 62.0, 1: 72.0}
 
 
 def score_cap_by_high(n_high: int) -> float | None:
