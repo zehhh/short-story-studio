@@ -470,6 +470,7 @@ def main() -> int:
     _test_sec_overreach_detector()
     _test_recheck_rejects_rewrite_that_adds_hits()
     _test_strip_body_preamble_removes_duplicate_lead()
+    _test_summary_jump_detector()
 
     print("\n全部冒烟测试通过 ✔")
     return 0
@@ -995,6 +996,24 @@ def _test_strip_body_preamble_removes_duplicate_lead():
     plain = "第一段。\n\n第二段。"
     assert _strip_body_preamble(plain) == plain, "无节头时必须原样返回"
     print("[ok] 成稿抬头去重（砍正文序言 / 无节头原样返回）")
+
+
+def _test_summary_jump_detector():
+    """用概述跳过关键情节：节首「N个月后」+「一连串变故」→ 报；正常场景 → 不报。"""
+    from studio.pipeline import _summary_jump
+
+    bad = ("三个月后，宫宴。\n\n我身着皇后礼服。从贵妃到皇后，中间经历了北境平叛、"
+           "太后党羽清洗等一连串血腥变故。\n\n太后坐在对面，脸色灰败。")
+    assert _summary_jump(bad), "跳时间+概括必须报"
+    bad2 = "这期间发生了太多事。\n\n我坐在殿里。"
+    assert _summary_jump(bad2), "「这期间发生了」必须报"
+    ok = ("夜深了，穿堂风把烛火吹得忽明忽暗。\n\n门轴轻响，李承乾站在榻前。\n\n"
+          "「沈妃好兴致。」他声音低沉。")
+    assert _summary_jump(ok) == "", f"正常场景不许报，实测 {_summary_jump(ok)!r}"
+    # 只跳时间、不概括（合法的场景切换）→ 不报
+    ok2 = "三日后，我在偏殿见了他。\n\n他手里捏着一封信。"
+    assert _summary_jump(ok2) == "", "只跳时间不概括不许报"
+    print("[ok] 概述跳跃检测（跳时间+概括报 / 单纯场景切换不报）")
 
 
 if __name__ == "__main__":

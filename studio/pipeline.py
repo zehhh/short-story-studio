@@ -2497,6 +2497,13 @@ def _section_gate(cfg: dict, body: str, lo: int, hi: int) -> list[str]:
         if labels:
             problems.append("语言病：" + "；".join(x for x in labels if x)
                             + "（改成正常中文语序，一句话说完的不要拆成几个短句）")
+    _sj = _summary_jump(body)
+    if _sj:
+        problems.append(
+            f"{_sj}：这一节必须是一个当场发生的场景——把翻盘/翻身的那一步**演**出来"
+            "（动作、对话、对峙），不许用「几个月后」+「一连串变故」一句话概括。"
+            "真要跳时间，就在本节开头用一个具体场面把它演掉，不要解说。"
+        )
     return problems
 
 
@@ -2939,6 +2946,91 @@ def _sec_boundary(llm: BaseLLM, prev_text: str, cur_text: str) -> dict:
             "why": _why,
             "hint": str(d.get("rewrite_hint") or "")[:60],
             "causeless": cl}
+
+
+def _summary_jump(body: str) -> str:
+    """检测「用概述跳过关键情节」——本节是不是把最该演的那一段一句话说掉了。
+
+    为什么单独查这个：v18 的终审里**只剩一处 high**，就是它——08 节皇帝说
+    「朕给你些时日」，09 节开头直接「三个月后，宫宴」，中间用一句「从贵妃到
+    皇后，中间经历了北境平叛、太后党羽清洗、陈嫔之死真相大白等一连串血腥变故」
+    把整篇的翻盘过程全部省略。读者最想看的爽点被一句话打发，判官叫它「烂尾式
+    跳跃」。
+
+    它和「时间线倒退」不是一类：时间在往前，但**情节被压缩成了概述**。所以
+    `state.time_hint` 那种时点词检测抓不到，得专门认「跳时间 + 概括事件」这个
+    组合。只认两种高置信度句式，宁少判不误判：
+    ① 节首几段里出现「N个月/年/天后」，**并且**同段或下一段出现「一连串/一系列
+       /种种/诸般/等…变故」这类概括词；
+    ② 「中间经历了…」「这期间发生了…」「这几个月里…」这类明写「我在概括」的句子。
+    """
+    if not body:
+        return ""
+    paras = [p.strip() for p in body.split("\n") if p.strip()]
+    _JUMP = re.compile(r"(?:\d+|[一二两三四五六七八九十几半]+)\s*(?:个月|月|年|天|日|载)\s*(?:之?后|过去|间)")
+    _GIST = re.compile(r"一连串|一系列|种种|诸般|等.{0,10}(?:变故|风波|事情|事)|接二连三")
+    _GIST_SENT = re.compile(r"(?:中间|这期间|这几个月|这些日子|其间).{0,6}(?:经历|发生|出|有)")
+    _head = "\n".join(paras[:4])
+    if _GIST_SENT.search(_head):
+        m = _GIST_SENT.search(_head)
+        return f"用概述交代关键情节（「{m.group(0)}…」），该演的那一步没演"
+    for i, p in enumerate(paras[:4]):
+        if _JUMP.search(p) and (_GIST.search(p) or (i + 1 < len(paras) and _GIST.search(paras[i + 1]))):
+            return (f"节首用「{_JUMP.search(p).group(0)}」跳时间，"
+                    f"再用概述概括中间的关键情节，读者最想看的那一步被一句话带过了")
+    return ""
+
+
+def _final_dup_fix(cfg: dict, llm: BaseLLM, full: str, min_len: int = 14) -> tuple[str, dict]:
+    """交付前把**任意两节之间**的逐字重复再扫一遍并修掉。
+
+    为什么节级那次不够：`_fix_sec_dup` 是在逐节写作循环里做的，但它之后还有
+    一整串整稿改写——`lang_polish`、`_ai_deflavor`、密度重写、节长均衡，每一次
+    都会重写某些节的句子。**新写出来的句子没人再跟前面几节比过**，于是 v18 交付
+    时还留着「第05章复用第01章『轻笑出声那笑声里没有温度只有』」这种 14 字重复。
+
+    节级那次看的是「本节 vs 之前的节」，而这里要的是「全稿任意两节」。做法还是
+    只改动撞车的句子（`_fix_sec_dup`），不整节重写——整稿重写会把已调好的节长、
+    对白比例、人称一起打乱。
+    """
+    rep: dict = {"rounds": 0, "fixed": [], "left": []}
+    if not full or count_words_zh(full) < 200:
+        return full, rep
+    secs = _split_full_sections(full)
+    if len(secs) < 2:
+        return full, rep
+    seen: list[str] = []
+    changed = False
+    for i, s in enumerate(secs):
+        body = s.get("text") or ""
+        if i == 0:
+            seen.append(body)
+            continue
+        dups = _contin.dup_across([{"no": s.get("no"), "text": body}], min_len=min_len)
+        dups = [d for d in dups if any(d.get("text") in (p or "") for p in seen)]
+        if dups:
+            try:
+                nb, one = _fix_sec_dup(cfg, llm, body, dups, seen, i + 1)
+            except Exception as e:  # 收口失败不该毁掉整篇
+                print(f"[dup] 第 {i + 1} 节去重异常（{type(e).__name__}: {e}），保留原样")
+                nb, one = body, {"applied": False}
+            left = [d for d in _contin.dup_across([{"no": s.get("no"), "text": nb}], min_len=min_len)
+                    if any(d.get("text") in (p or "") for p in seen)]
+            if nb and nb != body and not left:
+                s["text"] = nb
+                changed = True
+                rep["fixed"].append({"no": s.get("no"), "frags": one.get("before")})
+                print(f"[dup] 第 {s.get('no')} 节与前面小节重复，已改掉 "
+                      f"{len(one.get('before') or [])} 处")
+                body = nb
+            else:
+                rep["left"].append({"no": s.get("no"), "frags": left})
+                print(f"[dup] ⚠ 第 {s.get('no')} 节仍有 {len(left)} 处重复未能改掉（保留原样）")
+        seen.append(body)
+    rep["rounds"] = 1
+    if changed:
+        return _join_sections(secs, full), rep
+    return full, rep
 
 
 def _facts_block(facts: list[str]) -> str:
@@ -5784,6 +5876,19 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
                 report["pov_fix"] = {"name": _pov_d, "fixed": _pn_d}
     except Exception as e:  # noqa: BLE001 —— 收口失败不该毁掉整篇成稿
         print(f"[stage] ⚠ 人称收口失败（{type(e).__name__}: {e}）")
+
+    # 交付前最后一次跨节去重：节级去重之后还有一整串整稿改写（lang_polish、
+    # _ai_deflavor、密度重写、节长均衡、补对白），每一步都会重写某些句子，而
+    # **新写出来的句子没人再跟前面几节比过**。v18 就是这里漏的：第 05 节复用
+    # 第 01 节「轻笑出声那笑声里没有温度只有」14 字，正卡在体检「≤2 处且最长
+    # <14 字」的线上，判「跨章逐字重复(轻)」WARN。
+    if not isinstance(llm, MockLLM):
+        try:
+            full, _dup_rep = _final_dup_fix(cfg, llm, full)
+            report["dup_final"] = _dup_rep
+        except Exception as e:  # noqa: BLE001
+            report["dup_final"] = {"error": f"{type(e).__name__}: {e}"}
+            print(f"[dup] ⚠ 交付前去重跳过（{type(e).__name__}: {e}）")
 
     # 平台成稿格式：导语 + 01/02/03 编号小节（assemble 已统一小节头为 NN 标题）
     plat_fmt = plat.get("format", "chapters")
