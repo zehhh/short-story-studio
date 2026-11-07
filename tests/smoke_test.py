@@ -471,6 +471,7 @@ def main() -> int:
     _test_recheck_rejects_rewrite_that_adds_hits()
     _test_strip_body_preamble_removes_duplicate_lead()
     _test_summary_jump_detector()
+    _test_body_trope_cluster()
     _test_rewrite_regress_guard()
     _test_direction_keys_fuzzy()
 
@@ -1016,6 +1017,29 @@ def _test_summary_jump_detector():
     ok2 = "三日后，我在偏殿见了他。\n\n他手里捏着一封信。"
     assert _summary_jump(ok2) == "", "只跳时间不概括不许报"
     print("[ok] 概述跳跃检测（跳时间+概括报 / 单纯场景切换不报）")
+
+def _test_body_trope_cluster():
+    """生理反应堆叠：单处合法，200 字内挤三个以上才报（判官嘴里的「测量式细节密集」）。"""
+    from studio import langqa
+
+    # 单个身体反应是合法中文，不许报
+    one = "我额角沁出冷汗，把碗放回案上。"
+    r = langqa.scan(one)
+    assert r["stats"]["body_clusters"] == 0, "单个身体反应不许判堆叠"
+
+    # 三个以上挤在一段里 → 报
+    bad = ("额角沁出冷汗，寒意顺着骨头缝往里钻，指节泛白，浑身抖如筛糠。"
+           "她抬眼看他，一句话都说不出来。")
+    r2 = langqa.scan(bad)
+    assert r2["stats"]["body_clusters"] >= 1, f"堆叠必须报，实测 {r2['stats']}"
+    assert any("生理反应堆叠" in h["label"] for h in r2["hits"]), "必须产出对应 hit"
+    hit = [h for h in r2["hits"] if "生理反应堆叠" in h["label"]][0]
+    assert hit["severity"] == "mid", "堆叠是文风密度问题，不许判 high（评分封顶只数硬伤）"
+
+    # 换成看得见的行为结果 → 不报
+    ok = "我把碗放回案上，放得太轻，它自己滑了一下。她捏着帕子的手停在半空。"
+    assert langqa.scan(ok)["stats"]["body_clusters"] == 0, "行为结果不许判堆叠"
+    print("[ok] 生理反应堆叠（单个不报 / 密集才报 / 严重度 mid）")
 
 def _test_rewrite_regress_guard():
     """整稿改写的语言回归守卫：改长改短不误判，语言变差必须拦。"""

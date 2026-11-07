@@ -590,6 +590,13 @@ def _rule_not_genres(rule: dict) -> tuple[str, ...]:
     return (g,) if isinstance(g, str) else tuple(g)
 
 
+# 身体反应 / 神态套词（只用于判聚集，不做逐词禁令）
+_BODY_TROPE = re.compile(
+    r"冷汗|寒意|凉意|骨缝|骨头缝|筛糠|瞳孔|眼底|眸色|指节|喉结|鬓发|鬓角|掌心"
+    r"|发抖|哆嗦|鸡皮疙瘩|头皮发麻|后颈|脊背发凉|浑身发|浑身一"
+)
+
+
 def scan(text: str, rules: dict | None = None, genres: tuple[str, ...] | list[str] = ()) -> dict:
     """扫描正文，返回 {pass, hits, stats}。hits: [{kind,label,note,count/pos}]
 
@@ -861,9 +868,47 @@ def scan(text: str, rules: dict | None = None, genres: tuple[str, ...] | list[st
                 }
             )
 
+    # ---- 生理反应 / 神态套词密度（判官嘴里的「测量式细节密集」） ----
+    # 为什么不用逐词规则：`冷汗`、`寒意`、`指节` 单独出现都是合法中文，做成黑名单
+    # 词表必然误伤（v20 实测全稿 20 处，逐处都挑得出毛病，但没有一处是「错字」）。
+    # 判官真正受不了的是**聚集**——同一段里连叠三四个身体反应。所以这里只判聚集。
+    _bt_pos = [m.start() for m in _BODY_TROPE.finditer(text)]
+    _bt_clusters = []
+    _bt_end = -1
+    for _i, _pos in enumerate(_bt_pos):
+        if _pos < _bt_end:
+            continue
+        _in = [q for q in _bt_pos if _pos <= q < _pos + 200]
+        if len(_in) >= 3:
+            _bt_clusters.append((_pos, len(_in)))
+            _bt_end = _pos + 200
+    if _bt_clusters:
+        _worst = max(_bt_clusters, key=lambda x: x[1])
+        hits.append(
+            {
+                "kind": "文风",
+                "label": "AI味·生理反应堆叠",
+                "note": (
+                    f"全稿 {len(_bt_pos)} 处身体/神态词，其中 {len(_bt_clusters)} 处密集堆叠"
+                    f"（最密一处 200 字内 {_worst[1]} 个，如：{text[_worst[0]:_worst[0] + 18]}…）"
+                ),
+                "suggest": "冷汗/寒意/骨缝发凉/瞳孔微缩/指节泛白/浑身抖如筛糠 这类**只留一处**，"
+                           "其余换成看得见的行为结果：手抖→「茶盏磕在案沿，泼了半盏」，"
+                           "害怕→「她把裙角攥进了手心，指甲掐进肉里」",
+                "severity": "mid",
+            }
+        )
+
     stats = {
         "chars": n_chars,
         "paras": len(paras),
+        "body_trope": len(_bt_pos),
+        "body_clusters": len(_bt_clusters),
+        # 文风类 high 命中条数：给 pipeline 的「判官文风 high 要不要压档」用。
+        # 只要有一条硬红线（high 级）真的命中，就不该把判官的意见降级。
+        "style_high": sum(
+            1 for h in hits if h["severity"] == "high" and h["kind"] in ("语言", "文风", "AI味")
+        ),
         # 对白占比只认一个判据（`language.dialog_ratio`，按引号内字数算）。
         # 旧实现数「含引号或冒号的段落」——冒号把「他说：」这种叙述也算成对白，
         # 一度把真实 0.22 的稿子报成 0.55，与体检/章级门三个数各不相同。
