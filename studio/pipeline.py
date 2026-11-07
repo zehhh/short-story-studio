@@ -2724,6 +2724,10 @@ _REPLAY_SYS = (
     "反例（这种情况必须判 false）：上一节「手腕顺势抖动，汤汁溅出几点落在袖口」"
     "→ 本节「描金瓷碗脱手飞出，砸在青砖上四分五裂，我捂着胸口往下滑」——"
     "动作更大、结果不同、有新信息，是升级，不是重演。\n"
+    "**特别注意一种必须判 true 的重演**：上一节已经**做完的位移/入场动作**"
+    "（转身进了内室、绕过屏风站定、跪下、落座、被人押进殿、把碗放回案上），"
+    "这一节开头又把同一个位移走了一遍。哪怕这一节换了对手、换了说的话，"
+    "「人已经在内室里了，又走了一遍进内室」就是重演，判 true 并给出两句原文。\n"
     "拿不准就判 false：误判成重演会逼写手把正常的推进删掉，比漏判代价大得多。\n"
     "② 这一节里有没有**无因之果**：人物突然使出一种前文从没交代过的本事"
     "（会改脉、会易容、会点穴），或者凭空拿出一件前文没出现过的东西"
@@ -3240,9 +3244,14 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
         if prev_body:
             prev_tail = prev_body
             prev_summary = f"{secs[i - 2].get('goal', '')}（正文开头：{_first_sentence(prev_body)}）"
+            # 上一节的最后一句单独拎出来喂给写手：光给「上一节正文结尾」它会把已经
+            # 做完的入场动作再演一遍（v22 实测 01→02、02→03 连续两处「走进内室」）。
+            _pl = [x for x in re.split(r"(?<=[。！？])", prev_body.strip()) if x.strip()]
+            prev_last_act = _pl[-1].strip() if _pl else "（无）"
         else:
             prev_tail = "（小节01，无）"
             prev_summary = "（小节01，无）"
+            prev_last_act = "（小节01，无）"
 
         system, user = render_prompt(
             "write_section",
@@ -3251,6 +3260,7 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
             CH_TITLE=ch_title,
             PLAN=json.dumps(plan, ensure_ascii=False, indent=1),
             PREV_TAIL=prev_tail,
+            PREV_LAST_ACT=prev_last_act,
             PREV_SUMMARY=prev_summary,
             FACTS=_facts_block(facts),
             GOAL=goal,
