@@ -535,6 +535,60 @@ def _local_detail(text: str) -> tuple[int, list[dict]]:
     return score, hits
 
 
+PARA_LEN_P90 = 45.0     # 人类语料段长 p90（字）
+CLAUSE_P90 = 3.8        # 人类语料「小句/段」p90
+CLAUSE_HARD = 6         # 小句硬上限：人类语料 p90 段落里最多 6.58 小句，6 以上几乎必然同义反复
+
+
+def _clauses(p: str) -> list[str]:
+    return [c.strip() for c in re.findall(r"[^。！？；…，]+[。！？；…，]?", p) if c.strip()]
+
+
+def _local_para(text: str) -> tuple[int, list[dict]]:
+    """**节内**段落密度：段长与小句/段 —— 直接对应「重复赘述」的物理成因。
+
+    标定来自 `dataset-forge/data/raw/onehu` 里 120 篇真实上架短篇（正文抽出来后统计）：
+        段长（字）   中位 23.7  p90 40.4
+        小句/段      中位 2.46  p90 3.75
+        单句段占比   中位 30%   p90 49%
+    本项目生成稿实测 段长 40-45、小句/段 4.3-4.8 —— 段长是人类的两倍、小句是 1.8 倍。
+    一段塞进 4-5 个小句时，作者（模型）为了把小句写满，会不断给同一件事换说法，
+    读者的观感就是「一句能写清的事拆成好几句，还反复讲」。所以这不是格式问题，
+    是冗余的生成机制本身。
+    """
+    hits: list[dict] = []
+    score = 0
+    raw = [p.strip() for p in text.split("\n") if len(p.strip()) >= 2]
+    # 只数正文段：扔掉标题行、导语/平台行、分隔线、列表项等版式成分
+    paras = [p for p in raw
+             if not p.startswith(("**", ">", "#", "-", "*", "|"))
+             and "导语" not in p and p not in ("---", "***")
+             and not re.fullmatch(r"\d{1,3}", p)]
+    if len(paras) < 5:
+        return 0, hits
+    n_hard = 0
+    worst: tuple[int, str] | None = None
+    for p in paras:
+        if langqa._DIALOG_MARK.search(p):      # 台词段另算（对白天然短句多）
+            continue
+        n = len(_clauses(p))
+        if n >= CLAUSE_HARD:
+            n_hard += 1
+            if worst is None or n > worst[0]:
+                worst = (n, p[:30])
+    if n_hard:
+        # 每千字允许 1 段（人类语料 p90 段落里 6.58 小句是极值，正常一节省 1000 字也遇不到几次）
+        budget = max(1.0, 1.0 * len(re.sub(r"\s", "", text)) / 1000.0)
+        if n_hard > budget:
+            score += int(round((n_hard - budget) * 3))
+            hits.append({"kind": "冗余·小句堆叠",
+                         "text": worst[1] + "…" if worst else "",
+                         "note": f"本节 {n_hard} 段一逗到底（≥{CLAUSE_HARD} 个小句），"
+                                 f"最多的一段 {worst[0] if worst else 0} 个小句：{worst[1] if worst else ''}…"
+                                 f"；一段只写一个信息点，同义反复的小句删掉，其余另起一段"})
+    return score, hits
+
+
 def defect_score(text: str, rules: dict | None = None) -> dict:
     """单节（或整稿）四类语言缺陷的确定性得分。
 
