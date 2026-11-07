@@ -2834,8 +2834,10 @@ _REPLAY_SYS = (
     "② 这一节里有没有**无因之果**：人物突然使出一种前文从没交代过的本事"
     "（会改脉、会易容、会点穴），或者凭空拿出一件前文没出现过的东西"
     "（银针、令牌、密信）。\n"
-    "判据是「**来历找不到**」，不是「东西头一次出现」。只要在本节或上一节里有"
+    "判据是「**来历找不到**」，不是「东西头一次出现」。只要在**本节或上一节**里有"
     "一句话交代过（谁给的、什么时候备下的、跟谁学的、从哪儿翻出来的），就算有来历，"
+    "**本节内交代就算数**，不要求前文写过——v29 实测判官把「入宫前寻回」这种"
+    "本节内的交代当成「无前文交代」连报三次，写手改三遍都过不了；"
     "**必须整条不要写进 causeless**。\n"
     "特别注意这几种**不算**：上一节已交代配方的药引/解药；当场有人递过来的东西；"
     "前文提过名字、本节只是拿出来用；只是被提及而没被使用。\n"
@@ -3006,7 +3008,8 @@ def _sec_overreach(llm: BaseLLM, cur_text: str, next_goal: str, next_hook: str) 
 _SEC_STATE_SYS = (
     "你是连载小说的场记。读完一节正文，只输出它**结尾那一刻**的状态，严格 JSON："
     '{"here":"地点","when":"时辰或日子","on":["结尾时还在场的人"],'
-    '"done":["本节已经演完的事，最多3条"],"knows":["主角本节新知道的信息，最多3条"]}'
+    '"done":["本节已经演完的事，最多3条"],"knows":["主角本节新知道的信息，最多3条"],'
+    '"told":["本节已经把哪些底牌/计划/身份摊开、摊给了谁，最多3条"]}'
     "\n规矩：只写正文里明写的；推断不出来就写空字符串或空数组，不许编；"
     "不许评价文笔，不许给建议，只输出 JSON。"
 )
@@ -3038,7 +3041,8 @@ def _sec_state(llm: BaseLLM, body: str) -> dict:
            "when": str(d.get("when") or "")[:20],
            "on": [str(x)[:10] for x in (d.get("on") or []) if str(x).strip()][:6],
            "done": [str(x)[:40] for x in (d.get("done") or []) if str(x).strip()][:3],
-           "knows": [str(x)[:40] for x in (d.get("knows") or []) if str(x).strip()][:3]}
+           "knows": [str(x)[:40] for x in (d.get("knows") or []) if str(x).strip()][:3],
+           "told": [str(x)[:40] for x in (d.get("told") or []) if str(x).strip()][:3]}
     if not (out["here"] or out["when"] or out["on"] or out["done"]):
         return {}
     return out
@@ -3059,6 +3063,10 @@ def _state_block(st: dict) -> str:
         lines.append(f"已经演完：{d}")
     for k in st.get("knows") or []:
         lines.append(f"主角已经知道：{k}")
+    # 摊开的底牌是「对方已经知道」的反向约束：v29 的硬伤里有一条正是
+    # 「05 太后已当场自曝底牌 → 07 又写她像没对质过」，写手记不住说过的话。
+    for t in st.get("told") or []:
+        lines.append(f"已经摊开、对方已知：{t}")
     return chr(10).join(lines) if lines else "（无）"
 
 
