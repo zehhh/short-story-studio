@@ -513,7 +513,13 @@ def self_refs(text: str, names: list[str]) -> dict[str, dict[str, list[str]]]:
             seg = ""
             mq = _QUOTE_TAIL.match(body[m.end(): m.end() + 40])
             if mq:
-                seg = mq.group(1)
+                # 名字与引号之间若还出现**另一个**名册人物，归属就不确定
+                # （「太后看向皇帝：「朕……」」——这句是皇帝说的）。宁可漏判。
+                full_m = mq.group(0)
+                cut = min([i for i in (full_m.find("「"), full_m.find("“")) if i >= 0] or [0])
+                gap = full_m[:cut]
+                if not any(o != nm and o in gap for o in names if len(o) >= 2):
+                    seg = mq.group(1)
             else:
                 mh = _QUOTE_HEAD.search(body[max(0, m.start() - 320): m.start()])
                 if mh:

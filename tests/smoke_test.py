@@ -474,6 +474,8 @@ def main() -> int:
     _test_death_ledger_resurrection()
     _test_summary_jump_detector()
     _test_body_trope_cluster()
+    _test_self_dup_guard()
+    _test_plan_replay_nonadjacent()
     _test_rewrite_regress_guard()
     _test_direction_keys_fuzzy()
 
@@ -1156,6 +1158,39 @@ def _test_direction_keys_fuzzy():
     assert not missing, f"这些梗库方向没有任何读者画像覆盖（会退化成默认取样）：{missing}"
     print("[ok] 题材键模糊解析（婆媳矛盾→poxi）+ 读者画像 42/42 全覆盖")
 
+
+
+def _test_self_dup_guard():
+    """节内自我重复判据：同一句贴两遍要报，正常不会误报。"""
+    from studio.pipeline import _self_dup
+
+    bad = "我依言跪在软垫上，凤冠霞帔压得脖颈生疼。我抬头看了一眼。" * 2
+    assert _self_dup(bad), "同一段贴两遍必须报"
+    ok = ("太后放下碗，淡淡道：「哀家累了。」殿里没人应声。"
+          "我垂着眼睛数砖缝，数到第七道，听见外面有人拖步过来。")
+    assert not _self_dup(ok), f"正常段落不许误报：{_self_dup(ok)!r}"
+    assert not _self_dup("短"), "过短文本直接放过"
+    print("[ok] 节内自我重复：复制残句报 / 正常段落不误报")
+
+
+def _test_plan_replay_nonadjacent():
+    """分节计划：隔着几节的同一场戏也要拦住（v27 的 04↔06 就是这么漏的）。"""
+    from studio.pipeline import plan_replay_risk
+
+    plan = {"sections": [
+        {"no": 1, "goal": "太后赐药试探我", "scene": "慈宁宫·太后"},
+        {"no": 2, "goal": "我当众推拒不饮", "scene": "大殿·百官"},
+        {"no": 3, "goal": "太后又赐药试探我", "scene": "慈宁宫·太后"},
+    ]}
+    hits = plan_replay_risk(plan)
+    assert hits and hits[0]["at"] == [1, 3], f"隔着三节的同场戏必须报：{hits}"
+    clean = {"sections": [
+        {"no": 1, "goal": "太后赐药试探我", "scene": "慈宁宫·太后"},
+        {"no": 2, "goal": "我在御花园撞见柳贵妃", "scene": "御花园·柳贵妃"},
+        {"no": 3, "goal": "皇帝查太医院旧案", "scene": "御书房·皇帝"},
+    ]}
+    assert not plan_replay_risk(clean), "不同的戏不许误报"
+    print("[ok] 分节计划重演风险：隔节同场戏报 / 不同戏不误报")
 
 
 if __name__ == "__main__":

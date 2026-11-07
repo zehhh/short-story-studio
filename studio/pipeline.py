@@ -2517,6 +2517,12 @@ def _section_gate(cfg: dict, body: str, lo: int, hi: int) -> list[str]:
         if labels:
             problems.append("语言病：" + "；".join(x for x in labels if x)
                             + "（改成正常中文语序，一句话说完的不要拆成几个短句）")
+    _sd = _self_dup(body)
+    if _sd:
+        problems.append(
+            f"本节内部有一句话原样说了两遍（「{_sd[:14]}」）：同一件事、同一个动作"
+            "只写一次，把重复的那句删掉，或改成新信息"
+        )
     _sj = _summary_jump(body)
     if _sj:
         problems.append(
@@ -2563,21 +2569,27 @@ def plan_replay_risk(plan: dict) -> list[dict]:
     """
     secs = plan.get("sections") or []
     out: list[dict] = []
-    for i in range(len(secs) - 1):
-        a, b = secs[i], secs[i + 1]
-        if not isinstance(a, dict) or not isinstance(b, dict):
-            continue
-        why = []
-        sa = (a.get("scene") or "").strip()
-        sb = (b.get("scene") or "").strip()
-        if sa and sb and sa == sb:
-            why.append(f"两节同一场戏「{sa}」")
-        ga, gb = _goal_grams(a.get("goal") or ""), _goal_grams(b.get("goal") or "")
-        if ga and gb:
-            jac = len(ga & gb) / len(ga | gb)
-            if jac >= 0.34:
-                why.append(f"核心事件重复（相似度 {jac:.2f}）")
-        if why:
+    # 相邻与**不相邻**的都要查：v27 的三处重演是 04↔06（同一场请安）、02↔03（藏瓷）、
+    # 03↔05（柳贵妃关系倒退），隔着一节的重演只查相邻是抓不到的。
+    # 距离越远，允许的相似度越高（中间可能真的夹了别的戏）。
+    for i in range(len(secs)):
+        for j in range(i + 1, len(secs)):
+            a, b = secs[i], secs[j]
+            if not isinstance(a, dict) or not isinstance(b, dict):
+                continue
+            why = []
+            sa = (a.get("scene") or "").strip()
+            sb = (b.get("scene") or "").strip()
+            if sa and sb and sa == sb:
+                why.append(f"两节同一场戏「{sa}」")
+            ga, gb = _goal_grams(a.get("goal") or ""), _goal_grams(b.get("goal") or "")
+            _lim = 0.34 if j == i + 1 else (0.46 if j == i + 2 else 0.58)
+            if ga and gb:
+                jac = len(ga & gb) / len(ga | gb)
+                if jac >= _lim:
+                    why.append(f"核心事件重复（相似度 {jac:.2f}）")
+            if not why:
+                continue
             out.append({
                 "at": [a.get("no"), b.get("no")],
                 "why": "；".join(why),
@@ -3120,6 +3132,27 @@ def _facts_block(facts: list[str]) -> str:
     if not facts:
         return "（第一节，尚无）"
     return "\n".join(f"- {f}" for f in facts)
+
+
+def _self_dup(text: str, n: int = 12) -> str:
+    """同一节内部原样重复的句子（扩写/整稿改写留下的复制残句）。
+
+    和 `langqa.cross_dup` 管的是两件不同的事：那个比的是「本节 vs 前面几节」，
+    这个比的是「本节 vs 自己」。v27 的终审报过「同一句『我依言跪在软垫上，
+    凤冠霞帔压得脖颈生疼』在相邻两段原样出现两次」——扩写补字数时把一句话
+    贴了两遍，跨节判据看不见（它只跟前面几节比），只能靠这一道。
+    归一化去掉标点与空白后开窗，命中即返回重复片段（空串 = 没有）。
+    """
+    norm = re.sub("[" + r"\s，。！？、；：" + "'" + r"「」『』“”…—\-·（）()" + "]", "", text or "")
+    if len(norm) < n * 2:
+        return ""
+    seen: dict[str, int] = {}
+    for i in range(len(norm) - n + 1):
+        g = norm[i:i + n]
+        seen[g] = seen.get(g, 0) + 1
+        if seen[g] >= 2:
+            return g
+    return ""
 
 
 def _fix_sec_dup(cfg: dict, llm: BaseLLM, text: str, dups: list[dict],
@@ -5216,6 +5249,11 @@ def _apply_patches_verified(cfg: dict, full: str, patches: list[dict],
         cand = cur[:idx] + repl + cur[idx + len(cand_find):]
         lo2, hi2 = max(0, idx - window), min(len(cand), idx + len(repl) + window)
         before, after = _span_pen(cfg, cur[lo:hi]), _span_pen(cfg, cand[lo2:hi2])
+        # 补丁不许把一句话贴两遍：v27 的终审报过「同一句在相邻两段原样出现两次，
+        # 是扩写越界留下的复制残句」——那是这一轮补丁自己造出来的病。
+        if _self_dup(cand[lo2:hi2]) and not _self_dup(cur[lo:hi]):
+            dropped.append({"find": cand_find[:30], "reason": "改完该处出现自我重复"})
+            continue
         if after <= before:
             cur = cand
             kept += 1
