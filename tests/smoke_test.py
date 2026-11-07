@@ -476,6 +476,7 @@ def main() -> int:
     _test_body_trope_cluster()
     _test_self_dup_guard()
     _test_plan_replay_nonadjacent()
+    _test_section_gate_genre_aware()
     _test_prop_confusion_names()
     _test_plan_causal_check_keeps_plan_shape()
     _test_rewrite_regress_guard()
@@ -1174,6 +1175,17 @@ def _test_self_dup_guard():
     assert not _self_dup("短"), "过短文本直接放过"
     print("[ok] 节内自我重复：复制残句报 / 正常段落不误报")
 
+
+def _test_section_gate_genre_aware():
+    """题材规则必须传进节级门禁：古言「现代词混入古风」是 high，不传就永远不弹。"""
+    from studio.pipeline import _section_gate
+    cfg = {"lang_rules": {}}
+    b = ("她坐在榻上，脸色是一种近乎静止的状态。" * 40)
+    plain = _section_gate(cfg, b, 100, 90000)
+    guy = _section_gate(cfg, b, 100, 90000, ("guyan",))
+    assert not any("现代词" in x for x in plain), "无题材标签时不该报"
+    assert any("现代词" in x for x in guy), "带 guyan 必须报出现代词"
+    print("[ok] 节级门禁题材感知：古言现代词只在带题材标签时才拦")
 
 def _test_prop_confusion_names():
     """只差一个字的道具名要报出来（锦囊/药囊、玉佩/玉牌），其余不报。"""

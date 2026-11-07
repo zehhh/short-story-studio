@@ -2583,7 +2583,8 @@ def _first_sentence(text: str, limit: int = 60) -> str:
     return body[:limit]
 
 
-def _section_gate(cfg: dict, body: str, lo: int, hi: int) -> list[str]:
+def _section_gate(cfg: dict, body: str, lo: int, hi: int,
+                  genres: tuple = ()) -> list[str]:
     """节级确定性门禁。返回不合格原因列表（空 = 通过）。零 token。"""
     problems: list[str] = []
     n = count_words_zh(body)
@@ -2597,20 +2598,27 @@ def _section_gate(cfg: dict, body: str, lo: int, hi: int) -> list[str]:
     if not b.get("pass", True):
         terms = "、".join(f"「{h['term']}」" for h in b["hits"][:3])
         problems.append(f"出现禁用道具 {terms}：换成具体行为、眼神、狠话或信物来承载")
-    rep = langqa.scan(body, langqa.load_rules(cfg))
+    # genres 必须传进来：题材专属规则（古言的「现代词混入古风」是 high）只在
+    # 带 genres 时生效。v36 终审 4 条 AI 味里唯一的 high 是「状态」——写作时
+    # 节级扫描没带 guyan，全程没拦，直到交付体检才炸成 C 不可投。
+    rep = langqa.scan(body, langqa.load_rules(cfg), genres=genres or ())
     if not rep.get("pass", True):
         # 节级只卡 **high**（黑名单硬伤：AI 腔套句、翻译腔句式）。
         # 「mid」里的 AI 口癖（一丝/只见/就在这时/时间过渡词）在节级是**不可达成的**
         # 指标——实测 12 节里 12 节全部因此判不合格，每节白烧 3 次重写还照样带着病
         # 交付。这类问题留给整稿 `_ai_deflavor`：它按节定位、把命中词与所在句一起
         # 喂给模型，比「整节盲改」有效得多（详见 docs/dev/DECISIONS.md 决策 30）。
-        labels = []
+        labels, tips = [], []
         for h in (rep.get("hits") or [])[:4]:
             if h.get("severity") == "high":
                 labels.append(h.get("label") or h.get("kind") or "")
+                _sg = str(h.get("suggest") or "").strip()
+                if _sg and len(tips) < 2:
+                    tips.append(_sg.split("；")[0][:60])
         if labels:
-            problems.append("语言病：" + "；".join(x for x in labels if x)
-                            + "（改成正常中文语序，一句话说完的不要拆成几个短句）")
+            _tail = "；".join(tips) if tips else (
+                "改成正常中文语序，一句话说完的不要拆成几个短句")
+            problems.append("语言病：" + "；".join(x for x in labels if x) + "（" + _tail + "）")
     _sd = _self_dup(body)
     if _sd:
         problems.append(
@@ -3470,6 +3478,9 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
     idea = concept.get("idea", "") or concept.get("core_trope", "") or project.root.name
     direction = concept.get("direction", "")
     total_words = concept.get("words", 9000)
+    # 题材标签写进 cfg，供所有确定性扫描器共用：古言的「现代词混入古风」是
+    # high 级规则，不带 genres 就永远不生效（v36 因此 C 不可投）。
+    cfg["_genres"] = langqa.genre_tags(direction)
 
     writer_llm = resolve_llm(cfg, llm, "writer")
     genre_guide = load_genre_guide(cfg, direction)
@@ -3669,7 +3680,8 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
                          + "\n\n只输出这一节正文，不要解释、不要道歉。")
             raw = writer_llm.chat(sys_i, user)
             body = normalize_quotes(_sec_clean(raw))
-            problems = _section_gate(cfg, body, lo_i, hi_i)
+            problems = _section_gate(cfg, body, lo_i, hi_i,
+                                     langqa.genre_tags(direction))
             # 线索不丢：上一节声明要留下的东西，这一节开头必须正面接住。
             # 只给一次重写机会（第 1 次尝试后才追加）——同义改写本来就抓不准，
             # 硬卡会产生假阳性连环重写；抓到了就提示，抓不到就落到连续性体检里。
@@ -5405,7 +5417,7 @@ def _det_hits_count(cfg: dict, text: str) -> int:
         if not t:
             continue
         try:
-            rep = langqa.scan(t, rules)
+            rep = langqa.scan(t, rules, genres=cfg.get("_genres") or ())
         except Exception:  # noqa: BLE001
             continue
         n += sum(1 for h in (rep.get("hits") or [])
