@@ -6429,6 +6429,19 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
         while avg < threshold and rnd < max_r:
             print(f"[stage] 读者均分 {avg:.2f} < {threshold}，整稿打回重写（{rnd}/{max_r}）…")
             writer_llm2 = resolve_llm(cfg, llm, "writer")
+            # 整稿重写是「锦上添花」，不是必须跑通的一步：把这一次调用的超时和
+            # 重试压到短值（配置里 writer 是 timeout=1800 / retries=5，网关挂死
+            # 时能白等两个多小时），调用完立刻还原，不影响后面的写手调用。
+            _saved = (getattr(writer_llm2, "timeout", None),
+                      getattr(writer_llm2, "retries", None))
+            try:
+                if _saved[0]:
+                    writer_llm2.timeout = min(int(_saved[0]), 420)
+                    writer_llm2._t_post = (15, writer_llm2.timeout)  # noqa: SLF001
+                if _saved[1] is not None:
+                    writer_llm2.retries = 0
+            except Exception:  # noqa: BLE001 —— 属性不存在就算了，别因小失大
+                pass
             sys_f, user_f = render_prompt(
                 "polish_final",
                 IDEA=(project.load_json("concept.json") or {}).get("core_trope", ""),
@@ -6438,7 +6451,27 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
                 GENRE_GUIDE=load_genre_guide(cfg, (project.load_json("concept.json") or {}).get("direction", "")),
                 STYLE_SAMPLE=_style_sample_f,
             )
-            new_full = writer_llm2.chat(sys_f, user_f).strip()
+            # 这道整稿重写是全流程最脆的一步：输出上万 token，网关偶发挂死
+            # （v39 实测 38 分钟无返回、无超时、脚本卡在收尾阶段）。挂死时宁可
+            # 不重写：读者团只差零点几分，重写收益本来就被 _rewrite_regress 卡着。
+            try:
+                new_full = writer_llm2.chat(sys_f, user_f).strip()
+            except Exception as e:  # noqa: BLE001
+                print(f"[guard] 读者团整稿重写调用失败（{type(e).__name__}: {e}），保留原稿")
+                runlog.event("reader_rewrite", f"整稿重写失败：{type(e).__name__}", level="warn")
+                break
+            if not new_full:
+                print("[guard] 读者团整稿重写返回空文本，保留原稿")
+                break
+            # 还原写手通道的超时/重试（下一次重写或收尾阶段还要用同一个实例）
+            try:
+                if _saved[0]:
+                    writer_llm2.timeout = _saved[0]
+                    writer_llm2._t_post = (15, writer_llm2.timeout)  # noqa: SLF001
+                if _saved[1] is not None:
+                    writer_llm2.retries = _saved[1]
+            except Exception:  # noqa: BLE001
+                pass
             # 长度/结构/语言三道守卫一起过（见 _rewrite_regress 的注释：v19 就是
             # 只比了长度，整稿重写后长句密度 0.34→3.89/千字，B 直接掉 C）
             _ok_r, _why_r = _rewrite_regress(cfg, full, new_full, "读者团重写")
