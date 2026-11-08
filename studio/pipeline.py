@@ -5183,25 +5183,42 @@ def _thin_body(cfg: dict, llm: BaseLLM, full: str, cap: float = 1.0,
                 break
             rep["rounds"] += 1
             changed = 0
+            _pairs: list[tuple[str, str]] = []
             for ln in raw.split("\n"):
-                m = re.match(r"^\s*(\d+)\s*[｜|]\s*(.+?)\s*$", ln)
+                # 编号分隔符一律放宽：模型会在「1｜」之外写成「1.」「1、」「1：」「1)」。
+                m = re.match(r"^\s*(\d+)\s*[｜|.、:：)）]\s*(.+?)\s*$", ln)
                 if not m:
                     continue
                 idx = int(m.group(1)) - 1
                 if not (0 <= idx < len(pick)):
                     continue
-                old_seg = pick[idx][1].strip()
-                new_seg = m.group(2).strip()
+                _pairs.append((pick[idx][1].strip(), m.group(2).strip()))
+            if not _pairs:
+                # 编号整段丢掉时按顺序配对——能对上一条也比整轮空转好。
+                _prose = [ln.strip() for ln in raw.split("\n")
+                          if len(ln.strip()) >= 6 and not re.match(r"^\s*\d", ln)]
+                _pairs = [(pick[i][1].strip(), _prose[i])
+                          for i in range(min(len(pick), len(_prose)))]
+                if _pairs:
+                    print(f"[thin] 模型没按编号输出，按顺序配对 {len(_pairs)} 句")
+            for old_seg, new_seg in _pairs:
                 if not old_seg or old_seg == new_seg:
                     continue
                 if len(new_seg) > len(old_seg) * 2 or len(new_seg) < 4:
                     continue
-                if old_seg in cur:
-                    cur = cur.replace(old_seg, new_seg, 1)
-                    changed += 1
+                # 精确替换失败时退一步：去掉两端引号再试。模型常把「」转成“”，
+                # 整句就对不上原文（v38 实测 5 句提交、0 句替换，全是这个原因）。
+                for _a, _b in ((old_seg, new_seg),
+                               (old_seg.strip("「」“”\"'"), new_seg.strip("「」“”\"'"))):
+                    if _a and _a != _b and _a in cur:
+                        cur = cur.replace(_a, _b, 1)
+                        changed += 1
+                        break
             rep["changed"] += changed
             print(f"[thin] 第 {_r + 1} 轮：超标 {need} 句，提交 {len(pick)} 句，实际改动 {changed} 句")
             if not changed:
+                print(f"[thin] 解析明细：模型原样输出前 60 字「{raw[:60]}」——"
+                      "改不动说明它把句子改写成了对不上原文的形式，本轮跳过")
                 break
         st2 = (langqa.scan(cur, rules, genres=genres) or {}).get("stats") or {}
         n2 = int(st2.get("body_trope") or 0)
@@ -6626,7 +6643,18 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
     # **新写出来的句子没人再跟前面几节比过**。v18 就是这里漏的：第 05 节复用
     # 第 01 节「轻笑出声那笑声里没有温度只有」14 字，正卡在体检「≤2 处且最长
     # <14 字」的线上，判「跨章逐字重复(轻)」WARN。
+    # 衔接同理，而且比逐字重复更隐蔽：v38 的 r09 五处 high 里三处是跨节缝——
+    # 01 结尾「我捧着那碗未动的毒汤退出大殿」，02 开头又写「案几上那碗汤药还搁着」。
+    # 写作阶段每节都过了 `_sec_boundary`，但**改稿**把它们改成了矛盾的一对：
+    # 补丁只改一节，谁也不再回头看两边接得上接不上。所以在所有整稿改写之后再跑一次。
     if not isinstance(llm, MockLLM):
+        try:
+            full, _bnd2 = _fix_boundary_replay(cfg, llm, full, max_fix=3)
+            if _bnd2.get("fixed") or _bnd2.get("left"):
+                report["boundary_refix"] = _bnd2
+        except Exception as e:  # noqa: BLE001
+            report["boundary_refix"] = {"error": f"{type(e).__name__}: {e}"}
+            print(f"[boundary] ⚠ 交付前衔接复检跳过（{type(e).__name__}: {e}）")
         try:
             full, _dup_rep = _final_dup_fix(cfg, llm, full)
             report["dup_final"] = _dup_rep
