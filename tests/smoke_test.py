@@ -474,11 +474,13 @@ def main() -> int:
     _test_death_ledger_resurrection()
     _test_summary_jump_detector()
     _test_body_trope_cluster()
+    _test_thin_body_targeted_rewrite()
     _test_self_dup_guard()
     _test_plan_replay_nonadjacent()
     _test_section_gate_genre_aware()
     _test_prop_confusion_names()
     _test_plan_causal_check_keeps_plan_shape()
+    _test_plan_sections_structure_guard()
     _test_rewrite_regress_guard()
     _test_direction_keys_fuzzy()
 
@@ -1115,6 +1117,71 @@ def _test_body_trope_cluster():
     assert langqa.scan(thin)["stats"]["body_rate"] < 1.2, "单处不许判密度超标"
     print("[ok] 生理反应密度（人类基准 0.21/千字 · 红线 1.2）")
 
+
+def _test_thin_body_targeted_rewrite():
+    """密度瘦身：只改超标的那几句，改完密度必须降，改不动必须原样返回。"""
+    import re as _re
+
+    from studio import langqa
+    from studio.pipeline import _thin_body
+
+    filler = "她把帕子叠好，放回袖中，又看了一眼门外。" * 40
+    dense = ("01" + chr(10) + chr(10) + "额角沁出冷汗。" + filler
+             + "寒意顺着骨头缝往里钻，指节泛白，她把手缩回袖子里。" + chr(10))
+
+    class _L:
+        """只会干一件事的假写手：把这一行里的套词删干净。"""
+
+        def chat(self, sys_p, user_p, **kw):
+            out = []
+            for ln in user_p.split("【怎么改】")[0].split(chr(10)):
+                m = _re.match(r"^(\d+)｜(.+)$", ln.strip())
+                if not m:
+                    continue
+                seg = m.group(2)
+                for w in ("冷汗", "寒意", "骨头缝", "指节", "瞳孔", "眼底", "掌心"):
+                    seg = seg.replace(w, "")
+                out.append(f"{m.group(1)}｜{seg}")
+            return chr(10).join(out)
+
+    before = langqa.scan(dense)["stats"]["body_rate"]
+    assert before >= 1.2, f"构造的稿子应当超标，实测 {before}"
+
+    import studio.pipeline as _P
+
+    _orig = _P.resolve_llm
+    cfg = {"llm": {"provider": "mock"}, "lang": {}, "_genres": ()}
+    try:
+        _P.resolve_llm = lambda c, b, role: _L()
+        new, rep = _thin_body(cfg, _L(), dense, cap=1.0)
+        after = langqa.scan(new)["stats"]["body_rate"]
+        assert after < before, f"瘦身后密度必须下降：{before} → {after}"
+        assert rep["changed"] >= 1, f"至少应改一句，实测 {rep}"
+        assert rep["reverted"] is False, "正常瘦身不该回滚"
+
+        # 干不成时（假写手什么都不改）必须原样返回，不许把稿子写坏
+        class _Nop:
+            def chat(self, sys_p, user_p, **kw):
+                return ""
+
+        _P.resolve_llm = lambda c, b, role: _Nop()
+        new2, rep2 = _thin_body(cfg, _Nop(), dense, cap=1.0)
+        assert new2 == dense, "改不动时正文必须原样返回"
+        assert rep2["changed"] == 0, "不该记改过句子"
+
+        # 本来就没超标 → 一次 LLM 都不该调
+        class _Boom:
+            def chat(self, *a, **kw):
+                raise AssertionError("没超标不该调用模型")
+
+        _P.resolve_llm = lambda c, b, role: _Boom()
+        light = "额角沁出冷汗。" + filler * 2
+        new3, rep3 = _thin_body(cfg, _Boom(), light, cap=1.0)
+        assert new3 == light and rep3["rounds"] == 0, "没超标不许调用模型"
+    finally:
+        _P.resolve_llm = _orig
+    print("[ok] 生理反应瘦身（只改超标句 / 改不动原样返回 / 没超标不调模型）")
+
 def _test_rewrite_regress_guard():
     """整稿改写的语言回归守卫：改长改短不误判，语言变差必须拦。"""
     from studio.pipeline import _rewrite_regress
@@ -1201,8 +1268,22 @@ def _test_plan_causal_check_keeps_plan_shape():
     from studio import pipeline as P
 
     class _L:
-        def __init__(self, d): self.d = d
-        def chat_json(self, sys_p, user_p): return self.d
+        """第一轮回「有矛盾」，之后回「没有了」——复诊那一轮必须看到干净结果。
+
+        真实链路里 `plan_causal_check` 有两轮（改完再复诊一轮，抓「改法自己带出
+        的新矛盾」）。假模型如果每次都回同一份「有矛盾」，第二轮必然又判回来，
+        于是改版被回退、断言失败——这不是实现的问题，是桩没模拟出收敛。
+        """
+
+        def __init__(self, d):
+            self.d = d
+            self.n = 0
+
+        def chat_json(self, sys_p, user_p):
+            self.n += 1
+            if self.n == 1:
+                return self.d
+            return {"changes": [], "sections": []}
 
     plan = {"sections": [{"no": i, "title": "t%d" % i, "goal": "g%d" % i,
                           "end_hook": "h%d" % i} for i in (1, 2, 3)]}
@@ -1217,6 +1298,32 @@ def _test_plan_causal_check_keeps_plan_shape():
     np3, ch3 = P.plan_causal_check(_L({"changes": [], "sections": []}), plan)
     assert ch3 == [] and np3 is plan, "无矛盾原样返回"
     print("[ok] 计划级因果校验：改版采用 / 节数不符回退 / 无矛盾不动")
+
+
+def _test_plan_sections_structure_guard():
+    """节表结构校验：字符串列表即使节数对得上也不许被采用（v38 整轮跑崩的真因）。"""
+    from studio import pipeline as P
+
+    assert P._plan_sections_ok([{"no": 1, "goal": "g"}, {"no": 2, "goal": "h"}])
+    assert not P._plan_sections_ok(["第一节", "第二节"]), "字符串列表必须判不合格"
+    assert not P._plan_sections_ok([{"no": 1, "goal": "g"}, "坏掉的一节"]), "混入脏项也不许过"
+    assert not P._plan_sections_ok([{"no": 1}]), "缺 goal 不许过"
+    assert not P._plan_sections_ok([{"goal": "g"}]), "缺 no 不许过"
+    assert not P._plan_sections_ok([]) and not P._plan_sections_ok(None)
+
+    class _L:
+        """回一份节数正确、但 sections 是字符串列表的「改版」。"""
+
+        def chat_json(self, sys_p, user_p):
+            return {"changes": [{"sections": [2], "what": "x", "fix": "y"}],
+                    "sections": ["一", "二", "三"]}
+
+    plan = {"sections": [{"no": i, "title": "t", "goal": "g%d" % i,
+                          "end_hook": "h"} for i in (1, 2, 3)]}
+    np1, ch1 = P.plan_causal_check(_L(), plan)
+    assert ch1 == [] and np1 is plan, "结构不合格的改版必须原样回退"
+    print("[ok] 节表结构校验：字符串列表 / 缺字段 / 脏项一律回退")
+
 
 def _test_plan_replay_nonadjacent():
     """分节计划：隔着几节的同一场戏也要拦住（v27 的 04↔06 就是这么漏的）。"""

@@ -600,6 +600,30 @@ _BODY_TROPE = re.compile(
 )
 
 
+def body_sentences(text: str, min_len: int = 6) -> list[tuple[int, str]]:
+    """返回含身体/神态套词的句子 `[(字符偏移, 句子)]`，按命中词数降序。
+
+    定向瘦身用：密度超标时要能说清**改哪几句**，而不是把整节打回重写。
+
+    为什么不逐词下禁令上面已经说明：`冷汗`「指节」单独出现都是合法中文，
+    词表硬扫只会误伤。所以这里只负责**定位**——改不改、改哪几句由 pipeline
+    的 `_thin_body` 按「超量多少」决定。
+    """
+    out: list[tuple[int, int, str]] = []
+    off = 0
+    for line in (text or "").split("\n"):
+        for m in re.finditer(r"[^。！？]*[。！？]?", line):
+            seg = m.group(0)
+            if len(seg.strip()) < min_len:
+                continue
+            n = len(_BODY_TROPE.findall(seg))
+            if n:
+                out.append((off + m.start(), n, seg))
+        off += len(line) + 1
+    out.sort(key=lambda x: -x[1])
+    return [(pos, seg) for pos, _n, seg in out]
+
+
 def scan(text: str, rules: dict | None = None, genres: tuple[str, ...] | list[str] = ()) -> dict:
     """扫描正文，返回 {pass, hits, stats}。hits: [{kind,label,note,count/pos}]
 

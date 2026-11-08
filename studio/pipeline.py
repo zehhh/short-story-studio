@@ -2967,6 +2967,27 @@ def _plan_digest(plan: dict) -> str:
     return "\n".join(out)
 
 
+def _plan_sections_ok(secs) -> bool:
+    """改版节表的结构校验：每节必须是带 no 与 goal 的字典。
+
+    只比长度是不够的。真实事故（v38）：判官模型把 `sections` 回成了字符串列表，
+    节数正好与计划一致，长度校验放行 → 改版被采用 → 写节时 `sec.get("no")`
+    抛 AttributeError，整轮跑到 108 秒崩掉。计划改版宁可不用，也不许把计划弄散。
+    """
+    if not isinstance(secs, list) or not secs:
+        return False
+    for s in secs:
+        if not isinstance(s, dict):
+            return False
+        try:
+            int(s.get("no"))
+        except (TypeError, ValueError):
+            return False
+        if not str(s.get("goal") or "").strip():
+            return False
+    return True
+
+
 def plan_causal_check(llm: BaseLLM, plan: dict, idea: str = "",
                       lo: int = 600, hi: int = 1000) -> tuple:
     """分节计划的**全局因果校验**：在写一个字之前把跨节矛盾改掉。
@@ -2993,7 +3014,7 @@ def plan_causal_check(llm: BaseLLM, plan: dict, idea: str = "",
         return plan, []
     changes = [c for c in (d.get("changes") or []) if isinstance(c, dict)][:5]
     news = d.get("sections") or []
-    if not changes or len(news) != len(secs):
+    if not changes or len(news) != len(secs) or not _plan_sections_ok(news):
         if changes:
             print(f"[plan] ⚠ 因果校验报了 {len(changes)} 处矛盾但节数对不上，"
                   f"不采用改版（宁可漏改，不许把计划弄散）")
@@ -3015,7 +3036,7 @@ def plan_causal_check(llm: BaseLLM, plan: dict, idea: str = "",
     if isinstance(d2, dict):
         _ch2 = [c for c in (d2.get("changes") or []) if isinstance(c, dict)][:5]
         _n2 = d2.get("sections") or []
-        if _ch2 and len(_n2) == len(merged.get("sections") or []):
+        if _ch2 and len(_n2) == len(merged.get("sections") or []) and _plan_sections_ok(_n2):
             print(f"[plan] 复诊又发现 {len(_ch2)} 处（第一轮的改法自己带出来的）：")
             for c in _ch2:
                 print(f"[plan]    第{c.get('sections')}节 · {str(c.get('what'))[:60]}")
@@ -3552,6 +3573,24 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
                 plan = _plan_keep
         project.save_json("section_plan.json", plan)
     secs = plan.get("sections") or []
+    # 结构兜底：真实事故（v38）——判官模型把 `sections` 回成了字符串列表，节数
+    # 正好对得上，于是 `plan_causal_check` 的长度校验放行，改版被采用，这里
+    # `sec.get("no")` 直接 AttributeError，整轮跑到第 108 秒崩掉。
+    # 「长度对得上」不等于「结构对得上」，所以入口再校一次：字符串按标题补成小节，
+    # 别的脏数据直接丢掉。
+    if secs and not all(isinstance(s, dict) for s in secs):
+        _fixed: list[dict] = []
+        for _i, _s in enumerate(secs, 1):
+            if isinstance(_s, dict) and _s.get("no") is not None:
+                _fixed.append(_s)
+            elif isinstance(_s, str) and _s.strip():
+                _fixed.append({"no": _i, "title": _s.strip()[:20], "goal": _s.strip(),
+                               "end_hook": ""})
+        if _fixed:
+            print(f"[stage] ⚠ 分节计划结构异常（{len(secs)} 项里有非字典项），"
+                  f"已按标题补全 {len(_fixed)} 节")
+            plan = dict(plan, sections=_fixed)
+            secs = _fixed
     if not secs:
         print("[stage] ⚠ 分节计划生成失败，回落到整篇一次写")
         return stage_write_direct(cfg, llm, project)
@@ -5077,6 +5116,110 @@ def _ai_deflavor(cfg: dict, llm: BaseLLM, project: Project, full: str,
         return full, {"rounds": 0, "error": f"{type(e).__name__}: {e}"[:200]}
 
 
+_THIN_SYS = (
+    "你是中文小说编辑。任务只有一个：把给定句子里的**身体反应/神态套词**换成"
+    "看得见的结果或具体物件，句子意思、人物、事件、时态一律不许变。"
+    "不要新增比喻，不要堆形容词，不要加心理描写，不要解释。"
+)
+
+_THIN_USER = """【要改的句子】（每行「编号｜原句」）
+{LINES}
+
+【怎么改】
+- 目标是让这些句子里**不再出现**：冷汗、寒意、凉意、骨缝发凉、筛糠、瞳孔、眼底、
+  眸色、指节、喉结、鬓角、掌心、发抖、哆嗦、鸡皮疙瘩、头皮发麻、后颈、脊背发凉、浑身发。
+- 换成**看得见的结果**：手抖→「茶盏磕在案沿，泼了半盏」；怕→「她把裙角攥进手心，
+  指甲掐进肉里」；惊→「她手里那支笔停在半空，一直没落下来」；冷→「她往袖子里缩了缩手」。
+- 一句里出现两三个套词的，留一个最必要的，其余删掉——不要为了保留而改写成长句。
+- 无法改写就**原样输出该行**（宁可不动，也不许改出病句）。
+
+【输出格式】只输出「编号｜改后句子」，编号一个不许少、不许合并、不许换顺序。"""
+
+
+def _thin_body(cfg: dict, llm: BaseLLM, full: str, cap: float = 1.0,
+               max_sents: int = 10, rounds: int = 2) -> tuple[str, dict]:
+    """把身体/神态套词密度从超红线压回人类区间（只改超标的那几句）。
+
+    为什么单独做这一步：密度红线（1.2/千字）是投稿判定里的 mid 级文风命中，v37
+    成稿 1.69/千字——离 A 级只差这一条。但两条现成的路都不通：逐词下禁令会把
+    合法中文一同判死（`冷汗`「指节」单独出现并不算病）；整节重写则按「密度下降」
+    收下改稿时会顺带把 AI 口癖写回来（实测密度降了、命中涨了）。所以这里只挑
+    **超量的那几句**做定点替换，改完全稿复测——密度没降或别的指标变差就回滚。
+    """
+    rep: dict = {"rounds": 0, "before": 0.0, "after": 0.0,
+                 "changed": 0, "reverted": False}
+    try:
+        from .langqa import body_sentences as _body_sents
+        from .langqa import load_rules as _load_rules
+        rules = _load_rules(cfg)
+        genres = cfg.get("_genres") or ()
+        st = (langqa.scan(full, rules, genres=genres) or {}).get("stats") or {}
+        n0 = int(st.get("body_trope") or 0)
+        chars = int(st.get("chars") or 0) or 1
+        rate0 = n0 / chars * 1000
+        rep["before"] = round(rate0, 2)
+        if rate0 <= cap or n0 == 0:
+            rep["after"] = rep["before"]
+            return full, rep
+        allowed = int(cap * chars / 1000)
+        base_pen = _det_hits_count(cfg, full)
+        cur = full
+        for _r in range(max(1, rounds)):
+            st_c = (langqa.scan(cur, rules, genres=genres) or {}).get("stats") or {}
+            n_c = int(st_c.get("body_trope") or 0)
+            need = n_c - allowed
+            if need <= 0:
+                break
+            cands = _body_sents(cur)
+            if not cands:
+                break
+            pick = cands[:min(need, max_sents)]
+            lines = "\n".join(f"{i + 1}｜{seg.strip()}" for i, (_p, seg) in enumerate(pick))
+            try:
+                raw = resolve_llm(cfg, llm, "writer").chat(
+                    _THIN_SYS, _THIN_USER.replace("{LINES}", lines)).strip()
+            except Exception as e:  # noqa: BLE001
+                print(f"[thin] 瘦身调用失败（{e}），保留原文")
+                break
+            rep["rounds"] += 1
+            changed = 0
+            for ln in raw.split("\n"):
+                m = re.match(r"^\s*(\d+)\s*[｜|]\s*(.+?)\s*$", ln)
+                if not m:
+                    continue
+                idx = int(m.group(1)) - 1
+                if not (0 <= idx < len(pick)):
+                    continue
+                old_seg = pick[idx][1].strip()
+                new_seg = m.group(2).strip()
+                if not old_seg or old_seg == new_seg:
+                    continue
+                if len(new_seg) > len(old_seg) * 2 or len(new_seg) < 4:
+                    continue
+                if old_seg in cur:
+                    cur = cur.replace(old_seg, new_seg, 1)
+                    changed += 1
+            rep["changed"] += changed
+            print(f"[thin] 第 {_r + 1} 轮：超标 {need} 句，提交 {len(pick)} 句，实际改动 {changed} 句")
+            if not changed:
+                break
+        st2 = (langqa.scan(cur, rules, genres=genres) or {}).get("stats") or {}
+        n2 = int(st2.get("body_trope") or 0)
+        rate2 = n2 / chars * 1000
+        rep["after"] = round(rate2, 2)
+        if rate2 < rate0 and _det_hits_count(cfg, cur) <= base_pen:
+            print(f"[thin] 生理反应密度 {rate0:.2f} → {rate2:.2f}/千字（红线 {cap:.2f}），改动 "
+                  f"{rep['changed']} 句")
+            return cur, rep
+        rep["reverted"] = True
+        print(f"[warn] 瘦身后密度 {rate2:.2f}/千字未改善或带出新的语言病，回滚原文")
+        return full, rep
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] 生理反应瘦身失败（{e}），跳过")
+        rep["after"] = rep["before"]
+        return full, rep
+
+
 def _rewrite_density_sections(cfg: dict, llm: BaseLLM, project: Project, full: str,
                               style_sample: str, max_secs: int = 3,
                               prefer_ai: bool = False) -> str:
@@ -5877,18 +6020,35 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
                     continue
             if not reps:
                 raise ValueError("体检输出非对象")
-            reps.sort(key=lambda x: float(x.get("score") or 0))
-            best = reps[len(reps) // 2]
+            # 三次评分先各自过核验，再按 **(硬伤数, 分数)** 取中位那次。
+            # 为什么按硬伤数排序而不是按分数：封顶阶梯只看硬伤数，而判官对同一
+            # 份稿子的硬伤计数极不稳定——v37 同一篇在 r01–r06 被判出 2/3/4/6/14
+            # 处 high，按分数取中位会挑中「分数中等但硬伤报了 14 处」的那次，
+            # 于是修复循环在 62→55→45 之间来回振荡，看起来像越修越坏。
             # 硬伤必须可核验（见 grade_issue_evidence）：引不出原文的高危降为 mid，
-            # 不让一句「重演了」把整篇压掉一档（v15 实测判官把升级判成重演，
-            # 按硬伤封顶把 68 分的稿子压到 43 分，四轮修复全在追不存在的缺陷）。
-            best["issues"], _n_down = grade_issue_evidence(best.get("issues") or [], text)
+            # 不让一句「重演了」把整篇压掉一档（v15 实测判官把升级判成重演）。
+            _n_down = _n_style = 0
+            for _r in reps:
+                _iss, _d = grade_issue_evidence(_r.get("issues") or [], text)
+                # 第二道核验：文风/AI 腔类 high 要有本项目扫描器背书。
+                _iss, _s = demote_unverified_style(_iss, text)
+                _r["issues"] = _iss
+                _n_down += _d
+                _n_style += _s
+
+            def _n_hi(r: dict) -> int:
+                return sum(1 for _i in (r.get("issues") or [])
+                           if str((_i or {}).get("severity") or "mid").strip() == "high")
+
+            reps.sort(key=lambda x: (_n_hi(x), float(x.get("score") or 0)))
+            best = reps[len(reps) // 2]
+            _spread = [v for v in (_n_hi(r) for r in reps)]
+            if len(set(_spread)) > 1:
+                print(f"[stage] 判官三次的硬伤计数不一致 {_spread}，取中位那次"
+                      f"（{_n_hi(best)} 处）——避免单次报数把整篇压掉一档")
             if _n_down:
                 print(f"[stage] 判官 {_n_down} 处 high 硬伤引不出原文，降为 mid"
                       f"（不可核验的印象不参与压档）")
-            # 第二道核验：文风/AI 腔类 high 要有本项目扫描器背书（见函数文档）。
-            best["issues"], _n_style = demote_unverified_style(
-                best.get("issues") or [], text)
             if _n_style:
                 print(f"[stage] 判官 {_n_style} 处 high「文风/AI 腔」与扫描器不符"
                       f"（本稿扫描命中 0 条），降为 mid（印象不压档）")
@@ -6362,6 +6522,12 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
     # 结果就是打磨把缺陷分从 62 打到 17、终审 66 分，投稿仍判「D规范/AI味/黑名单(硬)
     # → C 不可投」。这里补上唯一缺的一环：用同一套 langqa 判据找节、逐节定向重写。
     full, report["langqa_ai_repair"] = _ai_deflavor(cfg, llm, project, full, _style_sample_f)
+
+    # 生理反应/神态套词密度瘦身：langqa 红线 1.2/千字（79 篇 onehu 真人短篇 p90=0.73
+    # 标定），而 v37 成稿 1.69 —— 这一条是「主编 6.6 但投稿 B」里唯一还压着的文风项。
+    # 必须放在 _ai_deflavor 之后：去味重写会顺带把「眼底闪过一丝」这类套词写回来，
+    # 先瘦身后去味等于白做，顺序反了（实测 v20 顺序颠倒时密度从 2.67 只降到 2.1）。
+    full, report["body_thin"] = _thin_body(cfg, llm, full)
 
     total_words = count_words_zh(full)
     # 全稿确定性兜底复查：润色/补丁/读者重写都可能把道具或思考泄漏写回来。
