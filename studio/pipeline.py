@@ -5137,7 +5137,7 @@ _THIN_USER = """【要改的句子】（每行「编号｜原句」）
 
 
 def _thin_body(cfg: dict, llm: BaseLLM, full: str, cap: float = 1.0,
-               max_sents: int = 10, rounds: int = 2) -> tuple[str, dict]:
+               max_sents: int = 10, rounds: int = 3) -> tuple[str, dict]:
     """把身体/神态套词密度从超红线压回人类区间（只改超标的那几句）。
 
     为什么单独做这一步：密度红线（1.2/千字）是投稿判定里的 mid 级文风命中，v37
@@ -6578,6 +6578,16 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
     # 必须放在 _ai_deflavor 之后：去味重写会顺带把「眼底闪过一丝」这类套词写回来，
     # 先瘦身后去味等于白做，顺序反了（实测 v20 顺序颠倒时密度从 2.67 只降到 2.1）。
     full, report["body_thin"] = _thin_body(cfg, llm, full)
+    # 瘦身之后再去一次味：瘦身是逐句替换，改出来的句子会带回「嘴角勾起一抹」这类口癖
+    # （v40 实测瘦身把密度打到 1.22 的同时冒出 4 条 AI 味 high：嘴角套词 / 并非而是 /
+    # 生理反应堆叠，投稿直接判 C）。顺序上「去味 → 瘦身 → 再去味」一轮不够，
+    # 但第三趟必须收得很紧（单轮），否则会在两个指标之间来回摆。
+    try:
+        full, _ai2 = _ai_deflavor(cfg, llm, project, full, _style_sample_f, max_rounds=1)
+        if _ai2.get("rounds"):
+            report["langqa_ai_repair2"] = _ai2
+    except Exception as e:  # noqa: BLE001
+        print(f"[stage] ⚠ 收尾去味失败（{type(e).__name__}: {e}）")
 
     total_words = count_words_zh(full)
     # 全稿确定性兜底复查：润色/补丁/读者重写都可能把道具或思考泄漏写回来。
