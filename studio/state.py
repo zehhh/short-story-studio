@@ -215,7 +215,9 @@ def causeless(prev_text: str, body: str, declared: str = "") -> list[dict]:
 def hint_causeless(hit: dict) -> str:
     return (f"「{hit['item']}」在上一节里没有出现过，本节第一次出现就拿来用了"
             f"（「{hit['sentence']}」）——新手段/新道具第一次露面必须当场交代来源："
-            "谁给的、什么时候备下的、跟谁学的，一句话带过")
+            "谁给的、什么时候备下的、跟谁学的，一句话带过。"
+            "但身份自带的常用器具（太医的银针、厨子的刀、嬷嬷的鸡毛掸子）"
+            "只要句子里点明了是谁在用，就算交代过，不必再编来历")
 
 
 def summary(prev_text: str, body: str) -> list[str]:
@@ -489,7 +491,8 @@ _SELF_FEMALE = ("臣妾", "妾身", "本宫", "哀家", "奴婢", "小女", "女
 # 这些是通用第一人称，男女都用，不参与性别判定
 _SELF_NEUTRAL = ("我", "咱", "本人")
 
-_SAY_VERB = r"(?:说|道|笑道|低声道|轻声道|开口|答道|回话|喝|喊|问道|冷冷道|急道)"
+_SAY_VERB = (r"(?:说|道|笑道|低声道|轻声道|开口|答道|回话|喝|喊|问道|冷冷道|急道"
+             r"|声音|语气|嗓音|沉声道|冷声道|缓缓道|淡淡道)")
 _STOP = "".join(["\\u3002\\uff01\\uff1f", "\\n", "\\u300c\\u300d"])  # 。！？ 换行 「」
 _NOSTOP = "[^" + "。！？\n「」" + "]"
 _QUOTE_TAIL = re.compile(
@@ -497,6 +500,12 @@ _QUOTE_TAIL = re.compile(
     + _NOSTOP + r"{0,6}?[：:，,]?\s*[「“]([^」”]{2,300})[」”]"
 )
 _QUOTE_HEAD = re.compile(r"[「“]([^」”]{2,300})[」”]" + _NOSTOP + r"{0,10}$")
+# 「」后面的名字是不是这一句的说话人：只有紧跟说话动作才算。
+# 「嘴唇哆嗦」也收进来——「「臣妾……」太后嘴唇哆嗦」是标准的中文倒装写法。
+_SAY_AFTER = re.compile(
+    r"^[，、]?(?:说|道|问|答|应|笑|叹|哼|开口|出声|回话|低声|高声|沉声|轻声|冷声"
+    r"|缓缓|喃喃|嘀咕|嗫嚅|呜咽|嘴唇)"
+)
 _TOKENS = tuple(sorted(_SELF_MALE + _SELF_FEMALE, key=len, reverse=True))
 
 
@@ -534,7 +543,11 @@ def self_refs(text: str, names: list[str]) -> dict[str, dict[str, list[str]]]:
                     seg = mq.group(1)
             else:
                 mh = _QUOTE_HEAD.search(body[max(0, m.start() - 320): m.start()])
-                if mh:
+                # 「…」+ 名字 + 说话动词 才算这人说的。只靠「引号后出现名字」会把
+                # 下一句的动作主语当成上一句的说话人——实测 v38 把赵贵妃的
+                # 「陛下，臣妾只是邀请淑妃赏花」记到了紧接着的「萧景琰没看她」头上，
+                # 于是判皇帝自称混用，写手被逼着改了两遍真稿。
+                if mh and _SAY_AFTER.match(body[m.end(): m.end() + 12]):
                     seg = mh.group(1)
             if not seg:
                 continue

@@ -481,6 +481,7 @@ def main() -> int:
     _test_prop_confusion_names()
     _test_plan_causal_check_keeps_plan_shape()
     _test_plan_sections_structure_guard()
+    _test_self_ref_speaker_attribution()
     _test_rewrite_regress_guard()
     _test_direction_keys_fuzzy()
 
@@ -1262,6 +1263,34 @@ def _test_prop_confusion_names():
     assert not any("银针" in p for p in h), "长度不同/不形近的不许报"
     assert prop_confusion([]) == [] and prop_confusion(["碗"]) == []
     print("[ok] 道具形近名：锦囊/药囊 与 玉佩/玉牌 报出，不形近的不误报")
+
+
+def _test_self_ref_speaker_attribution():
+    """自称归属：引号后的名字若不是说话人，不许把台词记到它头上。
+
+    真实事故（v38）：「陛下，臣妾只是邀请淑妃赏花」后面紧跟「萧景琰没看她」，
+    旧实现把赵贵妃的台词记成了皇帝说的，于是判「皇帝自称朕/臣妾混用」，
+    写手被逼着重写两遍真稿。
+    """
+    from studio.state import self_ref_breaks, self_refs
+
+    txt = ("「陛下，臣妾只是邀请淑妃赏花，不知怎的她突然就晕了。」"
+           "萧景琰没看她，目光死死钉在我的脸上。" + chr(10))
+    r = self_refs(txt, ["萧景琰"])
+    assert "臣妾" not in (r.get("萧景琰") or {}), f"动作主语不是说话人：{r}"
+
+    # 倒装写法要认：引号 + 名字 + 说话/嘴唇动作
+    txt2 = ("「臣妾……」太后嘴唇哆嗦，最终无力地垂下手。" + chr(10))
+    r2 = self_refs(txt2, ["太后"])
+    assert "臣妾" in (r2.get("太后") or {}), f"倒装归属该认出来：{r2}"
+
+    # 名字在前（正常语序）仍然要认
+    txt3 = ("萧景琰声音冷得像冰：「朕要看那份调令。」" + chr(10))
+    r3 = self_refs(txt3, ["萧景琰"])
+    assert "朕" in (r3.get("萧景琰") or {}), f"正常语序该认出来：{r3}"
+    assert self_ref_breaks(txt, ["萧景琰"]) == []
+    print("[ok] 自称归属：动作主语不抢台词 / 倒装认 / 正常语序认")
+
 
 def _test_plan_causal_check_keeps_plan_shape():
     """计划级因果校验：节数对得上才采用改版，对不上宁可不动。"""
