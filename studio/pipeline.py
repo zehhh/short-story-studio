@@ -6169,6 +6169,7 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
         best_full, best_score = full, float(report.get("score") or 0)
         best_report = report  # 与 best_full 同时刻的体检结论（见下方"留优回填"）
         fail_streak = 0  # 连续"补丁后未提升/未达标"的轮数（≥2 即收敛终止）
+        no_gain_streak = 0  # 连续"分数没涨"的轮数（缺陷下降也算，≥3 收敛终止）
         _rewrite_n = 0  # 密度型整稿重写次数（独立上限4次，防无限循环）
         # 无界空转的两道闸（实测教训）：`final_fix_rounds=0` 的语义是"修到达标为止"，
         # 但每轮只涨 1 分（58→62→63）会让 fail_streak 永远停在 0——因为"提升"就重置。
@@ -6358,8 +6359,16 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
                 elif _det_hits_count(cfg, full) < _det_hits_count(cfg, prev_full):
                     _db, _da = _det_hits_count(cfg, prev_full), _det_hits_count(cfg, full)
                     fail_streak = 0
+                    # 分数不涨的轮次要单独数：v41 实测连续 5 轮判官都给 62.0 分，
+                    # 每轮只把确定性缺陷从 6 条磨到 2 条，而「缺陷下降就重置
+                    # fail_streak」让循环永远停不下来（每轮 12 分钟、6 个补丁、
+                    # 3 次判官采样）。分数不涨就是没向门槛靠近，缺陷再少也得止步。
+                    no_gain_streak += 1
                     print(f"[stage] 复评 {cur} 分未涨，但确定性缺陷 {_db}→{_da} 条，"
-                          f"保留本轮改动继续（不因判官抖动回滚已改好的稿子）")
+                          f"保留本轮改动继续（分数连续 {no_gain_streak} 轮没动）")
+                    if no_gain_streak >= 3:
+                        print("[guard] 连续3轮分数没有上涨（只磨平了确定性缺陷），收敛终止")
+                        break
                 else:
                     fail_streak += 1
                     print(f"[stage] 复评 {cur} 分未提升（best {best_score}），回滚；"
