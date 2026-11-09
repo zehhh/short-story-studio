@@ -104,7 +104,11 @@ def audit_text(text: str, report: dict | None = None, direction: str = "") -> di
     paras = [p.strip() for p in text.split("\n") if p.strip()]
     # 对白占比与章级门同源：按引号内**字数**算，不数"含引号的段落"
     # （后者对长段落天然偏高，同一篇稿子两个数——正是要消灭的判据分裂）。
-    ratio = language.dialog_ratio(text)
+    # 另：量**正文**，不量整篇。书名与导语里天然没有对白，却要占掉几百字的分母。
+    # 实测 nd2：正文 0.251 已达标，含书名导语的成稿算出来 0.242 → 判「C节奏/对话段占比」
+    # C 不可投。那等于要求写手每篇多写 3% 对白去贴补导语——这不是市场标准，是判据错位。
+    # 有节头就切出正文再算；直写散稿没有节头时退回整篇（否则分母直接变 0）。
+    ratio = language.dialog_ratio("\n".join(b for _, b in bodies) if bodies else text)
     long_paras = [i for i, p in enumerate(paras)
                   if len(p) > LONG_PARA_CHARS and not langqa._DIALOG_MARK.search(p)]
 

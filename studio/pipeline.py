@@ -6782,12 +6782,60 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
 
     # 平台成稿格式：导语 + 01/02/03 编号小节（assemble 已统一小节头为 NN 标题）
     plat_fmt = plat.get("format", "chapters")
-    if plat_fmt == "lead_numbered" and lead_rec.get("text"):
-        sections = [f"{title}", "", "导语：", lead_rec["text"], ""]
-        sections.append(full)   # full 来自 assemble：每节首行已是「NN 标题」
-        submit_text = "\n\n".join(sections)
-    else:
-        submit_text = f"{title}\n\n{full}"
+
+    def _build_submit(_body: str) -> str:
+        """按平台格式拼「读者真正看到的那一页」：书名 + 导语 + 正文。
+
+        必须是一个函数而不是一段内联代码：这个字符串既要喂给对白占比判据，
+        也要在字数收口之后重新拼一次。原先是内联拼一次、之后 `full` 又被
+        `deterministic_repair` 改过，结果 **成稿.txt 与体检用的都是改之前的旧稿**，
+        成稿.md 却是新的——同一篇稿子两个版本（nd2 实测：txt 缺了整轮机械返修）。
+        """
+        if plat_fmt == "lead_numbered" and lead_rec.get("text"):
+            return "\n\n".join([f"{title}", "", "导语：", lead_rec["text"], "", _body])
+        return f"{title}\n\n{_body}"
+
+    submit_text = _build_submit(full)
+
+    # 交付前**最后**一次对白复检，要量在正文上、且必须排在所有内容改动之后。
+    # 两个坑，实测 nd2 同时踩中：
+    #   ① 6734 行那次补对白之后还有人称收口 / 衔接复检 / 跨节去重，改的全是叙述句，
+    #      对白占比只减不增——门禁在下游、改写在上游，就永远差那么一点。
+    #   ② 判据口径必须与体检一致：都量正文（studio.audit 已同步改为切出正文再算），
+    #      不能一边量正文一边量成稿，否则写手要多写 3% 对白去贴补书名与导语。
+    # 所以：所有内容改动之后、字数收口之前，循环补到过线（最多 2 轮）。
+    if (cfg.get("review") or {}).get("lang_dialog_enabled", True) and not isinstance(llm, MockLLM):
+        try:
+            from .language import MARKET_TARGET as _MT4
+            from .language import dialog_raise as _lang_dialog3
+            from .language import dialog_ratio as _dratio3
+
+            _line3 = float(_MT4["dialog_ratio_min"])
+            _r3 = []
+            for _k3 in range(2):
+                _before3 = _dratio3(full)
+                if _before3 >= _line3:
+                    break
+                print(f"[dialog] 交付前正文对白占比 {_before3:.3f} < {_line3:.2f}，"
+                      f"第 {_k3 + 1} 轮补…")
+                full, _one3 = _lang_dialog3(
+                    cfg, llm, project, full,
+                    max_edits=int((cfg.get("review") or {}).get("lang_dialog_max_edits", 3)),
+                    style_sample=_style_sample_of(cfg, project),
+                )
+                submit_text = _build_submit(full)
+                _r3.append({"before": round(_before3, 3),
+                            "after": round(_dratio3(full), 3)})
+                if not (_one3 or {}).get("edits"):
+                    break
+            if _r3:
+                report["dialog_final"] = {"line": _line3, "rounds": _r3,
+                                          "after": round(_dratio3(full), 3)}
+                if _dratio3(full) < _line3:
+                    print(f"[dialog] ⚠ 补了两轮仍 {_dratio3(full):.3f} < {_line3:.2f}，留痕不再改")
+        except Exception as e:  # noqa: BLE001
+            report["dialog_final"] = {"error": f"{type(e).__name__}: {e}"}
+            print(f"[dialog] ⚠ 交付前对白复检跳过（{type(e).__name__}: {e}）")
     # 字数必须在**所有整稿改写之后**重量一次：4210 行取 total_words 之后，节长均衡
     # 与补对白还会整稿改写。用旧值会让成稿头部印的字数、report.final_words、
     # word_flow.lost_in_clean、set_stage("final") 全部对不上正文。final_md 因此也
@@ -6815,6 +6863,9 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
     if _new_total != total_words:
         print(f"[words] 交付前整稿改写使字数 {total_words} → {_new_total}，按新值收口")
         total_words = _new_total
+    # 机械返修刚改过 full → 成稿字符串必须重拼，否则 成稿.txt 与体检都用旧稿
+    # （成稿.md 用的是 full，所以两个文件会不一致；这是 nd2 实测到的问题）。
+    submit_text = _build_submit(full)
     final_md = (
         f"# {title}\n\n"
         f"> 平台：{plat['name']} | 字数：{total_words} | 题材：{direction}"

@@ -478,6 +478,7 @@ def main() -> int:
     _test_self_dup_guard()
     _test_plan_replay_nonadjacent()
     _test_boundary_fix_returns_records()
+    _test_audit_dialog_ratio_ignores_lead()
     _test_section_gate_genre_aware()
     _test_prop_confusion_names()
     _test_plan_causal_check_keeps_plan_shape()
@@ -990,6 +991,37 @@ def _test_recheck_rejects_rewrite_that_adds_hits():
     assert n_clean == 0, f"干净文本不许有硬命中，实测 {n_clean}"
     assert n_dirty > n_clean, f"脏文本必须多算，实测 {n_dirty} vs {n_clean}"
     print(f"[ok] 复查回归守卫的判据（干净 {n_clean} 条 / 脏文本 {n_dirty} 条）")
+
+
+def _test_audit_dialog_ratio_ignores_lead():
+    """体检的对白占比必须量正文，不量书名与导语。
+
+    实测 nd2：正文 0.251 已达标，含书名导语的成稿算出来 0.242，体检判
+    「C节奏/对话段占比」→ C 不可投。那等于要求写手每篇多写 3% 对白去贴补
+    几百字的书名与导语——不是市场标准，是判据错位。
+    """
+    from studio.audit import audit_text
+
+    body = ("01\n\n" + "「你来了。」他说。\n\n「我来晚了。」我说。\n\n" * 8
+            + "02\n\n" + "「坐。」他推过来一把椅子。\n\n「不坐了。」我说。\n\n" * 8)
+    # 书名 + 三百字纯叙述导语：整篇算会把对白占比压到线下，正文算不会
+    lead = "他站在门口，雨还没停，衣角往下滴水，屋里那盏灯忽明忽暗，像随时会灭。\n\n" * 6
+    doc = f"标题很长很长很长的一句话书名\n\n导语：\n{lead}\n\n{body}"
+    from studio.language import dialog_ratio
+
+    want = dialog_ratio(body)
+    whole = dialog_ratio(doc)
+    a_all = audit_text(doc)
+    assert a_all["sections"], "节头没识别出来，用例本身失效"
+    # 与「量正文」相差不到 3%（节头行算进分母会有一点点差），但必须明显高于整篇口径
+    assert abs(a_all["dialog_ratio"] - want) < 0.03, (
+        f"体检应按正文算 {want:.3f}，实测 {a_all['dialog_ratio']}")
+    assert a_all["dialog_ratio"] > whole + 0.08, (
+        f"整篇口径 {whole:.3f} 与正文口径 {want:.3f} 没拉开，用例没有区分度")
+    # 没有节头的散稿没有「正文」可分，退回整篇，不能变成 0
+    plain = "「你好。」\n\n「你好。」"
+    assert audit_text(plain)["dialog_ratio"] > 0.5, "无节头散稿必须退回整篇口径"
+    print("[ok] 体检对白占比量正文（不含书名导语 / 无节头退回整篇）")
 
 
 def _test_boundary_fix_returns_records():
