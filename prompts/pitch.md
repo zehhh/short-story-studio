@@ -21,6 +21,8 @@
 【核心梗】{{CORE_TROPE}}
 【核心冲突】{{CONFLICT}}
 【开头钩子】{{HOOK}}
+【这个故事已经拆好的骨架——书名与一句话故事必须是这同一个人、同一件事，不许另起炉灶】
+{{PLAN_HINT}}
 【目标平台】{{PLATFORM_NAME}}，平台规范：{{PLATFORM_STYLE}}；全稿目标 {{TARGET_WORDS}} 字左右。
 【题材知识卡摘要】
 {{KB_DIGEST}}

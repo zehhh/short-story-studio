@@ -477,6 +477,7 @@ def main() -> int:
     _test_thin_body_targeted_rewrite()
     _test_self_dup_guard()
     _test_plan_replay_nonadjacent()
+    _test_boundary_fix_returns_records()
     _test_section_gate_genre_aware()
     _test_prop_confusion_names()
     _test_plan_causal_check_keeps_plan_shape()
@@ -990,6 +991,26 @@ def _test_recheck_rejects_rewrite_that_adds_hits():
     assert n_dirty > n_clean, f"脏文本必须多算，实测 {n_dirty} vs {n_clean}"
     print(f"[ok] 复查回归守卫的判据（干净 {n_clean} 条 / 脏文本 {n_dirty} 条）")
 
+
+def _test_boundary_fix_returns_records():
+    """`_fix_boundary_replay` 的返回形状是 (text, list)，调用点不许当 dict 用。
+
+    实测事故：交付前衔接复检修好后写成 `_bnd2.get("fixed")`，整段抛
+    `AttributeError: 'list' object has no attribute 'get'` 被外层 except 吞掉，
+    report 里只留一行 `boundary_refix: {"error": ...}`——看起来像「不需要修」，
+    实际是这道门**一次都没跑过**（v-nd1 的 08→09 重演就这样漏到了终稿）。
+    这里把契约固定下来：第二项是 list，无重演时为空 list。
+    """
+    from studio.llm import MockLLM
+    from studio.pipeline import _fix_boundary_replay
+
+    text = "01\n\n" + "他推开门，屋里没有人。" * 20 + "\n\n02\n\n" + "她坐在窗边，没有回头。" * 20 + "\n"
+    out, recs = _fix_boundary_replay({}, MockLLM(), text, max_fix=1)
+    assert isinstance(out, str), f"第一项必须是正文，实测 {type(out).__name__}"
+    assert isinstance(recs, list), f"第二项必须是 list（调用点曾当 dict 用而崩溃），实测 {type(recs).__name__}"
+    # 两节正文互不相干时不该报重演
+    assert not recs, f"不相干的两节被误判成重演：{recs}"
+    print("[ok] 交付前衔接复检返回形状（str, list）")
 
 def _test_strip_body_preamble_removes_duplicate_lead():
     """正文自带的「书名：/导语：」必须砍掉，否则成稿里出现两个书名两段导语。

@@ -979,7 +979,8 @@ def _fallback_title(concept: dict) -> str:
 
 
 @runlog.staged("书名方案")
-def stage_pitch(cfg: dict, llm: BaseLLM, project: Project) -> dict:
+def stage_pitch(cfg: dict, llm: BaseLLM, project: Project,
+                plan_hint: str = "") -> dict:
     if project.has("pitch.json"):
         return project.load_json("pitch.json")
     llm = resolve_llm(cfg, llm, "planner")
@@ -1055,6 +1056,7 @@ def stage_pitch(cfg: dict, llm: BaseLLM, project: Project) -> dict:
         CHARACTER_TEMPLATES=ct_digest,
         TITLE_BAN=title_ban,
         DIRECTION_CHAIN=chain_text or "（本题材无专属思维链，按通用设计）",
+        PLAN_HINT=plan_hint.strip() or "（本次没有分节计划，按上面的核心梗自由发挥）",
         BAN_PROPS=_ban_props_text(cfg),
         AXES_SPEC="\n".join(f"- {k}：{v}" for k, v in AXES_SPEC.items()),
         AXES_BAN=axes_ban_text(cfg) or "（暂无，各轴自由选择）",
@@ -3602,7 +3604,20 @@ def stage_write_section(cfg: dict, llm: BaseLLM, project: Project) -> None:
     # → 卖点分 2/10，投稿第一道门（书名卖点）就被拦；导语更是整条链路没人产出，
     # 体检「A结构/导语」必挂。两处都改成调既有阶段，判据只有一份实现。
     try:
-        _pitch = stage_pitch(cfg, llm, project) or {}
+        # 分节计划已经把这个故事拆成了一场一场的戏，书名与一句话故事必须跟它是
+        # **同一个故事**。不传的后果实测过：计划写的是「妻子用仅剩三十天的婚姻
+        # 额度唤醒丈夫」，而 pitch 从空的核心冲突里自己发挥，写出「我骗他签下
+        # 全部房产转让书，把他白月光送进精神病院」——两条完全不同的故事线，
+        # 导语跟着 pitch 走，正文跟着计划走，读者读到的是两本书。
+        _pl = project.load_json("section_plan.json") or {}
+        _hint = ""
+        if _pl:
+            _goals = [str(s.get("goal") or "").strip()
+                      for s in (_pl.get("sections") or [])[:4]]
+            _goals = [g for g in _goals if g]
+            _hint = (f"一句话故事：{str(_pl.get('logline') or '').strip()}\n"
+                     + "\n".join(f"第 {i + 1} 节要写：{g}" for i, g in enumerate(_goals)))
+        _pitch = stage_pitch(cfg, llm, project, plan_hint=_hint) or {}
         title = _pitch.get("title") or ""
     except Exception as e:  # noqa: BLE001
         print(f"[stage] 书名方案生成失败（{type(e).__name__}: {e}），标题退回正文抽取")
@@ -6749,8 +6764,12 @@ def stage_polish(cfg: dict, llm: BaseLLM, project: Project, skip_final_llm: bool
     if not isinstance(llm, MockLLM):
         try:
             full, _bnd2 = _fix_boundary_replay(cfg, llm, full, max_fix=3)
-            if _bnd2.get("fixed") or _bnd2.get("left"):
-                report["boundary_refix"] = _bnd2
+            # 注意：`_fix_boundary_replay` 返回的是 (text, list[dict])，不是 dict。
+            # 第一版按 dict 写 `.get("fixed")`，整段抛 AttributeError 被下面的
+            # except 吞掉——报告里只剩一行 boundary_refix.error，看起来像「没问题」，
+            # 而实际是这道交付前复检**从来没跑过**（v-nd1 的 08→09 重演就是这么漏的）。
+            if _bnd2:
+                report["boundary_refix"] = {"n": len(_bnd2), "records": _bnd2}
         except Exception as e:  # noqa: BLE001
             report["boundary_refix"] = {"error": f"{type(e).__name__}: {e}"}
             print(f"[boundary] ⚠ 交付前衔接复检跳过（{type(e).__name__}: {e}）")
