@@ -1160,15 +1160,18 @@ def _test_thin_body_targeted_rewrite():
         assert rep["changed"] >= 1, f"至少应改一句，实测 {rep}"
         assert rep["reverted"] is False, "正常瘦身不该回滚"
 
-        # 干不成时（假写手什么都不改）必须原样返回，不许把稿子写坏
+        # 干不成时（假写手什么都不改）走确定性兜底：删掉含套词的逗号短句。
+        # v38/v42 两次真跑都是「提交 10 句、实际改动 0 句」，密度原地不动，
+        # 所以模型不动时不能就这么算了——但兜底也不许把稿子改坏。
         class _Nop:
             def chat(self, sys_p, user_p, **kw):
                 return ""
 
         _P.resolve_llm = lambda c, b, role: _Nop()
         new2, rep2 = _thin_body(cfg, _Nop(), dense, cap=1.0)
-        assert new2 == dense, "改不动时正文必须原样返回"
-        assert rep2["changed"] == 0, "不该记改过句子"
+        assert langqa.scan(new2)["stats"]["body_rate"] <= before, "兜底不许把密度改高"
+        assert rep2["changed"] > 0, "模型不动时兜底必须真的删掉短句"
+        assert new2.startswith("01"), "兜底不许破坏节结构"
 
         # 本来就没超标 → 一次 LLM 都不该调
         class _Boom:

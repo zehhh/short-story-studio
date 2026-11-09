@@ -5131,9 +5131,42 @@ _THIN_USER = """【要改的句子】（每行「编号｜原句」）
 - 换成**看得见的结果**：手抖→「茶盏磕在案沿，泼了半盏」；怕→「她把裙角攥进手心，
   指甲掐进肉里」；惊→「她手里那支笔停在半空，一直没落下来」；冷→「她往袖子里缩了缩手」。
 - 一句里出现两三个套词的，留一个最必要的，其余删掉——不要为了保留而改写成长句。
-- 无法改写就**原样输出该行**（宁可不动，也不许改出病句）。
+- **每一行都必须动**：至少删掉一处套词。原样回传视同未完成任务。
+  实在改不动时，把含有套词的那个短句整段删掉（剩下的句子仍要通顺、仍要有标点）。
 
 【输出格式】只输出「编号｜改后句子」，编号一个不许少、不许合并、不许换顺序。"""
+
+
+def _strip_trope_clause(seg: str) -> "str | None":
+    """确定性兜底：删掉含身体/神态套词的逗号短句。
+
+    为什么需要它：`_thin_body` 交给模型改，模型常以「无法改写就原样输出」为由
+    整轮不动（v38 / v42 两次实测都是「提交 10 句、实际改动 0 句」，密度原地不动）。
+    提示词已改成「每一行都必须动」，但仍要给条兜底路——删掉一个逗号短句是
+    最保守的降密度手段：不改情节、不加新词，只去掉一个修饰性从句。
+
+    返回值三态：`None` = 不动（没有套词 / 拆了会伤原意）；`""` = 整句删掉
+    （整句都是身体反应，没有情节信息）；其余 = 替换文本。
+
+    只在纯叙述句上做：句子里有引号就放弃（删半句会把台词引号拆散）。
+    """
+    from .langqa import _BODY_TROPE as _BT
+
+    if not seg or _BT.search(seg) is None:
+        return None
+    if any(q in seg for q in "「」“”\""):
+        return None
+    parts = re.split(r"(?<=[，、；])", seg)
+    keep = [p for p in parts if _BT.search(p) is None]
+    if not keep:
+        # 整句都是身体反应（「额角沁出冷汗。」这种），删掉不影响情节
+        return "" if len(seg) <= 24 else None
+    out = "".join(keep).strip()
+    if len(out) < max(8, int(len(seg) * 0.3)):
+        return None  # 删得太多就不是同义压缩，是丢内容
+    if out and out[-1] not in "。！？":
+        out = out.rstrip("，、；") + "。"
+    return out if _BT.search(out) is None else None
 
 
 def _thin_body(cfg: dict, llm: BaseLLM, full: str, cap: float = 1.0,
@@ -5220,6 +5253,20 @@ def _thin_body(cfg: dict, llm: BaseLLM, full: str, cap: float = 1.0,
                 print(f"[thin] 解析明细：模型原样输出前 60 字「{raw[:60]}」——"
                       "改不动说明它把句子改写成了对不上原文的形式，本轮跳过")
                 break
+        # 模型整轮不动时的确定性兜底（见 `_strip_trope_clause` 的说明）
+        st_c = (langqa.scan(cur, rules, genres=genres) or {}).get("stats") or {}
+        if int(st_c.get("body_trope") or 0) > allowed:
+            _fixed = 0
+            for _p, _seg in _body_sents(cur)[:max_sents]:
+                _alt = _strip_trope_clause(_seg)
+                if _alt is None or _alt == _seg:
+                    continue
+                if _seg in cur:
+                    cur = cur.replace(_seg, _alt, 1)
+                    _fixed += 1
+            if _fixed:
+                rep["changed"] += _fixed
+                print(f"[thin] 模型没动，确定性兜底删掉含套词的短句 {_fixed} 处")
         st2 = (langqa.scan(cur, rules, genres=genres) or {}).get("stats") or {}
         n2 = int(st2.get("body_trope") or 0)
         rate2 = n2 / chars * 1000
